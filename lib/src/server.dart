@@ -2,15 +2,16 @@ import 'dart:convert';
 
 import 'package:mcp_dart/mcp_dart.dart';
 
+import 'config.dart';
 import 'db.dart';
 
-/// Convert a date-only string (YYYY-MM-DD) to unix seconds (UTC midnight).
+/// Convert a date-only string (YYYY-MM-DD) to unix seconds (local midnight).
 /// Returns null if unparseable.
 int? _dateToEpoch(String? s, {bool endOfDay = false}) {
   if (s == null || s.trim().isEmpty) return null;
   try {
-    final d = DateTime.parse(s.trim()).toUtc();
-    final base = DateTime.utc(d.year, d.month, d.day);
+    final d = DateTime.parse(s.trim());
+    final base = DateTime(d.year, d.month, d.day);
     if (endOfDay) {
       return base.add(const Duration(days: 1)).subtract(const Duration(seconds: 1)).millisecondsSinceEpoch ~/ 1000;
     }
@@ -24,9 +25,8 @@ Future<void> runServer(String dbPath) async {
   final db = openDb(dbPath);
 
   final sv = db.schemaVersion;
-  const expected = 18;
-  if (sv != expected) {
-    throw StateError('Falcon DB schema version mismatch: found $sv, expected $expected.');
+  if (sv != expectedSchemaVersion) {
+    throw StateError('Falcon DB schema version mismatch: found $sv, expected $expectedSchemaVersion.');
   }
 
   final server = McpServer(

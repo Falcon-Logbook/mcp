@@ -89,7 +89,7 @@ class FalconDb {
       final v = row[col];
       if (v is int) {
         if (_dateColumns.contains(col)) {
-          out[col] = DateTime.fromMillisecondsSinceEpoch(v * 1000, isUtc: true).toIso8601String();
+          out[col] = DateTime.fromMillisecondsSinceEpoch(v * 1000).toIso8601String();
         } else if (_boolColumns.contains(col)) {
           out[col] = v != 0;
         } else {
