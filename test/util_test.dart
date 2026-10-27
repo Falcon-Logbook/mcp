@@ -123,6 +123,69 @@ void main() {
     });
   });
 
+  group('uuidV4', () {
+    test('generates a lowercase RFC 4122 version 4 id', () {
+      final id = uuidV4();
+      expect(isUuidV4(id), isTrue, reason: id);
+      expect(id, matches(RegExp(r'^[0-9a-f-]+$')));
+      expect(id, hasLength(36));
+    });
+
+    test('does not repeat itself', () {
+      final ids = {for (var i = 0; i < 200; i++) uuidV4()};
+      expect(ids, hasLength(200));
+    });
+
+    test('rejects the id shapes the server used to write', () {
+      for (final bad in [
+        'mcp_fl_65ed958f79727',
+        'default',
+        '',
+        '3F1A6C1E-9B2D-4A57-8F0C-2D1E3B4A5C6D',
+        '3f1a6c1e-9b2d-1a57-8f0c-2d1e3b4a5c6d',
+        '3f1a6c1e-9b2d-4a57-0f0c-2d1e3b4a5c6d',
+        '3f1a6c1e-9b2d-4a57-8f0c-2d1e3b4a5c6',
+      ]) {
+        expect(isUuidV4(bad), isFalse, reason: 'must reject "$bad"');
+      }
+    });
+  });
+
+  group('canonicalClockTime', () {
+    test('reads 1 to 4 digits by digit count and pads to HH:MM', () {
+      expect(canonicalClockTime('9'), '09:00');
+      expect(canonicalClockTime('09'), '09:00');
+      expect(canonicalClockTime('930'), '09:30');
+      expect(canonicalClockTime('0930'), '09:30');
+      expect(canonicalClockTime('9:30'), '09:30');
+      expect(canonicalClockTime('09:30'), '09:30');
+      expect(canonicalClockTime(' 23:59 '), '23:59');
+      expect(canonicalClockTime('0'), '00:00');
+    });
+
+    test('refuses anything that is not a 24-hour clock time', () {
+      for (final bad in <Object?>[
+        null,
+        '',
+        '   ',
+        '9am',
+        '0930am',
+        '24:00',
+        '09:60',
+        '2400',
+        '0960',
+        '12345',
+        '1:5',
+        '09:3',
+        ':30',
+        '-1',
+        930,
+      ]) {
+        expect(canonicalClockTime(bad), isNull, reason: 'must reject $bad');
+      }
+    });
+  });
+
   group('coercion', () {
     test('asBool understands bools, numbers and strings', () {
       expect(asBool(true), isTrue);

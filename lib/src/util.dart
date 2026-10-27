@@ -1,5 +1,6 @@
 import 'dart:convert';
 import 'dart:io';
+import 'dart:math';
 
 import 'package:path/path.dart' as p;
 
@@ -140,6 +141,12 @@ String epochToIso(int seconds) =>
 /// `updated_at` columns.
 int nowEpochSeconds() => DateTime.now().millisecondsSinceEpoch ~/ 1000;
 
+/// The app's ceiling for a flight time column, in minutes (8760 hours), and for
+/// a takeoff/landing count. Mirrors `AppConstants.maxFlightTimeMinutes` and
+/// `AppConstants.maxFlightCount`, which the app's flights DAO enforces on save.
+const int maxFlightMinutes = 525600;
+const int maxFlightCount = 10000;
+
 /// Coerces loose JSON input into an int without throwing.
 int? asInt(Object? value) {
   if (value == null) return null;
@@ -188,6 +195,70 @@ String? asText(Object? value) {
 /// with `ESCAPE '\'` in the SQL.
 String escapeLike(String value) =>
     value.replaceAllMapped(RegExp(r'[\\%_]'), (m) => '\\${m[0]}');
+
+/// A random RFC 4122 version 4 UUID, lowercase and hyphenated, in the same
+/// shape as the app's `uuidV4()`. The synced id columns are UUID in the cloud
+/// schema, so an id in any other shape cannot be pushed.
+String uuidV4() {
+  final random = Random.secure();
+  final bytes = List<int>.generate(16, (_) => random.nextInt(256));
+  bytes[6] = (bytes[6] & 0x0f) | 0x40;
+  bytes[8] = (bytes[8] & 0x3f) | 0x80;
+  String hex(int from, int count) => [
+        for (var i = from; i < from + count; i++)
+          bytes[i].toRadixString(16).padLeft(2, '0'),
+      ].join();
+  return '${hex(0, 4)}-${hex(4, 2)}-${hex(6, 2)}-${hex(8, 2)}-${hex(10, 6)}';
+}
+
+final RegExp _uuidV4Pattern = RegExp(
+    r'^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$');
+
+/// Whether [value] is a lowercase RFC 4122 version 4 UUID.
+bool isUuidV4(String value) => _uuidV4Pattern.hasMatch(value);
+
+final RegExp _oneOrTwoDigits = RegExp(r'^\d{1,2}$');
+final RegExp _exactlyTwoDigits = RegExp(r'^\d{2}$');
+final RegExp _oneToFourDigits = RegExp(r'^\d{1,4}$');
+
+/// Reads a block time as a 24-hour clock time and returns it as `HH:MM`, or
+/// null when the value is not one.
+///
+/// Shape follows the app's formatter, which reads 1 to 4 digits by digit count:
+/// `9` is 09:00, `930` is 09:30, `0930` is 09:30. A colon is accepted only as
+/// `H:MM` or `HH:MM`, and the minutes must be two digits, because `1:5` reads
+/// as a duration rather than a clock time.
+String? canonicalClockTime(Object? raw) {
+  if (raw is! String) return null;
+  final text = raw.trim();
+  if (text.isEmpty) return null;
+
+  final int hours;
+  final int minutes;
+  if (text.contains(':')) {
+    final parts = text.split(':');
+    if (parts.length != 2) return null;
+    if (!_oneOrTwoDigits.hasMatch(parts[0])) return null;
+    if (!_exactlyTwoDigits.hasMatch(parts[1])) return null;
+    hours = int.parse(parts[0]);
+    minutes = int.parse(parts[1]);
+  } else {
+    if (!_oneToFourDigits.hasMatch(text)) return null;
+    // 3 digits split after the first one (H:MM), 4 after the second (HH:MM);
+    // 1 and 2 digits are whole hours.
+    final splitAt = switch (text.length) {
+      3 => 1,
+      4 => 2,
+      _ => text.length,
+    };
+    hours = int.parse(text.substring(0, splitAt));
+    minutes = splitAt < text.length ? int.parse(text.substring(splitAt)) : 0;
+  }
+
+  if (hours > 23 || minutes > 59) return null;
+  return '${hours.toString().padLeft(2, '0')}:'
+      '${minutes.toString().padLeft(2, '0')}';
+}
 
 /// Audit log path for a database: `<db-name>.mcp_audit.jsonl` alongside it.
 String auditPathFor(String dbPath) {
