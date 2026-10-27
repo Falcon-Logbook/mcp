@@ -63,11 +63,11 @@ String defaultDbPath() {
   }
   if (Platform.isMacOS) {
     final home = Platform.environment['HOME'] ?? '';
-    return p.join(home, 'Library', 'Application Support', 'Falcon', 'falcon_db.sqlite');
+    return p.join(home, 'Library', 'Application Support', 'falcon', 'Falcon', 'falcon_db.sqlite');
   }
   if (Platform.isWindows) {
     final appData = Platform.environment['APPDATA'] ?? '';
-    return p.join(appData, 'Falcon', 'falcon_db.sqlite');
+    return p.join(appData, 'falcon', 'Falcon', 'falcon_db.sqlite');
   }
   // Fallback
   final home = Platform.environment['HOME'] ?? '/tmp';

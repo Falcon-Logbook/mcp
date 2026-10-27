@@ -1,10 +1,11 @@
 import 'package:sqlite3/sqlite3.dart';
 
-
 const Set<String> _dateColumns = {
   'date',
+  'timestamp',
   'createdAt',
   'updatedAt',
+  'lastBackedUp',
 };
 
 const Set<String> _boolColumns = {
@@ -38,11 +39,24 @@ const Set<String> _boolColumns = {
   'showBadge',
   'firstNameInitialOnly',
   'nicknameOnly',
+  'oledDarkMode',
+  'hasSeenStorageExplanation',
+  'backgroundLaunchPending',
+  'hangarDoorsSplash',
+  'showDashboard',
+  'showExpiries',
+  'showReports',
+  'showAirports',
+  'showCurrency',
+  'showTools',
+  'showRoutes',
+  'expandedOnLaunch',
 };
 
 class FalconDb {
   FalconDb(this.path) {
-    _db = sqlite3.open(path);
+    _db = sqlite3.open(path, mode: OpenMode.readOnly);
+    _db.execute('PRAGMA busy_timeout = 5000');
   }
 
   final String path;
@@ -51,7 +65,8 @@ class FalconDb {
   int get schemaVersion {
     final rows = _db.select('PRAGMA user_version');
     if (rows.isEmpty) return 0;
-    return rows.first.values.first as int? ?? 0;
+    final v = rows.first['user_version'];
+    return v is int ? v : 0;
   }
 
   List<String> get tables {
@@ -61,7 +76,6 @@ class FalconDb {
     return rows.map((r) => r['name'] as String).toList();
   }
 
-  /// Run a SELECT and return rows as JSON-friendly maps.
   List<Map<String, dynamic>> query(String sql, [List<Object?> params = const []]) {
     final rows = _db.select(sql, params);
     return rows.map(_rowToMap).toList();
@@ -73,15 +87,12 @@ class FalconDb {
       final v = row[col];
       if (v is int) {
         if (_dateColumns.contains(col)) {
-          // Drift stores DateTime as unix seconds.
           out[col] = DateTime.fromMillisecondsSinceEpoch(v * 1000, isUtc: true).toIso8601String();
         } else if (_boolColumns.contains(col)) {
           out[col] = v != 0;
         } else {
           out[col] = v;
         }
-      } else if (v is double) {
-        out[col] = v;
       } else {
         out[col] = v;
       }
@@ -92,5 +103,4 @@ class FalconDb {
   void close() => _db.dispose();
 }
 
-/// Open read-only? We open normally but callers should only SELECT.
 FalconDb openDb(String path) => FalconDb(path);

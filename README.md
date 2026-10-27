@@ -1,9 +1,4 @@
 <p align="center">
-  <img src="https://raw.githubusercontent.com/Falcon-Logbook/app/main/assets/images/icon/icon.png" width="80" alt="Falcon">
-</p>
-
-<p align="center">
-  <a href="LICENSE"><img src="https://img.shields.io/badge/license-Apache%202.0-blue" alt="License"></a>
   <img src="https://img.shields.io/badge/Dart-3.4+-blue?logo=dart" alt="Dart">
   <img src="https://img.shields.io/badge/MCP-2025--11--25-green" alt="MCP">
 </p>
@@ -162,7 +157,7 @@ Add an MCP server entry of type `stdio` with the command path and the `--db` arg
 | Tool | Description |
 |---|---|
 | `db_info` | Database path, schema version, and table list |
-| `list_flights` | List flights with filters (date range, aircraft, flight type, pagination) |
+| `list_flights` | List flights with optional filters (date range, aircraft registration, flight type) |
 | `get_flight` | Get a single flight by id |
 | `search_flights` | Free-text search over route, flight number, crew name, registration |
 | `list_aircraft` | List aircraft, optionally including archived |
@@ -171,8 +166,11 @@ Add an MCP server entry of type `stdio` with the command path and the `--db` arg
 | `list_custom_airports` | List user-defined airports |
 | `list_crew` | List crew members, optionally including archived |
 | `list_saved_routes` | List saved routes |
-| `logbook_stats` | Totals for flights, hours, night time, landings, takeoffs (optional date range) |
+| `logbook_stats` | Totals for flights, minutes, night time, landings, takeoffs (optional date range) |
 | `get_flight_settings` | Pilot name, formats, country, display preferences |
+| `get_app_settings` | Storage mode, theme, accent, and app preferences |
+| `get_general_settings` | Startup tab, language, coordinates format, etc. |
+| `get_sync_status` | Sync state per table/provider and pending tombstone count |
 | `get_recent_logs` | Recent log entries for diagnostics |
 
 Resource: `falcon://flights` (latest 100 flights as JSON).

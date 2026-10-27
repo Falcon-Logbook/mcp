@@ -15,5 +15,10 @@ Future<void> main(List<String> args) async {
   }
 
   final dbPath = resolveDbPath(override: result['db'] as String?);
-  await runServer(dbPath);
+  try {
+    await runServer(dbPath);
+  } catch (e) {
+    stderr.writeln('Failed to open database at $dbPath: $e');
+    exit(1);
+  }
 }

@@ -111,7 +111,8 @@ Future<void> runServer(String dbPath) async {
     ),
     callback: (args, extra) async {
       try {
-        final id = args['id'] as String;
+        final id = args['id'];
+        if (id is! String || id.isEmpty) return fail('Missing or invalid id');
         final rows = db.query('SELECT * FROM flights WHERE id = ?', [id]);
         if (rows.isEmpty) return fail('Flight not found: $id');
         return ok(rows.first);
@@ -134,7 +135,8 @@ Future<void> runServer(String dbPath) async {
     ),
     callback: (args, extra) async {
       try {
-        final q = args['query'] as String;
+        final q = args['query'];
+        if (q is! String || q.isEmpty) return fail('Missing or invalid query');
         final limit = (args['limit'] as num?)?.toInt() ?? 50;
         final like = '%$q%';
         final rows = db.query(
@@ -183,7 +185,8 @@ Future<void> runServer(String dbPath) async {
     ),
     callback: (args, extra) async {
       try {
-        final id = args['id'] as String;
+        final id = args['id'];
+        if (id is! String || id.isEmpty) return fail('Missing or invalid id');
         final rows = db.query('SELECT * FROM aircraft WHERE id = ?', [id]);
         if (rows.isEmpty) return fail('Aircraft not found: $id');
         return ok(rows.first);
@@ -343,12 +346,58 @@ Future<void> runServer(String dbPath) async {
       try {
         final limit = (args['limit'] as num?)?.toInt() ?? 50;
         final rows = db.query(
-          'SELECT * FROM log_entries ORDER BY createdAt DESC LIMIT ?',
+          'SELECT * FROM log_entries ORDER BY timestamp DESC LIMIT ?',
           [limit],
         );
         return ok({'count': rows.length, 'logs': rows});
       } catch (e) {
         return fail('get_recent_logs failed: $e');
+      }
+    },
+  );
+
+  // --- app settings ---
+  server.registerTool(
+    'get_app_settings',
+    description: 'Get app settings (storage mode, theme, accent, etc.).',
+    inputSchema: JsonSchema.object(properties: {}),
+    callback: (args, extra) async {
+      try {
+        final rows = db.query('SELECT * FROM app_settings LIMIT 1');
+        return ok(rows.isEmpty ? {} : rows.first);
+      } catch (e) {
+        return fail('get_app_settings failed: $e');
+      }
+    },
+  );
+
+  server.registerTool(
+    'get_general_settings',
+    description: 'Get general settings (startup tab, language, coordinates format, etc.).',
+    inputSchema: JsonSchema.object(properties: {}),
+    callback: (args, extra) async {
+      try {
+        final rows = db.query('SELECT * FROM general_settings LIMIT 1');
+        return ok(rows.isEmpty ? {} : rows.first);
+      } catch (e) {
+        return fail('get_general_settings failed: $e');
+      }
+    },
+  );
+
+  // --- sync status ---
+  server.registerTool(
+    'get_sync_status',
+    description: 'Get sync state per table/provider and pending tombstone count.',
+    inputSchema: JsonSchema.object(properties: {}),
+    callback: (args, extra) async {
+      try {
+        final state = db.query('SELECT * FROM sync_state');
+        final deletions = db.query('SELECT COUNT(*) AS pending FROM sync_deletions');
+        final pending = deletions.isEmpty ? 0 : deletions.first['pending'];
+        return ok({'syncState': state, 'pendingDeletions': pending});
+      } catch (e) {
+        return fail('get_sync_status failed: $e');
       }
     },
   );
