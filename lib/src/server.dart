@@ -159,6 +159,45 @@ const _timeFormats = {'hhmm', 'decimal1', 'decimal2'};
 const _calculateTimeModes = {'utc', 'local', 'time', 'hobbsTacho'};
 const _crewRoles = {'pilotInCommand', 'copilot', 'student'};
 
+/// Columns that hold a duration in whole minutes.
+const Set<String> _minuteColumns = {
+  'total_time',
+  'day_time',
+  'night_time',
+  'actual_instrument',
+  'simulated_instrument',
+  'ground_instrument',
+  'icus_day_time',
+  'icus_night_time',
+};
+
+/// Time fields that also accept an `_hours` argument, converted once at the
+/// boundary. The column itself keeps its minutes name.
+const Map<String, String> _hoursAliases = {
+  'total_time': 'total_time_hours',
+  'day_time': 'day_time_hours',
+  'night_time': 'night_time_hours',
+};
+
+/// Every response that carries a time or date field states its units here,
+/// once per response rather than per row.
+const Map<String, String> _units = {
+  'time': 'minutes',
+  'date': 'epoch_seconds',
+};
+
+/// Arguments that select the date window, shared by every filtered read.
+const Set<String> _dateFilterKeys = {'date_from', 'date_to', 'period'};
+
+/// Arguments that switch a read from local rows to all owners' rows.
+const String _includeSharedKey = 'include_shared';
+
+/// The filter arguments every flight read accepts.
+const Set<String> _flightFilterKeys = {
+  ..._dateFilterKeys,
+  _includeSharedKey,
+};
+
 // ============================================================
 // Errors, results, coercion
 // ============================================================
@@ -189,7 +228,17 @@ Object? _coerce(_Column column, Object? raw) {
       return asText(raw);
     case _Kind.integer:
       final value = asInt(raw);
-      if (value == null) throw _ToolError('${column.name} must be an integer');
+      if (value == null) {
+        final alias = _hoursAliases[column.name];
+        if (alias != null) {
+          throw _ToolError(
+              '${column.name} must be an integer number of minutes; '
+              'use $alias to pass hours');
+        }
+        throw _ToolError(_minuteColumns.contains(column.name)
+            ? '${column.name} must be an integer number of minutes'
+            : '${column.name} must be an integer');
+      }
       _checkRange(column, value);
       return value;
     case _Kind.real:
@@ -274,6 +323,125 @@ void _collect(
     columns.add(column.name);
     values.add(_coerce(column, raw));
   }
+}
+
+// ============================================================
+// Read filters and paging
+// ============================================================
+
+/// Schema properties for the date window arguments, shared by filtered reads.
+Map<String, JsonSchema> _dateFilterProperties() => {
+      'date_from': JsonSchema.string(
+          format: 'date',
+          description: 'Inclusive start date, exactly YYYY-MM-DD.'),
+      'date_to': JsonSchema.string(
+          format: 'date',
+          description: 'Inclusive end date, exactly YYYY-MM-DD.'),
+      'period': JsonSchema.string(
+        enumValues: datePresets,
+        description: 'Named window instead of date_from/date_to, resolved on '
+            'the server: ${datePresets.join(', ')}.',
+      ),
+    };
+
+/// A date window resolved from arguments: WHERE terms, their parameters, and
+/// the inclusive calendar bounds to echo back.
+typedef _DateWindow = ({
+  List<String> where,
+  List<Object?> params,
+  String? from,
+  String? to,
+});
+
+DateTime? _readDate(Map<String, dynamic> args, String name) {
+  final raw = args[name];
+  if (raw == null) return null;
+  final date = parseCalendarDate(raw);
+  if (date == null) {
+    throw _ToolError(
+        '$name must be $dateFormatHint, for example 2025-01-31 (got "$raw")');
+  }
+  return date;
+}
+
+/// Builds the date predicate for a read. Anything that cannot be applied as
+/// written is a tool error: a filter that silently does not apply reports
+/// career totals as if they were the requested window.
+_DateWindow _flightDateFilter(Map<String, dynamic> args,
+    {required DateTime now}) {
+  final where = <String>[];
+  final params = <Object?>[];
+  final period = asText(args['period']);
+
+  if (period != null &&
+      (args['date_from'] != null || args['date_to'] != null)) {
+    throw _ToolError('Use either period or date_from/date_to, not both.');
+  }
+
+  DateTime? from;
+  DateTime? to;
+  if (period != null) {
+    final resolved = resolveDatePreset(period, now: now);
+    if (resolved == null) {
+      throw _ToolError(
+          'period must be one of ${datePresets.join(', ')} (got "$period")');
+    }
+    from = resolved.from;
+    to = resolved.to;
+  } else {
+    from = _readDate(args, 'date_from');
+    to = _readDate(args, 'date_to');
+    if (from != null && to != null && from.isAfter(to)) {
+      throw _ToolError('date_from (${formatCalendarDate(from)}) must not be '
+          'after date_to (${formatCalendarDate(to)})');
+    }
+  }
+
+  if (from != null) {
+    where.add('date >= ?');
+    params.add(epochForDayStart(from));
+  }
+  if (to != null) {
+    // Half open: local midnight of the day after the last requested day.
+    where.add('date < ?');
+    params.add(epochForDayAfter(to));
+  }
+  return (
+    where: where,
+    params: params,
+    from: from == null ? null : formatCalendarDate(from),
+    to: to == null ? null : formatCalendarDate(to),
+  );
+}
+
+/// The applied boundaries, echoed in the response so a caller can check them.
+Map<String, dynamic> _rangeOf(_DateWindow window) =>
+    {'from': window.from, 'to': window.to};
+
+/// ` WHERE a AND b`, or nothing when [where] is empty.
+String _whereSql(List<String> where) =>
+    where.isEmpty ? '' : ' WHERE ${where.join(' AND ')}';
+
+/// The app's local-rows rule: `owner_id` NULL or `'local'`. Empty when shared
+/// rows are requested or the table has no owner column.
+String _ownerClause(FalconDb db, String table, {required bool includeShared}) =>
+    !includeShared && db.columnsOf(table).contains('owner_id')
+        ? "(owner_id IS NULL OR owner_id = 'local')"
+        : '';
+
+/// Total rows matching the same WHERE, and whether the page leaves more
+/// behind. [params] must not already carry the LIMIT/OFFSET values.
+({int total, bool hasMore}) _pageInfo(
+  FalconDb db,
+  String fromWhere,
+  List<Object?> params, {
+  required int offset,
+  required int count,
+}) {
+  final rows =
+      db.query('SELECT COUNT(*) AS total FROM $fromWhere', List.of(params));
+  final total = rows.isEmpty ? 0 : asInt(rows.first['total']) ?? 0;
+  return (total: total, hasMore: offset + count < total);
 }
 
 // ============================================================
@@ -384,6 +552,40 @@ String? _matchCrewMemberId(FalconDb db, String name) {
   return null;
 }
 
+/// Converts every `*_hours` argument to the minutes the column stores, so the
+/// conversion happens once. Supplying both forms of one field is an error.
+Map<String, dynamic> _minutesFromHours(Map<String, dynamic> args) {
+  final out = Map<String, dynamic>.of(args);
+  for (final entry in _hoursAliases.entries) {
+    final alias = entry.value;
+    if (!out.containsKey(alias)) continue;
+    if (out[entry.key] != null) {
+      throw _ToolError(
+          'Supply either ${entry.key} (minutes) or $alias (hours), not both.');
+    }
+    final hours = asDouble(out.remove(alias));
+    if (hours == null) throw _ToolError('$alias must be a number of hours');
+    if (hours < 0) throw _ToolError('$alias must be >= 0');
+    out[entry.key] = (hours * 60).round();
+  }
+  return out;
+}
+
+/// Input schema for the flight write tools: the live columns plus the `_hours`
+/// aliases for the duration fields this database has.
+Map<String, JsonSchema> _flightWriteProperties(FalconDb db) {
+  final available = db.columnsOf('flights').toSet();
+  return {
+    ..._propertiesOf(_supported(db, 'flights', _flightColumns)),
+    for (final entry in _hoursAliases.entries)
+      if (available.contains(entry.key))
+        entry.value: JsonSchema.number(
+          minimum: 0,
+          description: 'Hours, converted to ${entry.key} minutes.',
+        ),
+  };
+}
+
 /// Builds the column/value map for a flight from tool arguments, deriving the
 /// aircraft and crew foreign keys the app expects.
 ({Map<String, Object?> values, List<String> warnings}) _flightValues(
@@ -392,19 +594,22 @@ String? _matchCrewMemberId(FalconDb db, String name) {
 ) {
   final values = <String, Object?>{};
   final warnings = <String>[];
-  _rejectUnknown(args, _fieldNames(_flightColumns, {'id'}));
-  if (args.containsKey('date') && asText(args['date']) == null) {
+  _rejectUnknown(
+      args, _fieldNames(_flightColumns, {'id', ..._hoursAliases.values}));
+  final fields = _minutesFromHours(args);
+  if (fields.containsKey('date') && asText(fields['date']) == null) {
     throw _ToolError('date cannot be empty');
   }
   final columns = <String>[];
   final raw = <Object?>[];
-  _collect(db, 'flights', _flightColumns, args, columns, raw, keepNulls: true);
+  _collect(db, 'flights', _flightColumns, fields, columns, raw,
+      keepNulls: true);
   for (var i = 0; i < columns.length; i++) {
     values[columns[i]] = raw[i];
   }
 
-  if (args.containsKey('aircraft_registration')) {
-    final text = asText(args['aircraft_registration']);
+  if (fields.containsKey('aircraft_registration')) {
+    final text = asText(fields['aircraft_registration']);
     if (text == null) {
       values['aircraft_registration'] = null;
       values['aircraft_id'] = null;
@@ -420,8 +625,8 @@ String? _matchCrewMemberId(FalconDb db, String name) {
         values['aircraft_id'] = match.id;
       }
     }
-  } else if (args.containsKey('aircraft_id')) {
-    final aircraftId = asText(args['aircraft_id']);
+  } else if (fields.containsKey('aircraft_id')) {
+    final aircraftId = asText(fields['aircraft_id']);
     if (aircraftId != null &&
         db.query(
             'SELECT id FROM aircraft WHERE id = ?', [aircraftId]).isEmpty) {
@@ -430,8 +635,8 @@ String? _matchCrewMemberId(FalconDb db, String name) {
     values['aircraft_id'] = aircraftId;
   }
 
-  if (args.containsKey('crew_members_name')) {
-    final name = asText(args['crew_members_name']);
+  if (fields.containsKey('crew_members_name')) {
+    final name = asText(fields['crew_members_name']);
     if (name == null) {
       values['crew_members_name'] = null;
       values['crew_member_id'] = null;
@@ -439,8 +644,8 @@ String? _matchCrewMemberId(FalconDb db, String name) {
       values['crew_members_name'] = name;
       values['crew_member_id'] = _matchCrewMemberId(db, name);
     }
-  } else if (args.containsKey('crew_member_id')) {
-    final crewId = asText(args['crew_member_id']);
+  } else if (fields.containsKey('crew_member_id')) {
+    final crewId = asText(fields['crew_member_id']);
     if (crewId != null &&
         db.query(
             'SELECT id FROM crew_members WHERE id = ?', [crewId]).isEmpty) {
@@ -580,13 +785,22 @@ Future<void> runServer(String dbPath, {bool readonly = true}) async {
         'Show database path, schema version, table list, and whether writes are enabled.',
     inputSchema: JsonSchema.object(properties: {}),
     annotations: readOnlyAnnotations,
-    callback: (args, extra) async => _ok({
-      'path': dbPath,
-      'schemaVersion': version,
-      'supportedSchemaVersions': '$minSchemaVersion-$maxSchemaVersion',
-      'readonly': readonly,
-      'tables': db.tables,
-    }),
+    callback: (args, extra) async {
+      try {
+        _rejectUnknown(args, const {});
+        return _ok({
+          'path': dbPath,
+          'schemaVersion': version,
+          'supportedSchemaVersions': '$minSchemaVersion-$maxSchemaVersion',
+          'readonly': readonly,
+          'tables': db.tables,
+        });
+      } on _ToolError catch (error) {
+        return _fail(error.message);
+      } catch (error) {
+        return _fail('db_info failed: $error');
+      }
+    },
   );
 
   List<Map<String, dynamic>> describeTable(String table) => db.tableInfo(table);
@@ -602,6 +816,7 @@ Future<void> runServer(String dbPath, {bool readonly = true}) async {
     annotations: readOnlyAnnotations,
     callback: (args, extra) async {
       try {
+        _rejectUnknown(args, {'table'});
         final only = asText(args['table']);
         if (only != null && !db.hasTable(only)) {
           return _fail(
@@ -609,6 +824,8 @@ Future<void> runServer(String dbPath, {bool readonly = true}) async {
         }
         final tables = only != null ? [only] : db.tables;
         return _ok({for (final table in tables) table: describeTable(table)});
+      } on _ToolError catch (error) {
+        return _fail(error.message);
       } catch (error) {
         return _fail('get_schema failed: $error');
       }
@@ -618,35 +835,39 @@ Future<void> runServer(String dbPath, {bool readonly = true}) async {
   server.registerTool(
     'list_flights',
     description:
-        'List flights with optional filters (date range, aircraft registration, flight type).',
+        'List flights, newest first (date, then day_order, then id). Times are '
+        'minutes and dates are epoch seconds. Returns count (rows on this page), '
+        'total (all matching rows), has_more, offset and the applied range. '
+        'Dates are YYYY-MM-DD. Local rows only unless include_shared is true.',
     inputSchema: JsonSchema.object(properties: {
       'limit': JsonSchema.integer(minimum: 1, maximum: 1000),
       'offset': JsonSchema.integer(minimum: 0),
-      'date_from': JsonSchema.string(format: 'date'),
-      'date_to': JsonSchema.string(format: 'date'),
+      ..._dateFilterProperties(),
       'aircraft_registration': JsonSchema.string(),
       'flight_type': JsonSchema.string(),
       'crew_members_name': JsonSchema.string(),
+      _includeSharedKey: JsonSchema.boolean(
+          description:
+              'Include rows owned by another device or account. Default false.'),
     }),
     annotations: readOnlyAnnotations,
     callback: (args, extra) async {
       try {
+        _rejectUnknown(args, {
+          'limit',
+          'offset',
+          'aircraft_registration',
+          'flight_type',
+          'crew_members_name',
+          ..._flightFilterKeys,
+        });
         final limit = asInt(args['limit']) ?? 50;
         if (limit < 1) return _fail('limit must be >= 1');
         final offset = asInt(args['offset']) ?? 0;
         if (offset < 0) return _fail('offset must be >= 0');
-        final where = <String>[];
-        final params = <Object?>[];
-        final from = dateToEpoch(args['date_from']);
-        if (from != null) {
-          where.add('date >= ?');
-          params.add(from);
-        }
-        final to = dateToEpoch(args['date_to'], endOfDay: true);
-        if (to != null) {
-          where.add('date <= ?');
-          params.add(to);
-        }
+        final window = _flightDateFilter(args, now: DateTime.now());
+        final where = [...window.where];
+        final params = [...window.params];
         for (final filter in const [
           'aircraft_registration',
           'flight_type',
@@ -658,12 +879,27 @@ Future<void> runServer(String dbPath, {bool readonly = true}) async {
             params.add(value);
           }
         }
-        final sql = 'SELECT * FROM flights'
-            '${where.isEmpty ? '' : ' WHERE ${where.join(' AND ')}'}'
-            ' ORDER BY date DESC, day_order ASC LIMIT ? OFFSET ?';
-        params.addAll([limit, offset]);
-        final rows = db.query(sql, params);
-        return _ok({'count': rows.length, 'flights': rows});
+        final owner = _ownerClause(db, 'flights',
+            includeShared: asBool(args[_includeSharedKey]) ?? false);
+        if (owner.isNotEmpty) where.add(owner);
+        final fromWhere = 'flights${_whereSql(where)}';
+        final rows = db.query(
+            'SELECT * FROM $fromWhere '
+            'ORDER BY date DESC, day_order DESC, id LIMIT ? OFFSET ?',
+            [...params, limit, offset]);
+        final page = _pageInfo(db, fromWhere, params,
+            offset: offset, count: rows.length);
+        return _ok({
+          'count': rows.length,
+          'total': page.total,
+          'has_more': page.hasMore,
+          'offset': offset,
+          'range': _rangeOf(window),
+          'units': _units,
+          'flights': rows,
+        });
+      } on _ToolError catch (error) {
+        return _fail(error.message);
       } catch (error) {
         return _fail('list_flights failed: $error');
       }
@@ -672,17 +908,33 @@ Future<void> runServer(String dbPath, {bool readonly = true}) async {
 
   server.registerTool(
     'get_flight',
-    description: 'Get a single flight by id.',
-    inputSchema: JsonSchema.object(
-        properties: {'id': JsonSchema.string()}, required: ['id']),
+    description:
+        'Get a single flight by id. Times are minutes and dates are epoch '
+        'seconds. Local rows only unless include_shared is true.',
+    inputSchema: JsonSchema.object(properties: {
+      'id': JsonSchema.string(),
+      _includeSharedKey: JsonSchema.boolean(
+          description:
+              'Allow a row owned by another device or account. Default false.'),
+    }, required: [
+      'id'
+    ]),
     annotations: readOnlyAnnotations,
     callback: (args, extra) async {
       try {
+        _rejectUnknown(args, {'id', _includeSharedKey});
         final id = asText(args['id']);
         if (id == null) return _fail('Missing or invalid id');
-        final rows = db.query('SELECT * FROM flights WHERE id = ?', [id]);
+        final owner = _ownerClause(db, 'flights',
+            includeShared: asBool(args[_includeSharedKey]) ?? false);
+        final rows = db.query(
+            'SELECT * FROM flights WHERE id = ?'
+            '${owner.isEmpty ? '' : ' AND $owner'}',
+            [id]);
         if (rows.isEmpty) return _fail('Flight not found: $id');
-        return _ok(rows.first);
+        return _ok({...rows.first, 'units': _units});
+      } on _ToolError catch (error) {
+        return _fail(error.message);
       } catch (error) {
         return _fail('get_flight failed: $error');
       }
@@ -692,27 +944,73 @@ Future<void> runServer(String dbPath, {bool readonly = true}) async {
   server.registerTool(
     'search_flights',
     description:
-        'Search flights by free text (route, flight number, crew name, registration).',
+        'Search flights by free text (route, flight number, crew name, '
+        'registration). Times are minutes and dates are epoch seconds. Returns '
+        'count (rows on this page), total (all matching rows), has_more, offset '
+        'and the applied range. Ordered newest first (date, then day_order, '
+        'then id). Local rows only unless include_shared is true.',
     inputSchema: JsonSchema.object(properties: {
       'query': JsonSchema.string(),
       'limit': JsonSchema.integer(minimum: 1, maximum: 1000),
+      'offset': JsonSchema.integer(minimum: 0),
+      ..._dateFilterProperties(),
+      _includeSharedKey: JsonSchema.boolean(
+          description:
+              'Include rows owned by another device or account. Default false.'),
     }, required: [
       'query'
     ]),
     annotations: readOnlyAnnotations,
     callback: (args, extra) async {
       try {
+        _rejectUnknown(args, {
+          'query',
+          'limit',
+          'offset',
+          ..._flightFilterKeys,
+        });
         final text = asText(args['query']);
         if (text == null) return _fail('Missing or invalid query');
         final limit = asInt(args['limit']) ?? 50;
+        if (limit < 1) return _fail('limit must be >= 1');
+        final offset = asInt(args['offset']) ?? 0;
+        if (offset < 0) return _fail('offset must be >= 0');
         final like = '%${escapeLike(text)}%';
+        final window = _flightDateFilter(args, now: DateTime.now());
+        final where = <String>[
+          "(route LIKE ? ESCAPE '\\' OR flight_number LIKE ? ESCAPE '\\' "
+              "OR crew_members_name LIKE ? ESCAPE '\\' "
+              "OR aircraft_registration LIKE ? ESCAPE '\\')",
+          ...window.where,
+        ];
+        final params = <Object?>[
+          like,
+          like,
+          like,
+          like,
+          ...window.params,
+        ];
+        final owner = _ownerClause(db, 'flights',
+            includeShared: asBool(args[_includeSharedKey]) ?? false);
+        if (owner.isNotEmpty) where.add(owner);
+        final fromWhere = 'flights WHERE ${where.join(' AND ')}';
         final rows = db.query(
-          "SELECT * FROM flights WHERE route LIKE ? ESCAPE '\\' OR flight_number LIKE ? ESCAPE '\\' "
-          "OR crew_members_name LIKE ? ESCAPE '\\' OR aircraft_registration LIKE ? ESCAPE '\\' "
-          'ORDER BY date DESC LIMIT ?',
-          [like, like, like, like, limit],
-        );
-        return _ok({'count': rows.length, 'flights': rows});
+            'SELECT * FROM $fromWhere '
+            'ORDER BY date DESC, day_order DESC, id LIMIT ? OFFSET ?',
+            [...params, limit, offset]);
+        final page = _pageInfo(db, fromWhere, params,
+            offset: offset, count: rows.length);
+        return _ok({
+          'count': rows.length,
+          'total': page.total,
+          'has_more': page.hasMore,
+          'offset': offset,
+          'range': _rangeOf(window),
+          'units': _units,
+          'flights': rows,
+        });
+      } on _ToolError catch (error) {
+        return _fail(error.message);
       } catch (error) {
         return _fail('search_flights failed: $error');
       }
@@ -721,21 +1019,35 @@ Future<void> runServer(String dbPath, {bool readonly = true}) async {
 
   server.registerTool(
     'list_aircraft',
-    description: 'List aircraft (optionally include archived).',
+    description:
+        'List aircraft, optionally including archived ones. Local rows only '
+        'unless include_shared is true.',
     inputSchema: JsonSchema.object(properties: {
       'include_archived': JsonSchema.boolean(),
+      _includeSharedKey: JsonSchema.boolean(
+          description:
+              'Include rows owned by another device or account. Default false.'),
       'limit': JsonSchema.integer(minimum: 1, maximum: 1000),
     }),
     annotations: readOnlyAnnotations,
     callback: (args, extra) async {
       try {
+        _rejectUnknown(args, {'include_archived', _includeSharedKey, 'limit'});
         final include = asBool(args['include_archived']) ?? false;
         final limit = asInt(args['limit']) ?? 200;
-        final sql = include
-            ? 'SELECT * FROM aircraft ORDER BY registration LIMIT ?'
-            : 'SELECT * FROM aircraft WHERE archived = 0 ORDER BY registration LIMIT ?';
-        final rows = db.query(sql, [limit]);
+        final owner = _ownerClause(db, 'aircraft',
+            includeShared: asBool(args[_includeSharedKey]) ?? false);
+        final where = [
+          if (!include) 'archived = 0',
+          if (owner.isNotEmpty) owner,
+        ];
+        final rows = db.query(
+            'SELECT * FROM aircraft${_whereSql(where)} '
+            'ORDER BY registration LIMIT ?',
+            [limit]);
         return _ok({'count': rows.length, 'aircraft': rows});
+      } on _ToolError catch (error) {
+        return _fail(error.message);
       } catch (error) {
         return _fail('list_aircraft failed: $error');
       }
@@ -744,17 +1056,32 @@ Future<void> runServer(String dbPath, {bool readonly = true}) async {
 
   server.registerTool(
     'get_aircraft',
-    description: 'Get aircraft by id.',
-    inputSchema: JsonSchema.object(
-        properties: {'id': JsonSchema.string()}, required: ['id']),
+    description: 'Get aircraft by id. Local rows only unless include_shared '
+        'is true.',
+    inputSchema: JsonSchema.object(properties: {
+      'id': JsonSchema.string(),
+      _includeSharedKey: JsonSchema.boolean(
+          description:
+              'Allow a row owned by another device or account. Default false.'),
+    }, required: [
+      'id'
+    ]),
     annotations: readOnlyAnnotations,
     callback: (args, extra) async {
       try {
+        _rejectUnknown(args, {'id', _includeSharedKey});
         final id = asText(args['id']);
         if (id == null) return _fail('Missing or invalid id');
-        final rows = db.query('SELECT * FROM aircraft WHERE id = ?', [id]);
+        final owner = _ownerClause(db, 'aircraft',
+            includeShared: asBool(args[_includeSharedKey]) ?? false);
+        final rows = db.query(
+            'SELECT * FROM aircraft WHERE id = ?'
+            '${owner.isEmpty ? '' : ' AND $owner'}',
+            [id]);
         if (rows.isEmpty) return _fail('Aircraft not found: $id');
         return _ok(rows.first);
+      } on _ToolError catch (error) {
+        return _fail(error.message);
       } catch (error) {
         return _fail('get_aircraft failed: $error');
       }
@@ -771,6 +1098,7 @@ Future<void> runServer(String dbPath, {bool readonly = true}) async {
     annotations: readOnlyAnnotations,
     callback: (args, extra) async {
       try {
+        _rejectUnknown(args, {'query', 'limit'});
         final limit = asInt(args['limit']) ?? 50;
         final text = asText(args['query']);
         if (text != null) {
@@ -784,6 +1112,8 @@ Future<void> runServer(String dbPath, {bool readonly = true}) async {
         }
         final rows = db.query('SELECT * FROM airports LIMIT ?', [limit]);
         return _ok({'count': rows.length, 'airports': rows});
+      } on _ToolError catch (error) {
+        return _fail(error.message);
       } catch (error) {
         return _fail('list_airports failed: $error');
       }
@@ -792,17 +1122,29 @@ Future<void> runServer(String dbPath, {bool readonly = true}) async {
 
   server.registerTool(
     'list_custom_airports',
-    description: 'List user-defined custom airports.',
+    description: 'List user-defined custom airports. Local rows only unless '
+        'include_shared is true.',
     inputSchema: JsonSchema.object(properties: {
+      _includeSharedKey: JsonSchema.boolean(
+          description:
+              'Include rows owned by another device or account. Default false.'),
       'limit': JsonSchema.integer(minimum: 1, maximum: 1000),
     }),
     annotations: readOnlyAnnotations,
     callback: (args, extra) async {
       try {
+        _rejectUnknown(args, {_includeSharedKey, 'limit'});
         final limit = asInt(args['limit']) ?? 200;
+        final owner = _ownerClause(db, 'custom_airports',
+            includeShared: asBool(args[_includeSharedKey]) ?? false);
         final rows = db.query(
-            'SELECT * FROM custom_airports ORDER BY name LIMIT ?', [limit]);
+            'SELECT * FROM custom_airports'
+            '${owner.isEmpty ? '' : ' WHERE $owner'} '
+            'ORDER BY name LIMIT ?',
+            [limit]);
         return _ok({'count': rows.length, 'airports': rows});
+      } on _ToolError catch (error) {
+        return _fail(error.message);
       } catch (error) {
         return _fail('list_custom_airports failed: $error');
       }
@@ -811,21 +1153,35 @@ Future<void> runServer(String dbPath, {bool readonly = true}) async {
 
   server.registerTool(
     'list_crew',
-    description: 'List crew members (optionally include archived).',
+    description:
+        'List crew members, optionally including archived ones. Local rows '
+        'only unless include_shared is true.',
     inputSchema: JsonSchema.object(properties: {
       'include_archived': JsonSchema.boolean(),
+      _includeSharedKey: JsonSchema.boolean(
+          description:
+              'Include rows owned by another device or account. Default false.'),
       'limit': JsonSchema.integer(minimum: 1, maximum: 1000),
     }),
     annotations: readOnlyAnnotations,
     callback: (args, extra) async {
       try {
+        _rejectUnknown(args, {'include_archived', _includeSharedKey, 'limit'});
         final include = asBool(args['include_archived']) ?? false;
         final limit = asInt(args['limit']) ?? 200;
-        final sql = include
-            ? 'SELECT * FROM crew_members ORDER BY name LIMIT ?'
-            : 'SELECT * FROM crew_members WHERE archived = 0 ORDER BY name LIMIT ?';
-        final rows = db.query(sql, [limit]);
+        final owner = _ownerClause(db, 'crew_members',
+            includeShared: asBool(args[_includeSharedKey]) ?? false);
+        final where = [
+          if (!include) 'archived = 0',
+          if (owner.isNotEmpty) owner,
+        ];
+        final rows = db.query(
+            'SELECT * FROM crew_members${_whereSql(where)} '
+            'ORDER BY name LIMIT ?',
+            [limit]);
         return _ok({'count': rows.length, 'crew': rows});
+      } on _ToolError catch (error) {
+        return _fail(error.message);
       } catch (error) {
         return _fail('list_crew failed: $error');
       }
@@ -834,18 +1190,29 @@ Future<void> runServer(String dbPath, {bool readonly = true}) async {
 
   server.registerTool(
     'list_saved_routes',
-    description: 'List saved routes.',
+    description:
+        'List saved routes. Local rows only unless include_shared is true.',
     inputSchema: JsonSchema.object(properties: {
+      _includeSharedKey: JsonSchema.boolean(
+          description:
+              'Include rows owned by another device or account. Default false.'),
       'limit': JsonSchema.integer(minimum: 1, maximum: 1000),
     }),
     annotations: readOnlyAnnotations,
     callback: (args, extra) async {
       try {
+        _rejectUnknown(args, {_includeSharedKey, 'limit'});
         final limit = asInt(args['limit']) ?? 200;
+        final owner = _ownerClause(db, 'saved_routes',
+            includeShared: asBool(args[_includeSharedKey]) ?? false);
         final rows = db.query(
-            'SELECT * FROM saved_routes ORDER BY flight_number LIMIT ?',
+            'SELECT * FROM saved_routes'
+            '${owner.isEmpty ? '' : ' WHERE $owner'} '
+            'ORDER BY flight_number LIMIT ?',
             [limit]);
         return _ok({'count': rows.length, 'routes': rows});
+      } on _ToolError catch (error) {
+        return _fail(error.message);
       } catch (error) {
         return _fail('list_saved_routes failed: $error');
       }
@@ -855,36 +1222,49 @@ Future<void> runServer(String dbPath, {bool readonly = true}) async {
   server.registerTool(
     'logbook_stats',
     description:
-        'Aggregate logbook statistics (flight count, drafts, total/night/day minutes, landings, takeoffs).',
+        'Aggregate logbook statistics. All times are minutes. flights counts '
+        'every local row including drafts, flights_complete counts rows with a '
+        'total time, and drafts counts the rest. Time and movement sums skip '
+        'empty values. sim_flights and sim_minutes report the simulator part, '
+        'which stays included in the other sums. Filters (date_from/date_to as '
+        'YYYY-MM-DD, or period) apply to every number in the response, and the '
+        'applied range is echoed back.',
     inputSchema: JsonSchema.object(properties: {
-      'date_from': JsonSchema.string(format: 'date'),
-      'date_to': JsonSchema.string(format: 'date'),
+      ..._dateFilterProperties(),
+      _includeSharedKey: JsonSchema.boolean(
+          description:
+              'Include rows owned by another device or account. Default false.'),
     }),
     annotations: readOnlyAnnotations,
     callback: (args, extra) async {
       try {
-        final where = <String>[];
-        final params = <Object?>[];
-        final from = dateToEpoch(args['date_from']);
-        if (from != null) {
-          where.add('date >= ?');
-          params.add(from);
-        }
-        final to = dateToEpoch(args['date_to'], endOfDay: true);
-        if (to != null) {
-          where.add('date <= ?');
-          params.add(to);
-        }
+        _rejectUnknown(args, _flightFilterKeys);
+        final window = _flightDateFilter(args, now: DateTime.now());
+        final where = [...window.where];
+        final params = [...window.params];
+        final owner = _ownerClause(db, 'flights',
+            includeShared: asBool(args[_includeSharedKey]) ?? false);
+        if (owner.isNotEmpty) where.add(owner);
         final sql = 'SELECT COUNT(*) AS flights, '
+            'COALESCE(SUM(CASE WHEN total_time IS NOT NULL THEN 1 ELSE 0 END), 0) AS flights_complete, '
             'COALESCE(SUM(CASE WHEN total_time IS NULL THEN 1 ELSE 0 END), 0) AS drafts, '
             'COALESCE(SUM(total_time), 0) AS total_minutes, '
             'COALESCE(SUM(night_time), 0) AS night_minutes, '
             'COALESCE(SUM(day_time), 0) AS day_minutes, '
             'COALESCE(SUM(landings), 0) AS landings, '
-            'COALESCE(SUM(takeoffs), 0) AS takeoffs '
-            'FROM flights${where.isEmpty ? '' : ' WHERE ${where.join(' AND ')}'}';
+            'COALESCE(SUM(takeoffs), 0) AS takeoffs, '
+            'COALESCE(SUM(CASE WHEN is_simulator = 1 THEN 1 ELSE 0 END), 0) AS sim_flights, '
+            'COALESCE(SUM(CASE WHEN is_simulator = 1 THEN total_time ELSE 0 END), 0) AS sim_minutes '
+            'FROM flights${_whereSql(where)}';
         final rows = db.query(sql, params);
-        return _ok(rows.isEmpty ? <String, dynamic>{} : rows.first);
+        final stats = rows.isEmpty ? <String, dynamic>{} : rows.first;
+        return _ok({
+          ...stats,
+          'range': _rangeOf(window),
+          'units': _units,
+        });
+      } on _ToolError catch (error) {
+        return _fail(error.message);
       } catch (error) {
         return _fail('logbook_stats failed: $error');
       }
@@ -898,8 +1278,11 @@ Future<void> runServer(String dbPath, {bool readonly = true}) async {
     annotations: readOnlyAnnotations,
     callback: (args, extra) async {
       try {
+        _rejectUnknown(args, const {});
         final rows = db.query('SELECT * FROM flights_settings LIMIT 1');
         return _ok(rows.isEmpty ? <String, dynamic>{} : rows.first);
+      } on _ToolError catch (error) {
+        return _fail(error.message);
       } catch (error) {
         return _fail('get_flight_settings failed: $error');
       }
@@ -913,8 +1296,11 @@ Future<void> runServer(String dbPath, {bool readonly = true}) async {
     annotations: readOnlyAnnotations,
     callback: (args, extra) async {
       try {
+        _rejectUnknown(args, const {});
         final rows = db.query('SELECT * FROM app_settings LIMIT 1');
         return _ok(rows.isEmpty ? <String, dynamic>{} : rows.first);
+      } on _ToolError catch (error) {
+        return _fail(error.message);
       } catch (error) {
         return _fail('get_app_settings failed: $error');
       }
@@ -929,8 +1315,11 @@ Future<void> runServer(String dbPath, {bool readonly = true}) async {
     annotations: readOnlyAnnotations,
     callback: (args, extra) async {
       try {
+        _rejectUnknown(args, const {});
         final rows = db.query('SELECT * FROM general_settings LIMIT 1');
         return _ok(rows.isEmpty ? <String, dynamic>{} : rows.first);
+      } on _ToolError catch (error) {
+        return _fail(error.message);
       } catch (error) {
         return _fail('get_general_settings failed: $error');
       }
@@ -946,11 +1335,14 @@ Future<void> runServer(String dbPath, {bool readonly = true}) async {
     annotations: readOnlyAnnotations,
     callback: (args, extra) async {
       try {
+        _rejectUnknown(args, {'limit'});
         final limit = asInt(args['limit']) ?? 50;
         final rows = db.query(
             'SELECT * FROM log_entries ORDER BY timestamp DESC, id DESC LIMIT ?',
             [limit]);
         return _ok({'count': rows.length, 'logs': rows});
+      } on _ToolError catch (error) {
+        return _fail(error.message);
       } catch (error) {
         return _fail('get_recent_logs failed: $error');
       }
@@ -960,21 +1352,32 @@ Future<void> runServer(String dbPath, {bool readonly = true}) async {
   server.registerTool(
     'find_missing_times',
     description:
-        'Find flights with no total time (drafts) or no day/night split.',
+        'Find flights with no total time (drafts) or no day/night split. Times '
+        'are minutes and dates are epoch seconds. Local rows only unless '
+        'include_shared is true.',
     inputSchema: JsonSchema.object(properties: {
       'limit': JsonSchema.integer(minimum: 1, maximum: 1000),
+      _includeSharedKey: JsonSchema.boolean(
+          description:
+              'Include rows owned by another device or account. Default false.'),
     }),
     annotations: readOnlyAnnotations,
     callback: (args, extra) async {
       try {
+        _rejectUnknown(args, {'limit', _includeSharedKey});
         final limit = asInt(args['limit']) ?? 200;
+        final owner = _ownerClause(db, 'flights',
+            includeShared: asBool(args[_includeSharedKey]) ?? false);
         final rows = db.query(
           'SELECT * FROM flights '
-          'WHERE total_time IS NULL OR (day_time IS NULL AND night_time IS NULL) '
-          'ORDER BY date DESC LIMIT ?',
+          'WHERE (total_time IS NULL OR (day_time IS NULL AND night_time IS NULL))'
+          '${owner.isEmpty ? '' : ' AND $owner'} '
+          'ORDER BY date DESC, day_order DESC, id LIMIT ?',
           [limit],
         );
-        return _ok({'count': rows.length, 'flights': rows});
+        return _ok({'count': rows.length, 'units': _units, 'flights': rows});
+      } on _ToolError catch (error) {
+        return _fail(error.message);
       } catch (error) {
         return _fail('find_missing_times failed: $error');
       }
@@ -983,12 +1386,21 @@ Future<void> runServer(String dbPath, {bool readonly = true}) async {
 
   server.registerTool(
     'dedupe_crew',
-    description: 'Find crew members with duplicate normalized names.',
-    inputSchema: JsonSchema.object(properties: {}),
+    description: 'Find crew members with duplicate normalized names. Local '
+        'rows only unless include_shared is true.',
+    inputSchema: JsonSchema.object(properties: {
+      _includeSharedKey: JsonSchema.boolean(
+          description:
+              'Include rows owned by another device or account. Default false.'),
+    }),
     annotations: readOnlyAnnotations,
     callback: (args, extra) async {
       try {
-        final rows = db.query('SELECT * FROM crew_members');
+        _rejectUnknown(args, {_includeSharedKey});
+        final owner = _ownerClause(db, 'crew_members',
+            includeShared: asBool(args[_includeSharedKey]) ?? false);
+        final rows = db.query(
+            'SELECT * FROM crew_members${owner.isEmpty ? '' : ' WHERE $owner'}');
         final groups = <String, List<Map<String, dynamic>>>{};
         for (final row in rows) {
           final key = _normalizeKey(row['name'] as String? ?? '');
@@ -1001,6 +1413,8 @@ Future<void> runServer(String dbPath, {bool readonly = true}) async {
               {'name': entry.key, 'members': entry.value},
         ];
         return _ok({'groups': duplicates.length, 'duplicates': duplicates});
+      } on _ToolError catch (error) {
+        return _fail(error.message);
       } catch (error) {
         return _fail('dedupe_crew failed: $error');
       }
@@ -1016,9 +1430,11 @@ Future<void> runServer(String dbPath, {bool readonly = true}) async {
     server.registerTool(
       'create_flight',
       description:
-          'Create a flight. Sets aircraft_id and crew_member_id automatically when the registration or crew name matches.',
+          'Create a flight. Times are minutes; total_time_hours, day_time_hours '
+          'and night_time_hours are accepted instead. Sets aircraft_id and '
+          'crew_member_id automatically when the registration or crew name matches.',
       inputSchema: JsonSchema.object(
-        properties: _propertiesOf(_supported(db, 'flights', _flightColumns)),
+        properties: _flightWriteProperties(db),
         required: ['date'],
       ),
       annotations: const ToolAnnotations(
@@ -1044,11 +1460,13 @@ Future<void> runServer(String dbPath, {bool readonly = true}) async {
     server.registerTool(
       'update_flight',
       description:
-          'Update a flight by id. Only the fields provided are changed.',
+          'Update a flight by id. Only the fields provided are changed. Times '
+          'are minutes; total_time_hours, day_time_hours and night_time_hours '
+          'are accepted instead.',
       inputSchema: JsonSchema.object(
         properties: {
           'id': JsonSchema.string(),
-          ..._propertiesOf(_supported(db, 'flights', _flightColumns)),
+          ..._flightWriteProperties(db),
         },
         required: ['id'],
       ),
@@ -1590,7 +2008,7 @@ Future<void> runServer(String dbPath, {bool readonly = true}) async {
     ),
     (uri, extra) async {
       final rows = db.query(
-          'SELECT * FROM flights ORDER BY date DESC, day_order ASC LIMIT 100');
+          'SELECT * FROM flights ORDER BY date DESC, day_order DESC, id LIMIT 100');
       return ReadResourceResult(
         contents: [
           TextResourceContents(
@@ -1642,9 +2060,12 @@ Future<void> runServer(String dbPath, {bool readonly = true}) async {
             mimeType: 'text/plain',
             text: 'FALCON DB CONVENTIONS\n\n'
                 '- Dates and timestamps are unix epoch seconds. The flights.date column holds local midnight of the flight date; tool inputs accept YYYY-MM-DD and are converted the same way.\n'
-                '- Flight time columns (total_time, day_time, night_time, actual_instrument, simulated_instrument, icus_day_time, icus_night_time) are integer MINUTES.\n'
+                '- Read filters accept only YYYY-MM-DD (or a named period) and reject anything else instead of ignoring it. Every filtered response echoes the applied window as range {from, to}.\n'
+                '- Flight time columns (total_time, day_time, night_time, actual_instrument, simulated_instrument, icus_day_time, icus_night_time) are integer MINUTES. Responses state this in a units object. Write tools also accept total_time_hours, day_time_hours and night_time_hours.\n'
                 '- time_start and time_stop are the raw HH:MM clock entries from the calculate-time dialog, paired with calc_time_mode (utc, local, time, hobbsTacho) and hobbs_start/hobbs_stop when that mode was used. They are not stored as durations.\n'
-                '- A flight is displayed as a DRAFT by the app when total_time IS NULL. Set total_time to make it complete.\n'
+                '- A flight is displayed as a DRAFT by the app when total_time IS NULL. Set total_time to make it complete. Lists include drafts; totals exclude them.\n'
+                '- Flights are ordered date DESC, day_order DESC, id, the same as the app. Flights on the same date are newest-first within the day.\n'
+                '- Reads return local rows only (owner_id NULL or "local") unless include_shared is true. Paged reads return count (rows on this page), total (all matching rows), has_more and offset.\n'
                 '- aircraft.registration is the BARE registration (e.g. country_code=VH, registration=XZO). The app displays country_code + "-" + registration.\n'
                 '- flights.aircraft_registration is the display registration (e.g. VH-XZO). Write tools accept either form and set aircraft_id from the matching aircraft row; flights.crew_members_name is matched the same way to set crew_member_id.\n'
                 '- flight_type values: route, details. crew_role values: pilotInCommand, copilot, student.\n'
