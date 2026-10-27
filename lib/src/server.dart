@@ -10,7 +10,7 @@ import 'util.dart';
 // Field metadata
 // ============================================================
 
-enum _Kind { text, integer, real, boolean, date }
+enum _Kind { text, integer, real, boolean, date, clock }
 
 /// One writable column: how to coerce it and how to advertise it to clients.
 class _Column {
@@ -33,6 +33,10 @@ class _Column {
           JsonSchema.number(description: note, minimum: min, maximum: max),
         _Kind.boolean => JsonSchema.boolean(description: note),
         _Kind.date => JsonSchema.string(description: note, format: 'date'),
+        // No pattern: the shapes accepted are wider than any single regex a
+        // client could read, and the SDK enforces a pattern before the tool
+        // runs, which would turn a valid 930 into a validation failure.
+        _Kind.clock => JsonSchema.string(description: note),
       };
 }
 
@@ -58,33 +62,45 @@ const _flightColumns = <_Column>[
   _Column('route', _Kind.text, note: 'Route text, e.g. "YSSY - NZQN".'),
   _Column('flight_number', _Kind.text),
   _Column('total_time', _Kind.integer,
-      min: 0, note: 'Minutes. Leave null to keep the flight a draft.'),
-  _Column('day_time', _Kind.integer, min: 0, note: 'Minutes.'),
-  _Column('night_time', _Kind.integer, min: 0, note: 'Minutes.'),
+      min: 0,
+      max: maxFlightMinutes,
+      note: 'Minutes, 1 to $maxFlightMinutes (8760 hours). Omit it to create a '
+          'draft, or pass draft: true on an update to clear it.'),
+  _Column('day_time', _Kind.integer,
+      min: 0, max: maxFlightMinutes, note: 'Minutes.'),
+  _Column('night_time', _Kind.integer,
+      min: 0, max: maxFlightMinutes, note: 'Minutes.'),
   _Column('calc_time_mode', _Kind.text,
       note: "'utc', 'local', 'time' or 'hobbsTacho'."),
-  _Column('time_start', _Kind.text,
-      note: 'Block-off clock time as entered, HH:MM.'),
-  _Column('time_stop', _Kind.text,
-      note: 'Block-on clock time as entered, HH:MM.'),
+  _Column('time_start', _Kind.clock,
+      note: 'Block-off clock time, 24-hour. Accepts 9, 930, 9:30, 09:30 or '
+          '0930 and stores HH:MM.'),
+  _Column('time_stop', _Kind.clock,
+      note: 'Block-on clock time, 24-hour. Accepts 9, 930, 9:30, 09:30 or '
+          '0930 and stores HH:MM.'),
   _Column('hobbs_start', _Kind.real, min: 0),
   _Column('hobbs_stop', _Kind.real, min: 0),
-  _Column('actual_instrument', _Kind.integer, min: 0, note: 'Minutes.'),
-  _Column('simulated_instrument', _Kind.integer, min: 0, note: 'Minutes.'),
-  _Column('ground_instrument', _Kind.integer, min: 0, note: 'Minutes.'),
-  _Column('icus_day_time', _Kind.integer, min: 0, note: 'Minutes.'),
-  _Column('icus_night_time', _Kind.integer, min: 0, note: 'Minutes.'),
+  _Column('actual_instrument', _Kind.integer,
+      min: 0, max: maxFlightMinutes, note: 'Minutes.'),
+  _Column('simulated_instrument', _Kind.integer,
+      min: 0, max: maxFlightMinutes, note: 'Minutes.'),
+  _Column('ground_instrument', _Kind.integer,
+      min: 0, max: maxFlightMinutes, note: 'Minutes.'),
+  _Column('icus_day_time', _Kind.integer,
+      min: 0, max: maxFlightMinutes, note: 'Minutes.'),
+  _Column('icus_night_time', _Kind.integer,
+      min: 0, max: maxFlightMinutes, note: 'Minutes.'),
   _Column('approaches2d', _Kind.text),
   _Column('approaches3d', _Kind.text),
   _Column('approach_details', _Kind.text),
-  _Column('takeoffs', _Kind.integer, min: 0),
-  _Column('landings', _Kind.integer, min: 0),
-  _Column('takeoff_day', _Kind.integer, min: 0),
-  _Column('takeoff_night', _Kind.integer, min: 0),
-  _Column('landing_day', _Kind.integer, min: 0),
-  _Column('landing_night', _Kind.integer, min: 0),
-  _Column('water_takeoffs', _Kind.integer, min: 0),
-  _Column('water_landings', _Kind.integer, min: 0),
+  _Column('takeoffs', _Kind.integer, min: 0, max: maxFlightCount),
+  _Column('landings', _Kind.integer, min: 0, max: maxFlightCount),
+  _Column('takeoff_day', _Kind.integer, min: 0, max: maxFlightCount),
+  _Column('takeoff_night', _Kind.integer, min: 0, max: maxFlightCount),
+  _Column('landing_day', _Kind.integer, min: 0, max: maxFlightCount),
+  _Column('landing_night', _Kind.integer, min: 0, max: maxFlightCount),
+  _Column('water_takeoffs', _Kind.integer, min: 0, max: maxFlightCount),
+  _Column('water_landings', _Kind.integer, min: 0, max: maxFlightCount),
   _Column('is_simulator', _Kind.boolean),
   _Column('is_ifr', _Kind.boolean),
   _Column('custom_columns', _Kind.text,
@@ -256,16 +272,36 @@ Object? _coerce(_Column column, Object? raw) {
         throw _ToolError('${column.name} must be a date such as 2026-10-27');
       }
       return value;
+    case _Kind.clock:
+      final value = canonicalClockTime(raw);
+      if (value == null) {
+        throw _ToolError(
+            '${column.name} must be a 24-hour clock time: 9, 930, 9:30, '
+            '09:30 or 0930 (got "$raw")');
+      }
+      return value;
   }
 }
 
 void _checkRange(_Column column, num value) {
   if (column.min != null && value < column.min!) {
-    throw _ToolError('${column.name} must be >= ${column.min}');
+    throw _ToolError(
+        '${column.name} must be >= ${column.min}${_unitSuffix(column)}');
   }
   if (column.max != null && value > column.max!) {
-    throw _ToolError('${column.name} must be <= ${column.max}');
+    throw _ToolError(
+        '${column.name} must be <= ${column.max}${_unitSuffix(column)}');
   }
+}
+
+/// The unit a range error names, so `<= 525600` cannot be read as a count and
+/// the pilot-facing limit is unambiguous.
+String _unitSuffix(_Column column) {
+  if (!_minuteColumns.contains(column.name)) return '';
+  if (column.max == maxFlightMinutes) {
+    return ' minutes (${maxFlightMinutes ~/ 60} hours)';
+  }
+  return ' minutes';
 }
 
 Map<String, JsonSchema> _propertiesOf(List<_Column> columns) => {
@@ -470,16 +506,22 @@ class _Auditor {
   }
 }
 
-/// Runs a write callback, auditing the outcome and converting validation
-/// failures into tool errors instead of crashes.
+/// Runs a write callback in one transaction, auditing the outcome and converting
+/// validation failures into tool errors instead of crashes.
+///
+/// The transaction is here rather than in each tool so every write is atomic: a
+/// refusal part way through a body leaves no partial row behind, and a read the
+/// body makes before writing sees the same snapshot as the write. Bodies that
+/// open their own transaction nest as a savepoint.
 CallToolResult _runWrite(
+  FalconDb db,
   _Auditor auditor,
   String tool,
   Map<String, dynamic> args,
   Object? Function() body,
 ) {
   try {
-    final result = body();
+    final result = db.transaction(body);
     final id = result is Map ? result['id'] : null;
     auditor.record(tool, args, id: id?.toString());
     return _ok(result);
@@ -571,8 +613,24 @@ Map<String, dynamic> _minutesFromHours(Map<String, dynamic> args) {
   return out;
 }
 
-/// Input schema for the flight write tools: the live columns plus the `_hours`
-/// aliases for the duration fields this database has.
+/// Applies `draft: true`: the flight's total time is cleared, which is the only
+/// thing that makes it a draft. Supplying a total at the same time is a
+/// contradiction, so it is refused rather than one of the two winning silently.
+void _applyDraft(Map<String, dynamic> fields, Map<String, dynamic> args) {
+  if (!args.containsKey('draft')) return;
+  final draft = asBool(args['draft']);
+  if (draft == null) throw _ToolError('draft must be true or false');
+  if (!draft) return;
+  if (fields.containsKey('total_time')) {
+    throw _ToolError(
+        'Supply either total_time or draft: true, not both. draft: true clears '
+        'total_time and makes the flight a draft.');
+  }
+  fields['total_time'] = null;
+}
+
+/// Input schema for the flight write tools: the live columns, the `_hours`
+/// aliases for the duration fields this database has, and `draft`.
 Map<String, JsonSchema> _flightWriteProperties(FalconDb db) {
   final available = db.columnsOf('flights').toSet();
   return {
@@ -583,8 +641,18 @@ Map<String, JsonSchema> _flightWriteProperties(FalconDb db) {
           minimum: 0,
           description: 'Hours, converted to ${entry.key} minutes.',
         ),
+    'draft': JsonSchema.boolean(
+      description: 'true clears total_time, which is what makes a flight a '
+          'draft. Cannot be combined with total_time. Clients cannot send a '
+          'null total_time, so this is the only way to clear a time.',
+    ),
   };
 }
+
+/// The columns that describe the day/night split. A disagreement between them
+/// is the one flight condition the app can never show, so it is checked on
+/// write.
+const Set<String> _splitFields = {'total_time', 'day_time', 'night_time'};
 
 /// Builds the column/value map for a flight from tool arguments, deriving the
 /// aircraft and crew foreign keys the app expects.
@@ -594,9 +662,10 @@ Map<String, JsonSchema> _flightWriteProperties(FalconDb db) {
 ) {
   final values = <String, Object?>{};
   final warnings = <String>[];
-  _rejectUnknown(
-      args, _fieldNames(_flightColumns, {'id', ..._hoursAliases.values}));
+  _rejectUnknown(args,
+      _fieldNames(_flightColumns, {'id', ..._hoursAliases.values, 'draft'}));
   final fields = _minutesFromHours(args);
+  _applyDraft(fields, args);
   if (fields.containsKey('date') && asText(fields['date']) == null) {
     throw _ToolError('date cannot be empty');
   }
@@ -606,6 +675,16 @@ Map<String, JsonSchema> _flightWriteProperties(FalconDb db) {
       keepNulls: true);
   for (var i = 0; i < columns.length; i++) {
     values[columns[i]] = raw[i];
+  }
+  // 0 is not a draft to the app: it stores and displays a complete flight with
+  // no duration, which the pilot cannot see and cannot fix from the logbook
+  // list. Only an absent total_time makes a draft, so this is refused rather
+  // than silently rewritten.
+  if (values['total_time'] == 0) {
+    throw _ToolError(
+        'total_time must be at least 1 minute: the app stores 0 as a complete '
+        'flight with no duration, not a draft. Pass draft: true to clear the '
+        'time.');
   }
 
   if (fields.containsKey('aircraft_registration')) {
@@ -668,6 +747,93 @@ Map<String, JsonSchema> _flightWriteProperties(FalconDb db) {
   }
   return (values: values, warnings: warnings);
 }
+
+/// What is wrong with a day/night split, as the app understands it: `total_time`
+/// set and either one side equal to it or both sides summing to it is complete.
+///
+/// Returns null when the row is as complete as it needs to be.
+String? _splitViolation(int? total, int? day, int? night) {
+  if (total == null) {
+    return day == null && night == null ? null : 'split_without_total';
+  }
+  if (day != null && night != null) return day + night == total ? null : 'sum';
+  if (day != null) return day == total ? null : 'day';
+  if (night != null) return night == total ? null : 'night';
+  return null;
+}
+
+/// Checks the split [row] would have after a write.
+///
+/// Two sides that do not sum to the total is an error: no Falcon screen can
+/// produce that row, and the app's own wizard refuses it. A one-sided split, or
+/// a split with no total, is only a warning, because the app saves those itself
+/// (a simulator session has no day/night split, and a draft can carry one side).
+///
+/// [before] and [written] let an update leave a pre-existing problem alone: an
+/// agent fixing a route must not be forced to repair times it did not touch.
+List<String> _checkDayNight(
+  Map<String, Object?> row, {
+  Map<String, dynamic>? before,
+  Set<String>? written,
+}) {
+  final total = asInt(row['total_time']);
+  final day = asInt(row['day_time']);
+  final night = asInt(row['night_time']);
+  final violation = _splitViolation(total, day, night);
+  if (violation == null) return const [];
+  if (before != null &&
+      written != null &&
+      !written.any(_splitFields.contains) &&
+      _splitViolation(asInt(before['total_time']), asInt(before['day_time']),
+              asInt(before['night_time'])) ==
+          violation) {
+    return const [];
+  }
+  return switch (violation) {
+    'sum' => throw _ToolError('day_time + night_time (${day! + night!}) must '
+        'equal total_time ($total). The app cannot display a split that does '
+        'not add up.'),
+    'split_without_total' => [
+        'day_time/night_time are set but total_time is not, so the app shows '
+            'this flight as a draft.'
+      ],
+    'day' => [
+        'day_time ($day) does not equal total_time ($total). The app stores '
+            'this one-sided split as given.'
+      ],
+    _ => [
+        'night_time ($night) does not equal total_time ($total). The app '
+            'stores this one-sided split as given.'
+      ],
+  };
+}
+
+/// The flight row [id] as the read tools present it, or null when it is gone.
+Map<String, dynamic>? _flightRow(FalconDb db, String id) {
+  final rows = db.query('SELECT * FROM flights WHERE id = ?', [id]);
+  return rows.isEmpty ? null : rows.first;
+}
+
+/// The next free `day_order` for the local day of [date], computed the way the
+/// app computes it on save (`_nextDayOrderForDate`): the highest local order on
+/// that day plus one, or 0 for the first flight of the day.
+int _nextDayOrder(FalconDb db, int date) {
+  final day = DateTime.fromMillisecondsSinceEpoch(date * 1000);
+  final where = <String>['date >= ?', 'date < ?'];
+  final owner = _ownerClause(db, 'flights', includeShared: false);
+  if (owner.isNotEmpty) where.add(owner);
+  final rows = db.query(
+    'SELECT COALESCE(MAX(day_order), -1) + 1 AS next FROM flights'
+    '${_whereSql(where)}',
+    [epochForDayStart(day), epochForDayAfter(day)],
+  );
+  return rows.isEmpty ? 0 : asInt(rows.first['next']) ?? 0;
+}
+
+/// Whether [date] is still the local day [storedDate] represents. [storedDate]
+/// is the `date` column as the row mapper renders it, local ISO text.
+bool _sameLocalDay(Object? storedDate, int date) =>
+    storedDate == epochToIso(date);
 
 /// Records a sync tombstone so a deleted row is not resurrected by Postgres
 /// sync, mirroring the app's delete path. No-op when no provider has synced.
@@ -736,8 +902,35 @@ String _bareRegistration(String registration, String countryCode) {
   return upper;
 }
 
-String _newId(String prefix) =>
-    'mcp_${prefix}_${DateTime.now().microsecondsSinceEpoch.toRadixString(16)}';
+/// The id a create should use. A caller-supplied id is accepted only when it is
+/// a UUID v4 and unused: imports need stable ids, and substituting a fresh one
+/// silently would defeat that.
+String _createId(FalconDb db, String table, Map<String, dynamic> args) {
+  final requested = asText(args['id']);
+  if (requested == null) return uuidV4();
+  if (!isUuidV4(requested)) {
+    throw _ToolError(
+        'id must be a UUID v4 (got "$requested"). Omit id to have one '
+        'generated: the synced id columns are UUID, so any other shape cannot '
+        'be pushed to the cloud.');
+  }
+  if (db.query('SELECT id FROM $table WHERE id = ?', [requested]).isNotEmpty) {
+    throw _ToolError('A $table row with id $requested already exists.');
+  }
+  return requested;
+}
+
+/// `updated_at` for a row being created, when the live table has the column.
+/// Without it a sync push keeps re-selecting the new row forever.
+Map<String, Object?> _createdStamp(FalconDb db, String table) => {
+      if (db.columnsOf(table).contains('updated_at'))
+        'updated_at': nowEpochSeconds(),
+    };
+
+/// Optional id for a create tool: a UUID v4 the caller wants to keep.
+JsonSchema get _createIdSchema => JsonSchema.string(
+    description: 'Optional id for an import: a UUID v4 that must be unused. '
+        'Omit it and one is generated.');
 
 // ============================================================
 // Server
@@ -1432,27 +1625,49 @@ Future<void> runServer(String dbPath, {bool readonly = true}) async {
       description:
           'Create a flight. Times are minutes; total_time_hours, day_time_hours '
           'and night_time_hours are accepted instead. Sets aircraft_id and '
-          'crew_member_id automatically when the registration or crew name matches.',
+          'crew_member_id automatically when the registration or crew name '
+          'matches. day_order is computed for the date. Returns the row as '
+          'written as flight, with draft telling you whether it counts as a '
+          'draft, and warnings for anything odd but legal.',
       inputSchema: JsonSchema.object(
-        properties: _flightWriteProperties(db),
+        properties: {
+          'id': _createIdSchema,
+          ..._flightWriteProperties(db),
+        },
         required: ['date'],
       ),
       annotations: const ToolAnnotations(
           readOnlyHint: false, destructiveHint: false, openWorldHint: false),
       callback: (args, extra) async =>
-          _runWrite(auditor, 'create_flight', args, () {
+          _runWrite(db, auditor, 'create_flight', args, () {
         if (asText(args['date']) == null) throw _ToolError('date is required');
         final flight = _flightValues(db, args);
-        final id = _newId('fl');
-        final fields = <String, Object?>{'id': id, ...flight.values};
+        final date = asInt(flight.values['date']);
+        if (date == null) throw _ToolError('date is required');
+        final id = _createId(db, 'flights', args);
+        final dayOrder = _nextDayOrder(db, date);
+        final fields = <String, Object?>{
+          'id': id,
+          'day_order': dayOrder,
+          ..._createdStamp(db, 'flights'),
+          ...flight.values,
+        };
         db.execute(
           'INSERT INTO flights (${fields.keys.join(', ')}) VALUES (${List.filled(fields.length, '?').join(', ')})',
           fields.values.toList(),
         );
+        final row = _flightRow(db, id)!;
+        final warnings = [
+          ...flight.warnings,
+          ..._checkDayNight(row),
+        ];
         return {
           'status': 'created',
           'id': id,
-          if (flight.warnings.isNotEmpty) 'warnings': flight.warnings,
+          'day_order': row['day_order'],
+          'draft': row['total_time'] == null,
+          'flight': row,
+          if (warnings.isNotEmpty) 'warnings': warnings,
         };
       }),
     );
@@ -1462,7 +1677,9 @@ Future<void> runServer(String dbPath, {bool readonly = true}) async {
       description:
           'Update a flight by id. Only the fields provided are changed. Times '
           'are minutes; total_time_hours, day_time_hours and night_time_hours '
-          'are accepted instead.',
+          'are accepted instead. draft: true clears total_time, because a null '
+          'total_time cannot be sent. Recomputes day_order when date moves the '
+          'flight to another day. Returns the row as written as flight.',
       inputSchema: JsonSchema.object(
         properties: {
           'id': JsonSchema.string(),
@@ -1473,30 +1690,36 @@ Future<void> runServer(String dbPath, {bool readonly = true}) async {
       annotations: const ToolAnnotations(
           readOnlyHint: false, destructiveHint: false, openWorldHint: false),
       callback: (args, extra) async =>
-          _runWrite(auditor, 'update_flight', args, () {
+          _runWrite(db, auditor, 'update_flight', args, () {
         final id = asText(args['id']);
         if (id == null) throw _ToolError('Missing or invalid id');
-        if (db.query('SELECT id FROM flights WHERE id = ?', [id]).isEmpty) {
-          throw _ToolError('Flight not found: $id');
-        }
+        final before = _flightRow(db, id);
+        if (before == null) throw _ToolError('Flight not found: $id');
         final flight = _flightValues(db, args);
         if (flight.values.isEmpty) throw _ToolError('No fields to update');
-        final assignments = [
-          for (final column in flight.values.keys) '$column = ?'
-        ];
-        final values = <Object?>[
-          ...flight.values.values,
-          nowEpochSeconds(),
-          id
-        ];
-        db.execute(
+        final values = Map<String, Object?>.of(flight.values);
+        final date = asInt(values['date']);
+        if (date != null && !_sameLocalDay(before['date'], date)) {
+          values['day_order'] = _nextDayOrder(db, date);
+        }
+        final assignments = [for (final column in values.keys) '$column = ?'];
+        final changed = db.execute(
           'UPDATE flights SET ${assignments.join(', ')}, updated_at = ? WHERE id = ?',
-          values,
+          [...values.values, nowEpochSeconds(), id],
         );
+        if (changed != 1) throw _ToolError('Flight not found: $id');
+        final row = _flightRow(db, id)!;
+        final warnings = [
+          ...flight.warnings,
+          ..._checkDayNight(row, before: before, written: values.keys.toSet()),
+        ];
         return {
           'status': 'updated',
           'id': id,
-          if (flight.warnings.isNotEmpty) 'warnings': flight.warnings,
+          'day_order': row['day_order'],
+          'draft': row['total_time'] == null,
+          'flight': row,
+          if (warnings.isNotEmpty) 'warnings': warnings,
         };
       }),
     );
@@ -1509,7 +1732,7 @@ Future<void> runServer(String dbPath, {bool readonly = true}) async {
       annotations: const ToolAnnotations(
           readOnlyHint: false, destructiveHint: true, openWorldHint: false),
       callback: (args, extra) async =>
-          _runWrite(auditor, 'delete_flight', args, () {
+          _runWrite(db, auditor, 'delete_flight', args, () {
         final id = asText(args['id']);
         if (id == null) throw _ToolError('Missing or invalid id');
         if (db.query('SELECT id FROM flights WHERE id = ?', [id]).isEmpty) {
@@ -1530,13 +1753,16 @@ Future<void> runServer(String dbPath, {bool readonly = true}) async {
       description:
           'Add an aircraft. Registration is the bare registration without country code.',
       inputSchema: JsonSchema.object(
-        properties: _propertiesOf(_supported(db, 'aircraft', _aircraftColumns)),
+        properties: {
+          'id': _createIdSchema,
+          ..._propertiesOf(_supported(db, 'aircraft', _aircraftColumns)),
+        },
         required: ['type', 'registration'],
       ),
       annotations: const ToolAnnotations(
           readOnlyHint: false, destructiveHint: false, openWorldHint: false),
       callback: (args, extra) async =>
-          _runWrite(auditor, 'add_aircraft', args, () {
+          _runWrite(db, auditor, 'add_aircraft', args, () {
         _rejectUnknown(args, _fieldNames(_aircraftColumns, {'id'}));
         final type = asText(args['type']);
         final registration = asText(args['registration']);
@@ -1553,7 +1779,7 @@ Future<void> runServer(String dbPath, {bool readonly = true}) async {
           throw _ToolError(
               'Aircraft $countryCode-$bare already exists (id ${clash.first['id']}).');
         }
-        final id = _newId('ac');
+        final id = _createId(db, 'aircraft', args);
         _insert(
           db,
           'aircraft',
@@ -1561,7 +1787,8 @@ Future<void> runServer(String dbPath, {bool readonly = true}) async {
             'id': id,
             'type': type,
             'country_code': countryCode,
-            'registration': bare
+            'registration': bare,
+            ..._createdStamp(db, 'aircraft'),
           },
           _aircraftColumns,
           args,
@@ -1584,7 +1811,7 @@ Future<void> runServer(String dbPath, {bool readonly = true}) async {
       annotations: const ToolAnnotations(
           readOnlyHint: false, destructiveHint: false, openWorldHint: false),
       callback: (args, extra) async =>
-          _runWrite(auditor, 'update_aircraft', args, () {
+          _runWrite(db, auditor, 'update_aircraft', args, () {
         _rejectUnknown(args, _fieldNames(_aircraftColumns, {'id'}));
         final id = asText(args['id']);
         if (id == null) throw _ToolError('Missing or invalid id');
@@ -1646,7 +1873,7 @@ Future<void> runServer(String dbPath, {bool readonly = true}) async {
       annotations: const ToolAnnotations(
           readOnlyHint: false, destructiveHint: true, openWorldHint: false),
       callback: (args, extra) async =>
-          _runWrite(auditor, 'delete_aircraft', args, () {
+          _runWrite(db, auditor, 'delete_aircraft', args, () {
         final id = asText(args['id']);
         if (id == null) throw _ToolError('Missing or invalid id');
         if (db.query('SELECT id FROM aircraft WHERE id = ?', [id]).isEmpty) {
@@ -1666,19 +1893,23 @@ Future<void> runServer(String dbPath, {bool readonly = true}) async {
       'add_crew',
       description: 'Add a crew member.',
       inputSchema: JsonSchema.object(
-        properties: _propertiesOf(_supported(db, 'crew_members', _crewColumns)),
+        properties: {
+          'id': _createIdSchema,
+          ..._propertiesOf(_supported(db, 'crew_members', _crewColumns)),
+        },
         required: ['first_name', 'last_name'],
       ),
       annotations: const ToolAnnotations(
           readOnlyHint: false, destructiveHint: false, openWorldHint: false),
-      callback: (args, extra) async => _runWrite(auditor, 'add_crew', args, () {
+      callback: (args, extra) async =>
+          _runWrite(db, auditor, 'add_crew', args, () {
         _rejectUnknown(args, _fieldNames(_crewColumns, {'id'}));
         final firstName = asText(args['first_name']);
         final lastName = asText(args['last_name']);
         if (firstName == null) throw _ToolError('first_name is required');
         if (lastName == null) throw _ToolError('last_name is required');
         final name = asText(args['name']) ?? '$firstName $lastName';
-        final id = _newId('cr');
+        final id = _createId(db, 'crew_members', args);
         _insert(
           db,
           'crew_members',
@@ -1686,7 +1917,8 @@ Future<void> runServer(String dbPath, {bool readonly = true}) async {
             'id': id,
             'name': name,
             'first_name': firstName,
-            'last_name': lastName
+            'last_name': lastName,
+            ..._createdStamp(db, 'crew_members'),
           },
           _crewColumns,
           args,
@@ -1709,7 +1941,7 @@ Future<void> runServer(String dbPath, {bool readonly = true}) async {
       annotations: const ToolAnnotations(
           readOnlyHint: false, destructiveHint: false, openWorldHint: false),
       callback: (args, extra) async =>
-          _runWrite(auditor, 'update_crew', args, () {
+          _runWrite(db, auditor, 'update_crew', args, () {
         _rejectUnknown(args, _fieldNames(_crewColumns, {'id'}));
         final id = asText(args['id']);
         if (id == null) throw _ToolError('Missing or invalid id');
@@ -1739,7 +1971,7 @@ Future<void> runServer(String dbPath, {bool readonly = true}) async {
       annotations: const ToolAnnotations(
           readOnlyHint: false, destructiveHint: true, openWorldHint: false),
       callback: (args, extra) async =>
-          _runWrite(auditor, 'delete_crew', args, () {
+          _runWrite(db, auditor, 'delete_crew', args, () {
         final id = asText(args['id']);
         if (id == null) throw _ToolError('Missing or invalid id');
         if (db
@@ -1761,20 +1993,32 @@ Future<void> runServer(String dbPath, {bool readonly = true}) async {
       description:
           'Add a custom airport that is not in the built-in airport list.',
       inputSchema: JsonSchema.object(
-        properties: _propertiesOf(
-            _supported(db, 'custom_airports', _customAirportColumns)),
+        properties: {
+          'id': _createIdSchema,
+          ..._propertiesOf(
+              _supported(db, 'custom_airports', _customAirportColumns)),
+        },
         required: ['name'],
       ),
       annotations: const ToolAnnotations(
           readOnlyHint: false, destructiveHint: false, openWorldHint: false),
       callback: (args, extra) async =>
-          _runWrite(auditor, 'add_custom_airport', args, () {
+          _runWrite(db, auditor, 'add_custom_airport', args, () {
         _rejectUnknown(args, _fieldNames(_customAirportColumns, {'id'}));
         final name = asText(args['name']);
         if (name == null) throw _ToolError('name is required');
-        final id = _newId('ap');
-        _insert(db, 'custom_airports', {'id': id, 'name': name},
-            _customAirportColumns, args);
+        final id = _createId(db, 'custom_airports', args);
+        _insert(
+          db,
+          'custom_airports',
+          {
+            'id': id,
+            'name': name,
+            ..._createdStamp(db, 'custom_airports'),
+          },
+          _customAirportColumns,
+          args,
+        );
         return {'status': 'created', 'id': id};
       }),
     );
@@ -1794,7 +2038,7 @@ Future<void> runServer(String dbPath, {bool readonly = true}) async {
       annotations: const ToolAnnotations(
           readOnlyHint: false, destructiveHint: false, openWorldHint: false),
       callback: (args, extra) async =>
-          _runWrite(auditor, 'update_custom_airport', args, () {
+          _runWrite(db, auditor, 'update_custom_airport', args, () {
         _rejectUnknown(args, _fieldNames(_customAirportColumns, {'id'}));
         final id = asText(args['id']);
         if (id == null) throw _ToolError('Missing or invalid id');
@@ -1824,7 +2068,7 @@ Future<void> runServer(String dbPath, {bool readonly = true}) async {
       annotations: const ToolAnnotations(
           readOnlyHint: false, destructiveHint: true, openWorldHint: false),
       callback: (args, extra) async =>
-          _runWrite(auditor, 'delete_custom_airport', args, () {
+          _runWrite(db, auditor, 'delete_custom_airport', args, () {
         final id = asText(args['id']);
         if (id == null) throw _ToolError('Missing or invalid id');
         if (db.query(
@@ -1852,7 +2096,7 @@ Future<void> runServer(String dbPath, {bool readonly = true}) async {
       annotations: const ToolAnnotations(
           readOnlyHint: false, destructiveHint: false, openWorldHint: false),
       callback: (args, extra) async =>
-          _runWrite(auditor, 'add_saved_route', args, () {
+          _runWrite(db, auditor, 'add_saved_route', args, () {
         _rejectUnknown(args, _fieldNames(_savedRouteColumns, {'id'}));
         final flightNumber = asText(args['flight_number']);
         final departure = asText(args['departure_icao']);
@@ -1889,7 +2133,7 @@ Future<void> runServer(String dbPath, {bool readonly = true}) async {
       annotations: const ToolAnnotations(
           readOnlyHint: false, destructiveHint: false, openWorldHint: false),
       callback: (args, extra) async =>
-          _runWrite(auditor, 'update_saved_route', args, () {
+          _runWrite(db, auditor, 'update_saved_route', args, () {
         _rejectUnknown(args, _fieldNames(_savedRouteColumns, {'id'}));
         final id = asInt(args['id']);
         if (id == null) throw _ToolError('Missing or invalid id');
@@ -1919,7 +2163,7 @@ Future<void> runServer(String dbPath, {bool readonly = true}) async {
       annotations: const ToolAnnotations(
           readOnlyHint: false, destructiveHint: true, openWorldHint: false),
       callback: (args, extra) async =>
-          _runWrite(auditor, 'delete_saved_route', args, () {
+          _runWrite(db, auditor, 'delete_saved_route', args, () {
         final id = asInt(args['id']);
         if (id == null) throw _ToolError('Missing or invalid id');
         if (db
@@ -1941,19 +2185,18 @@ Future<void> runServer(String dbPath, {bool readonly = true}) async {
     server.registerTool(
       'update_flight_settings',
       description:
-          'Update flight settings (pilot name, formats, country, display toggles).',
+          'Update flight settings (pilot name, formats, country, display '
+          'toggles). Creates the settings row when there is none. Returns the '
+          'settings as written as settings.',
       inputSchema: JsonSchema.object(
-        properties: {
-          'id': JsonSchema.string(),
-          ..._propertiesOf(
-              _supported(db, 'flights_settings', _flightSettingsColumns))
-        },
+        properties: _propertiesOf(
+            _supported(db, 'flights_settings', _flightSettingsColumns)),
       ),
       annotations: const ToolAnnotations(
           readOnlyHint: false, destructiveHint: false, openWorldHint: false),
       callback: (args, extra) async =>
-          _runWrite(auditor, 'update_flight_settings', args, () {
-        _rejectUnknown(args, _fieldNames(_flightSettingsColumns, {'id'}));
+          _runWrite(db, auditor, 'update_flight_settings', args, () {
+        _rejectUnknown(args, _fieldNames(_flightSettingsColumns));
         final columns = <String>[];
         final values = <Object?>[];
         _collect(db, 'flights_settings', _flightSettingsColumns, args, columns,
@@ -1974,23 +2217,36 @@ Future<void> runServer(String dbPath, {bool readonly = true}) async {
           }
         }
         final existing = db.query('SELECT id FROM flights_settings LIMIT 1');
-        final requested = asText(args['id']);
-        final id = requested ??
-            (existing.isEmpty
-                ? 'default'
-                : asText(existing.first['id']) ?? 'default');
+        // The app generates a UUID for its settings row, and 'default' is not a
+        // UUID, so a new row gets one too and the id is never an argument.
+        final id = existing.isEmpty
+            ? uuidV4()
+            : asText(existing.first['id']) ?? uuidV4();
         final assignments = [for (final column in columns) '$column = ?'];
+        final fields = <String, Object?>{
+          'id': id,
+          ..._createdStamp(db, 'flights_settings'),
+        };
         db.transaction(() {
           if (db.query(
               'SELECT id FROM flights_settings WHERE id = ?', [id]).isEmpty) {
-            db.execute('INSERT INTO flights_settings (id) VALUES (?)', [id]);
+            db.execute(
+              'INSERT INTO flights_settings (${fields.keys.join(', ')}) '
+              'VALUES (${List.filled(fields.length, '?').join(', ')})',
+              fields.values.toList(),
+            );
           }
           db.execute(
             'UPDATE flights_settings SET ${assignments.join(', ')}, updated_at = ? WHERE id = ?',
             [...values, nowEpochSeconds(), id],
           );
         });
-        return {'status': 'updated', 'id': id};
+        return {
+          'status': 'updated',
+          'id': id,
+          'settings': db
+              .query('SELECT * FROM flights_settings WHERE id = ?', [id]).first,
+        };
       }),
     );
   }
@@ -2067,8 +2323,12 @@ Future<void> runServer(String dbPath, {bool readonly = true}) async {
                 '- Dates and timestamps are unix epoch seconds. The flights.date column holds local midnight of the flight date; tool inputs accept YYYY-MM-DD and are converted the same way.\n'
                 '- Read filters accept only YYYY-MM-DD (or a named period) and reject anything else instead of ignoring it. Every filtered response echoes the applied window as range {from, to}.\n'
                 '- Flight time columns (total_time, day_time, night_time, actual_instrument, simulated_instrument, icus_day_time, icus_night_time) are integer MINUTES. Responses state this in a units object. Write tools also accept total_time_hours, day_time_hours and night_time_hours.\n'
-                '- time_start and time_stop are the raw HH:MM clock entries from the calculate-time dialog, paired with calc_time_mode (utc, local, time, hobbsTacho) and hobbs_start/hobbs_stop when that mode was used. They are not stored as durations.\n'
-                '- A flight is displayed as a DRAFT by the app when total_time IS NULL. Set total_time to make it complete. Lists include drafts; totals exclude them.\n'
+                '- Flight time is capped at 525600 minutes (8760 hours) and takeoff/landing counts at 10000, the same limits the app enforces. A value outside either is refused, and the error names the limit.\n'
+                '- day_time and night_time must add up to total_time when both are supplied: the app cannot display any other split, so it is refused. A one-sided split (for example day_time equal to total_time with no night_time) is stored as given and reported in warnings, because the app saves those itself.\n'
+                '- time_start and time_stop are 24-hour clock times stored as HH:MM. Write tools accept 9, 930, 9:30, 09:30 or 0930 and refuse anything else, so 9am is rejected rather than stored. They pair with calc_time_mode (utc, local, time, hobbsTacho) and hobbs_start/hobbs_stop when that mode was used. They are not stored as durations.\n'
+                '- A flight is a DRAFT when total_time IS NULL. Set total_time (1 minute or more) to make it complete. total_time 0 is refused: the app stores 0 as a complete flight with no duration, which the pilot cannot see or fix. To clear a time and make a flight a draft again, pass draft: true, because a null total_time cannot be sent over MCP. Lists include drafts; totals exclude them.\n'
+                '- ids for flights, aircraft, crew_members, custom_airports and flights_settings are RFC 4122 version 4 UUIDs, lowercase and hyphenated, the shape the cloud schema requires before a row can sync. A create tool accepts an optional UUID v4 id so an import can keep its own, and refuses any other shape. saved_routes keeps its integer id.\n'
+                '- day_order is the order of a flight within its date: a create takes the next free order for that day, and an update recomputes it when the date moves the flight to another day. updated_at records the last write.\n'
                 '- Flights are ordered date DESC, day_order DESC, id, the same as the app. Flights on the same date are newest-first within the day.\n'
                 '- Reads return local rows only (owner_id NULL or "local") unless include_shared is true. Paged reads return count (rows on this page), total (all matching rows), has_more and offset.\n'
                 '- aircraft.registration is the BARE registration (e.g. country_code=VH, registration=XZO). The app displays country_code + "-" + registration.\n'

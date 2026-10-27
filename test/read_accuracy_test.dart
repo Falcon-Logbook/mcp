@@ -420,13 +420,16 @@ void main() {
     expect(read['total_time'], 90);
     expect(read['night_time'], 30);
 
+    // The complete split (60 day + 30 night = 90 total) is the app's own rule,
+    // so this stays a test of the hours conversion rather than of the split
+    // check added for issue #10.
     final updated = await server.call('update_flight', {
       'id': id,
-      'day_time_hours': 0.25,
+      'day_time_hours': 1,
     });
     expect(updated.isError, isFalse, reason: '${updated.payload}');
     expect(
-        payloadOf(await server.call('get_flight', {'id': id}))['day_time'], 15);
+        payloadOf(await server.call('get_flight', {'id': id}))['day_time'], 60);
 
     final both = await server.call('create_flight', {
       'date': '2025-04-02',
