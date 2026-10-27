@@ -76,6 +76,30 @@ Future<void> runServer(String dbPath, {bool readonly = true}) async {
       inputSchema: JsonSchema.object(properties: {}),
       callback: (args, extra) async => ok({'path': dbPath, 'schemaVersion': sv, 'tables': db.tables, 'readonly': readonly}));
 
+  server.registerTool('get_schema',
+      description: 'Describe database tables and columns (name, type, nullability, default, PK). Optionally filter to one table.',
+      inputSchema: JsonSchema.object(properties: {'table': JsonSchema.string()}),
+      callback: (args, extra) async {
+        try {
+          final only = args['table'];
+          final tables = (only is String && only.isNotEmpty) ? [only] : db.tables;
+          final out = <String, dynamic>{};
+          for (final t in tables) {
+            final cols = db.query('PRAGMA table_info("$t")');
+            out[t] = cols.map((c) => {
+                  'name': c['name'],
+                  'type': c['type'],
+                  'notnull': c['notnull'],
+                  'default': c['dflt_value'],
+                  'pk': c['pk'],
+                }).toList();
+          }
+          return ok(out);
+        } catch (e) {
+          return fail('get_schema failed: $e');
+        }
+      });
+
   server.registerTool('list_flights',
       description: 'List flights with optional filters (date range, aircraft registration, flight type).',
       inputSchema: JsonSchema.object(properties: {
@@ -544,6 +568,7 @@ Future<void> runServer(String dbPath, {bool readonly = true}) async {
 
   server.registerTool('delete_flight',
       description: 'Delete a flight by id. ',
+      inputSchema: JsonSchema.object(properties: {'id': JsonSchema.string()}, required: ['id']),
       callback: (args, extra) async {
         try {
           final id = args['id'];
@@ -670,6 +695,7 @@ Future<void> runServer(String dbPath, {bool readonly = true}) async {
 
   server.registerTool('delete_aircraft',
       description: 'Delete an aircraft by id. ',
+      inputSchema: JsonSchema.object(properties: {'id': JsonSchema.string()}, required: ['id']),
       callback: (args, extra) async {
         try {
           final id = args['id'];
@@ -766,6 +792,7 @@ Future<void> runServer(String dbPath, {bool readonly = true}) async {
 
   server.registerTool('delete_crew',
       description: 'Delete a crew member by id. ',
+      inputSchema: JsonSchema.object(properties: {'id': JsonSchema.string()}, required: ['id']),
       callback: (args, extra) async {
         try {
           final id = args['id'];
@@ -830,6 +857,7 @@ Future<void> runServer(String dbPath, {bool readonly = true}) async {
 
   server.registerTool('delete_custom_airport',
       description: 'Delete a custom airport by id. ',
+      inputSchema: JsonSchema.object(properties: {'id': JsonSchema.string()}, required: ['id']),
       callback: (args, extra) async {
         try {
           final id = args['id'];
@@ -918,6 +946,7 @@ Future<void> runServer(String dbPath, {bool readonly = true}) async {
 
   server.registerTool('delete_saved_route',
       description: 'Delete a saved route by id. ',
+      inputSchema: JsonSchema.object(properties: {'id': JsonSchema.integer()}, required: ['id']),
       callback: (args, extra) async {
         try {
           final id = args['id'];
@@ -1034,6 +1063,7 @@ Future<void> runServer(String dbPath, {bool readonly = true}) async {
                   'add_crew, update_crew, delete_crew, add_custom_airport, delete_custom_airport, add_saved_route, '
                   'update_saved_route, delete_saved_route, update_flight_settings.\n\n'
                   'Writes apply immediately; an audit log is written next to the database.\n\n'
+                  'Call get_schema for exact table/column names and read the falcon://conventions resource for field semantics (dates, minutes, registration format, draft rule).\n'
                   'Example questions: "How many hours did I fly last year?", "List flights into YSSY in 2025", '
                   '"Are there flights missing block times?", "Add a flight today in VH-XZO from YSSY to NZQN".\n'
                   'Always confirm destructive or bulk operations with the user first.',
@@ -1059,6 +1089,35 @@ Future<void> runServer(String dbPath, {bool readonly = true}) async {
                 'Falcon MCP server: read and edit a local Falcon pilot logbook.\n'
                 'Tools cover flights, aircraft, airports, crew, routes, stats, settings, logs, and writes (gated by --readonly).\n'
                 'Use the falcon_help prompt for details.',
+          ),
+        ],
+      );
+    },
+  );
+
+  server.registerResource(
+    'conventions',
+    'falcon://conventions',
+    null,
+    (uri, extra) async {
+      return ReadResourceResult(
+        contents: [
+          TextResourceContents(
+            uri: uri.toString(),
+            mimeType: 'text/plain',
+            text:
+                'FALCON DB CONVENTIONS\n\n'
+                '- Dates/timestamps are stored as unix epoch seconds (UTC). Tool inputs accept YYYY-MM-DD and convert to local midnight.\n'
+                '- Flight time columns (total_time, day_time, night_time, block_off, block_on, etc.) are integer MINUTES.\n'
+                '- block_off / block_on are minutes since local midnight of the flight date; block_on_next_day marks a landing after midnight.\n'
+                '- A flight is shown as a DRAFT by the app when total_time IS NULL. Set total_time to mark it complete.\n'
+                '- Aircraft registration is stored as the BARE registration (e.g. country_code=VH, registration=XZO). The app displays country_code + "-" + registration. Do NOT include the country code in registration.\n'
+                '- Aircraft booleans: multi_engine, ifr, complex, pressurised, tailwheel, simulator, helicopter, float_plane, archived.\n'
+                '- flight_type values: route, details.\n'
+                '- calculate_time_mode values: utc, local, time, hobbsTacho.\n'
+                '- logbook_country is "AU", "NZ", or null.\n'
+                '- total_time is the authoritative flight duration; landings/takeoffs are counts per flight row.\n'
+                '- Use get_schema for exact table/column names before writing.',
           ),
         ],
       );

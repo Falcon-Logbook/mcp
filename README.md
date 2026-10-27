@@ -120,6 +120,7 @@ The server refuses to start if the database schema version does not match the su
 | Tool | Description |
 |---|---|
 | `db_info` | Database path, schema version, table list, readonly flag |
+| `get_schema` | Describe tables and columns (name, type, nullability, default, PK) |
 | `list_flights` | List flights with optional filters (date range, aircraft registration, flight type) |
 | `get_flight` | Get a single flight by id |
 | `search_flights` | Free-text search over route, flight number, crew name, registration |
@@ -153,7 +154,7 @@ The server refuses to start if the database schema version does not match the su
 | `delete_saved_route` | Delete a saved route by id |
 | `update_flight_settings` | Update flight settings |
 
-Resource: `falcon://flights` (latest 100 flights as JSON).
+Resources: `falcon://flights` (latest 100 flights as JSON), `falcon://overview`, `falcon://conventions` (field semantics: dates, minutes, registration format, draft rule), `falcon://schema`.
 
 ### Tech
 
