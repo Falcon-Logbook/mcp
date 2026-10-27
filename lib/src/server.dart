@@ -40,19 +40,6 @@ void _audit(String dbPath, String tool, Map<String, dynamic> args, String result
   } catch (_) {}
 }
 
-CallToolResult _confirmRequired(String tool, Map<String, dynamic> preview) {
-  return CallToolResult.fromContent([
-    TextContent(
-      text: const JsonEncoder.withIndent('  ').convert({
-        'status': 'preview',
-        'tool': tool,
-        'preview': preview,
-        'message': 'Dry run. Re-run with confirm=true to apply.',
-      }),
-    ),
-  ]);
-}
-
 Future<void> runServer(String dbPath, {bool readonly = true}) async {
   final db = openDb(dbPath);
 
@@ -79,8 +66,6 @@ Future<void> runServer(String dbPath, {bool readonly = true}) async {
 
   CallToolResult fail(String msg) =>
       CallToolResult(content: [TextContent(text: msg)], isError: true);
-
-  bool confirm(Map<String, dynamic> args) => args['confirm'] == true;
 
   // ============================================================
   // READ TOOLS
@@ -394,7 +379,7 @@ Future<void> runServer(String dbPath, {bool readonly = true}) async {
 
   // --- create_flight ---
   server.registerTool('create_flight',
-      description: 'Create a flight. Dry run by default; set confirm=true to apply.',
+      description: 'Create a flight. ',
       inputSchema: JsonSchema.object(properties: {
         'date': JsonSchema.string(),
         'aircraft_registration': JsonSchema.string(),
@@ -415,7 +400,6 @@ Future<void> runServer(String dbPath, {bool readonly = true}) async {
         'is_simulator': JsonSchema.boolean(),
         'is_ifr': JsonSchema.boolean(),
         'day_order': JsonSchema.integer(),
-        'confirm': JsonSchema.boolean(),
       }, required: ['date']),
       callback: (args, extra) async {
         try {
@@ -460,10 +444,6 @@ Future<void> runServer(String dbPath, {bool readonly = true}) async {
           cols.add('created_at');
           vals.add(nowSec);
 
-          final preview = {'id': id, 'columns': cols, 'values': vals};
-          if (!confirm(args)) {
-            return _confirmRequired('create_flight', preview);
-          }
 
           final placeholders = List.filled(cols.length, '?').join(',');
           db.execute('INSERT INTO flights (${cols.join(',')}) VALUES ($placeholders)', vals);
@@ -477,7 +457,7 @@ Future<void> runServer(String dbPath, {bool readonly = true}) async {
 
   // --- update_flight ---
   server.registerTool('update_flight',
-      description: 'Update a flight by id. Dry run by default; set confirm=true to apply.',
+      description: 'Update a flight by id. ',
       inputSchema: JsonSchema.object(properties: {
         'id': JsonSchema.string(),
         'date': JsonSchema.string(),
@@ -499,7 +479,6 @@ Future<void> runServer(String dbPath, {bool readonly = true}) async {
         'is_simulator': JsonSchema.boolean(),
         'is_ifr': JsonSchema.boolean(),
         'day_order': JsonSchema.integer(),
-        'confirm': JsonSchema.boolean(),
       }, required: ['id']),
       callback: (args, extra) async {
         try {
@@ -551,10 +530,6 @@ Future<void> runServer(String dbPath, {bool readonly = true}) async {
           sets.add('updated_at = ?');
           vals.add(nowSec);
 
-          final preview = {'id': id, 'updates': sets, 'values': vals};
-          if (!confirm(args)) {
-            return _confirmRequired('update_flight', preview);
-          }
 
           vals.add(id);
           db.execute('UPDATE flights SET ${sets.join(', ')} WHERE id = ?', vals);
@@ -567,17 +542,13 @@ Future<void> runServer(String dbPath, {bool readonly = true}) async {
       });
 
   server.registerTool('delete_flight',
-      description: 'Delete a flight by id. Dry run by default; set confirm=true to apply.',
-      inputSchema: JsonSchema.object(properties: {'id': JsonSchema.string(), 'confirm': JsonSchema.boolean()}, required: ['id']),
+      description: 'Delete a flight by id. ',
       callback: (args, extra) async {
         try {
           final id = args['id'];
           if (id is! String || id.isEmpty) return fail('Missing or invalid id');
           final existing = db.query('SELECT * FROM flights WHERE id = ?', [id]);
           if (existing.isEmpty) return fail('Flight not found: $id');
-          if (!confirm(args)) {
-            return _confirmRequired('delete_flight', {'id': id, 'flight': existing.first});
-          }
           db.execute('DELETE FROM flights WHERE id = ?', [id]);
           _audit(dbPath, 'delete_flight', args.cast<String, dynamic>(), 'ok', 'id=$id');
           return ok({'status': 'deleted', 'id': id});
@@ -589,7 +560,7 @@ Future<void> runServer(String dbPath, {bool readonly = true}) async {
 
   // --- aircraft ---
   server.registerTool('add_aircraft',
-      description: 'Add an aircraft. Dry run by default; set confirm=true to apply.',
+      description: 'Add an aircraft. ',
       inputSchema: JsonSchema.object(properties: {
         'type': JsonSchema.string(),
         'country_code': JsonSchema.string(),
@@ -603,7 +574,6 @@ Future<void> runServer(String dbPath, {bool readonly = true}) async {
         'helicopter': JsonSchema.boolean(),
         'float_plane': JsonSchema.boolean(),
         'archived': JsonSchema.boolean(),
-        'confirm': JsonSchema.boolean(),
       }, required: ['type', 'country_code', 'registration']),
       callback: (args, extra) async {
         try {
@@ -628,10 +598,6 @@ Future<void> runServer(String dbPath, {bool readonly = true}) async {
           add('float_plane', args['float_plane'], boolToInt: true);
           add('archived', args['archived'], boolToInt: true);
 
-          final preview = {'id': id, 'columns': cols, 'values': vals};
-          if (!confirm(args)) {
-            return _confirmRequired('add_aircraft', preview);
-          }
           final placeholders = List.filled(cols.length, '?').join(',');
           db.execute('INSERT INTO aircraft (${cols.join(',')}) VALUES ($placeholders)', vals);
           _audit(dbPath, 'add_aircraft', args.cast<String, dynamic>(), 'ok', 'id=$id');
@@ -643,7 +609,7 @@ Future<void> runServer(String dbPath, {bool readonly = true}) async {
       });
 
   server.registerTool('update_aircraft',
-      description: 'Update an aircraft by id. Dry run by default; set confirm=true to apply.',
+      description: 'Update an aircraft by id. ',
       inputSchema: JsonSchema.object(properties: {
         'id': JsonSchema.string(),
         'type': JsonSchema.string(),
@@ -658,7 +624,6 @@ Future<void> runServer(String dbPath, {bool readonly = true}) async {
         'helicopter': JsonSchema.boolean(),
         'float_plane': JsonSchema.boolean(),
         'archived': JsonSchema.boolean(),
-        'confirm': JsonSchema.boolean(),
       }, required: ['id']),
       callback: (args, extra) async {
         try {
@@ -692,9 +657,6 @@ Future<void> runServer(String dbPath, {bool readonly = true}) async {
           sets.add('updated_at = ?');
           vals.add(nowSec);
 
-          if (!confirm(args)) {
-            return _confirmRequired('update_aircraft', {'id': id, 'updates': sets});
-          }
           vals.add(id);
           db.execute('UPDATE aircraft SET ${sets.join(', ')} WHERE id = ?', vals);
           _audit(dbPath, 'update_aircraft', args.cast<String, dynamic>(), 'ok', 'id=$id');
@@ -706,17 +668,13 @@ Future<void> runServer(String dbPath, {bool readonly = true}) async {
       });
 
   server.registerTool('delete_aircraft',
-      description: 'Delete an aircraft by id. Dry run by default; set confirm=true to apply.',
-      inputSchema: JsonSchema.object(properties: {'id': JsonSchema.string(), 'confirm': JsonSchema.boolean()}, required: ['id']),
+      description: 'Delete an aircraft by id. ',
       callback: (args, extra) async {
         try {
           final id = args['id'];
           if (id is! String || id.isEmpty) return fail('Missing or invalid id');
           final existing = db.query('SELECT * FROM aircraft WHERE id = ?', [id]);
           if (existing.isEmpty) return fail('Aircraft not found: $id');
-          if (!confirm(args)) {
-            return _confirmRequired('delete_aircraft', {'id': id, 'aircraft': existing.first});
-          }
           db.execute('DELETE FROM aircraft WHERE id = ?', [id]);
           _audit(dbPath, 'delete_aircraft', args.cast<String, dynamic>(), 'ok', 'id=$id');
           return ok({'status': 'deleted', 'id': id});
@@ -728,14 +686,13 @@ Future<void> runServer(String dbPath, {bool readonly = true}) async {
 
   // --- crew ---
   server.registerTool('add_crew',
-      description: 'Add a crew member. Dry run by default; set confirm=true to apply.',
+      description: 'Add a crew member. ',
       inputSchema: JsonSchema.object(properties: {
         'name': JsonSchema.string(),
         'first_name': JsonSchema.string(),
         'last_name': JsonSchema.string(),
         'note': JsonSchema.string(),
         'archived': JsonSchema.boolean(),
-        'confirm': JsonSchema.boolean(),
       }, required: ['name', 'first_name', 'last_name']),
       callback: (args, extra) async {
         try {
@@ -751,10 +708,6 @@ Future<void> runServer(String dbPath, {bool readonly = true}) async {
             cols.add('archived');
             vals.add((args['archived'] == true) ? 1 : 0);
           }
-          final preview = {'id': id, 'columns': cols, 'values': vals};
-          if (!confirm(args)) {
-            return _confirmRequired('add_crew', preview);
-          }
           final placeholders = List.filled(cols.length, '?').join(',');
           db.execute('INSERT INTO crew_members (${cols.join(',')}) VALUES ($placeholders)', vals);
           _audit(dbPath, 'add_crew', args.cast<String, dynamic>(), 'ok', 'id=$id');
@@ -766,7 +719,7 @@ Future<void> runServer(String dbPath, {bool readonly = true}) async {
       });
 
   server.registerTool('update_crew',
-      description: 'Update a crew member by id. Dry run by default; set confirm=true to apply.',
+      description: 'Update a crew member by id. ',
       inputSchema: JsonSchema.object(properties: {
         'id': JsonSchema.string(),
         'name': JsonSchema.string(),
@@ -774,7 +727,6 @@ Future<void> runServer(String dbPath, {bool readonly = true}) async {
         'last_name': JsonSchema.string(),
         'note': JsonSchema.string(),
         'archived': JsonSchema.boolean(),
-        'confirm': JsonSchema.boolean(),
       }, required: ['id']),
       callback: (args, extra) async {
         try {
@@ -801,9 +753,6 @@ Future<void> runServer(String dbPath, {bool readonly = true}) async {
           sets.add('updated_at = ?');
           vals.add(nowSec);
 
-          if (!confirm(args)) {
-            return _confirmRequired('update_crew', {'id': id, 'updates': sets});
-          }
           vals.add(id);
           db.execute('UPDATE crew_members SET ${sets.join(', ')} WHERE id = ?', vals);
           _audit(dbPath, 'update_crew', args.cast<String, dynamic>(), 'ok', 'id=$id');
@@ -815,17 +764,13 @@ Future<void> runServer(String dbPath, {bool readonly = true}) async {
       });
 
   server.registerTool('delete_crew',
-      description: 'Delete a crew member by id. Dry run by default; set confirm=true to apply.',
-      inputSchema: JsonSchema.object(properties: {'id': JsonSchema.string(), 'confirm': JsonSchema.boolean()}, required: ['id']),
+      description: 'Delete a crew member by id. ',
       callback: (args, extra) async {
         try {
           final id = args['id'];
           if (id is! String || id.isEmpty) return fail('Missing or invalid id');
           final existing = db.query('SELECT * FROM crew_members WHERE id = ?', [id]);
           if (existing.isEmpty) return fail('Crew member not found: $id');
-          if (!confirm(args)) {
-            return _confirmRequired('delete_crew', {'id': id, 'crew': existing.first});
-          }
           db.execute('DELETE FROM crew_members WHERE id = ?', [id]);
           _audit(dbPath, 'delete_crew', args.cast<String, dynamic>(), 'ok', 'id=$id');
           return ok({'status': 'deleted', 'id': id});
@@ -837,7 +782,7 @@ Future<void> runServer(String dbPath, {bool readonly = true}) async {
 
   // --- custom airports ---
   server.registerTool('add_custom_airport',
-      description: 'Add a custom airport. Dry run by default; set confirm=true to apply.',
+      description: 'Add a custom airport. ',
       inputSchema: JsonSchema.object(properties: {
         'name': JsonSchema.string(),
         'icao': JsonSchema.string(),
@@ -848,7 +793,6 @@ Future<void> runServer(String dbPath, {bool readonly = true}) async {
         'lon': JsonSchema.number(),
         'elevation': JsonSchema.integer(),
         'tz': JsonSchema.string(),
-        'confirm': JsonSchema.boolean(),
       }, required: ['name']),
       callback: (args, extra) async {
         try {
@@ -873,10 +817,6 @@ Future<void> runServer(String dbPath, {bool readonly = true}) async {
           add('tz', args['tz']);
           if (args['owner_id'] != null) add('owner_id', args['owner_id']);
 
-          final preview = {'id': id, 'columns': cols, 'values': vals};
-          if (!confirm(args)) {
-            return _confirmRequired('add_custom_airport', preview);
-          }
           final placeholders = List.filled(cols.length, '?').join(',');
           db.execute('INSERT INTO custom_airports (${cols.join(',')}) VALUES ($placeholders)', vals);
           _audit(dbPath, 'add_custom_airport', args.cast<String, dynamic>(), 'ok', 'id=$id');
@@ -888,17 +828,13 @@ Future<void> runServer(String dbPath, {bool readonly = true}) async {
       });
 
   server.registerTool('delete_custom_airport',
-      description: 'Delete a custom airport by id. Dry run by default; set confirm=true to apply.',
-      inputSchema: JsonSchema.object(properties: {'id': JsonSchema.string(), 'confirm': JsonSchema.boolean()}, required: ['id']),
+      description: 'Delete a custom airport by id. ',
       callback: (args, extra) async {
         try {
           final id = args['id'];
           if (id is! String || id.isEmpty) return fail('Missing or invalid id');
           final existing = db.query('SELECT * FROM custom_airports WHERE id = ?', [id]);
           if (existing.isEmpty) return fail('Custom airport not found: $id');
-          if (!confirm(args)) {
-            return _confirmRequired('delete_custom_airport', {'id': id, 'airport': existing.first});
-          }
           db.execute('DELETE FROM custom_airports WHERE id = ?', [id]);
           _audit(dbPath, 'delete_custom_airport', args.cast<String, dynamic>(), 'ok', 'id=$id');
           return ok({'status': 'deleted', 'id': id});
@@ -910,13 +846,12 @@ Future<void> runServer(String dbPath, {bool readonly = true}) async {
 
   // --- saved routes ---
   server.registerTool('add_saved_route',
-      description: 'Add a saved route. Dry run by default; set confirm=true to apply.',
+      description: 'Add a saved route. ',
       inputSchema: JsonSchema.object(properties: {
         'flight_number': JsonSchema.string(),
         'departure_icao': JsonSchema.string(),
         'arrival_icao': JsonSchema.string(),
         'distance_nm': JsonSchema.number(),
-        'confirm': JsonSchema.boolean(),
       }, required: ['flight_number', 'departure_icao', 'arrival_icao']),
       callback: (args, extra) async {
         try {
@@ -926,10 +861,6 @@ Future<void> runServer(String dbPath, {bool readonly = true}) async {
           if (args['distance_nm'] != null) {
             cols.add('distance_nm');
             vals.add(args['distance_nm']);
-          }
-          final preview = {'columns': cols, 'values': vals};
-          if (!confirm(args)) {
-            return _confirmRequired('add_saved_route', preview);
           }
           final placeholders = List.filled(cols.length, '?').join(',');
           db.execute('INSERT INTO saved_routes (${cols.join(',')}) VALUES ($placeholders)', vals);
@@ -943,14 +874,13 @@ Future<void> runServer(String dbPath, {bool readonly = true}) async {
       });
 
   server.registerTool('update_saved_route',
-      description: 'Update a saved route by id. Dry run by default; set confirm=true to apply.',
+      description: 'Update a saved route by id. ',
       inputSchema: JsonSchema.object(properties: {
         'id': JsonSchema.integer(),
         'flight_number': JsonSchema.string(),
         'departure_icao': JsonSchema.string(),
         'arrival_icao': JsonSchema.string(),
         'distance_nm': JsonSchema.number(),
-        'confirm': JsonSchema.boolean(),
       }, required: ['id']),
       callback: (args, extra) async {
         try {
@@ -975,9 +905,6 @@ Future<void> runServer(String dbPath, {bool readonly = true}) async {
           sets.add('updated_at = ?');
           vals.add(nowSec);
 
-          if (!confirm(args)) {
-            return _confirmRequired('update_saved_route', {'id': id, 'updates': sets});
-          }
           vals.add(id);
           db.execute('UPDATE saved_routes SET ${sets.join(', ')} WHERE id = ?', vals);
           _audit(dbPath, 'update_saved_route', args.cast<String, dynamic>(), 'ok', 'id=$id');
@@ -989,16 +916,12 @@ Future<void> runServer(String dbPath, {bool readonly = true}) async {
       });
 
   server.registerTool('delete_saved_route',
-      description: 'Delete a saved route by id. Dry run by default; set confirm=true to apply.',
-      inputSchema: JsonSchema.object(properties: {'id': JsonSchema.integer(), 'confirm': JsonSchema.boolean()}, required: ['id']),
+      description: 'Delete a saved route by id. ',
       callback: (args, extra) async {
         try {
           final id = args['id'];
           final existing = db.query('SELECT * FROM saved_routes WHERE id = ?', [id]);
           if (existing.isEmpty) return fail('Saved route not found: $id');
-          if (!confirm(args)) {
-            return _confirmRequired('delete_saved_route', {'id': id, 'route': existing.first});
-          }
           db.execute('DELETE FROM saved_routes WHERE id = ?', [id]);
           _audit(dbPath, 'delete_saved_route', args.cast<String, dynamic>(), 'ok', 'id=$id');
           return ok({'status': 'deleted', 'id': id});
@@ -1010,7 +933,7 @@ Future<void> runServer(String dbPath, {bool readonly = true}) async {
 
   // --- settings update ---
   server.registerTool('update_flight_settings',
-      description: 'Update flight settings. Dry run by default; set confirm=true to apply.',
+      description: 'Update flight settings. ',
       inputSchema: JsonSchema.object(properties: {
         'id': JsonSchema.string(),
         'pilot_name': JsonSchema.string(),
@@ -1024,7 +947,6 @@ Future<void> runServer(String dbPath, {bool readonly = true}) async {
         'show_routes_in_wizard': JsonSchema.boolean(),
         'show_logbook_view': JsonSchema.boolean(),
         'show_flight_number': JsonSchema.boolean(),
-        'confirm': JsonSchema.boolean(),
       }),
       callback: (args, extra) async {
         try {
@@ -1057,9 +979,6 @@ Future<void> runServer(String dbPath, {bool readonly = true}) async {
           sets.add('updated_at = ?');
           vals.add(nowSec);
 
-          if (!confirm(args)) {
-            return _confirmRequired('update_flight_settings', {'id': id, 'updates': sets});
-          }
 
           // Upsert: if no row exists, insert.
           final existing = db.query('SELECT id FROM flights_settings WHERE id = ?', [id]);

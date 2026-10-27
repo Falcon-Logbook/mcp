@@ -1,6 +1,6 @@
 <p align="center">
-  <img src="https://img.shields.io/badge/Dart-3.4+-blue?logo=dart" alt="Dart">
-  <img src="https://img.shields.io/badge/MCP-2026--07--28-green" alt="MCP">
+ <img src="https://img.shields.io/badge/Dart-3.4+-blue?logo=dart" alt="Dart">
+ <img src="https://img.shields.io/badge/MCP-2026--07--28-green" alt="MCP">
 </p>
 
 # Falcon MCP Server
@@ -15,7 +15,7 @@ Built by [Team Super Panda](https://www.teamsuperpanda.com).
 
 Falcon MCP is a bridge between your logbook and an AI chat. It runs locally on your machine, reads your Falcon SQLite database directly, and exposes your data to any AI client that speaks the [Model Context Protocol](https://modelcontextprotocol.io). Nothing is uploaded anywhere: your data stays on your computer unless you choose to use a cloud AI provider, and even then only the question and the relevant rows travel.
 
-It works whether the Falcon app is open or closed, and it never modifies your logbook without your explicit confirmation.
+It works whether the Falcon app is open or closed.
 
 ---
 
@@ -25,10 +25,10 @@ It works whether the Falcon app is open or closed, and it never modifies your lo
 - **Find gaps** - flights missing block times or total time, duplicate crew members.
 - **Statistics** - totals for flights, hours, night time, landings, and takeoffs, by date range.
 - **Search and filter** - flights by date, aircraft, route, flight number, or free text; airports by ICAO/IATA/name/city; aircraft and crew lists.
-- **Edit with confirmation** - create, update, and delete flights, aircraft, crew, airports, and saved routes. Every write shows a preview first and requires `confirm=true`.
+- **Edit** - create, update, and delete flights, aircraft, crew, airports, and saved routes.
 - **Diagnostics** - read settings and recent log entries to troubleshoot.
 
-Reads are always allowed. Writes default to a dry-run preview and require explicit confirmation. Every write is recorded in a local audit log (`.mcp_audit.jsonl` next to your database).
+Reads and writes are both available. Every write is recorded in a local audit log (`.mcp_audit.jsonl` next to your database).
 
 ---
 
@@ -37,7 +37,7 @@ Reads are always allowed. Writes default to a dry-run preview and require explic
 - **Answers in seconds.** No manual filtering or counting. Ask in plain English, get the numbers.
 - **Your data stays yours.** The server reads your local SQLite file. No Falcon cloud, no telemetry, no account. Fully offline.
 - **No lock-in.** MCP is an open standard. Use Claude today, a different model tomorrow.
-- **Safe by design.** Writes are gated behind confirmation, a schema version gate refuses unexpected databases, and there is no network exposure by default.
+- **Safe by design.** A schema version gate refuses unexpected databases, and there is no network exposure by default (stdio mode).
 - **Complements the app.** Falcon stays the authority for your logbook; the MCP server only writes when you explicitly approve each change.
 
 ---
@@ -54,12 +54,12 @@ Set up the Falcon MCP server for me.
 3. Compile: `dart compile exe bin/falcon_mcp.dart -o ~/.local/bin/falcon_mcp`.
 4. Ensure libsqlite3 is available (symlink /lib64/libsqlite3.so.0 to ~/.local/lib/libsqlite3.so if needed).
 5. Ask me:
-   - Where is my Falcon database? (default: ~/Documents/Falcon/falcon_db.sqlite)
-   - Do I want read-only mode (safe, AI can only read) or read+write mode (AI can create/update/delete with confirmation)?
+  - Where is my Falcon database? (default: ~/Documents/Falcon/falcon_db.sqlite)
+  - Do I want read-only mode (safe, AI can only read) or read+write mode (AI can create/update/delete)?
 6. Register the server in my MCP client config:
-   - OpenCode: add a "Falcon" entry under "mcp" in ~/.config/opencode/opencode.json, type "local", command ["/home/<me>/.local/bin/falcon_mcp"], enabled true, environment FALCON_DB_PATH=<db path>, FALCON_READONLY=<true|false>, LD_LIBRARY_PATH=/home/<me>/.local/lib.
-   - Claude Desktop: add to claude_desktop_config.json with command and env.
-   - Claude Code: `claude mcp add falcon -- /home/<me>/.local/bin/falcon_mcp` with FALCON_DB_PATH set.
+  - OpenCode: add a "Falcon" entry under "mcp" in ~/.config/opencode/opencode.json, type "local", command ["/home/<me>/.local/bin/falcon_mcp"], enabled true, environment FALCON_DB_PATH=<db path>, FALCON_READONLY=<true|false>, LD_LIBRARY_PATH=/home/<me>/.local/lib.
+  - Claude Desktop: add to claude_desktop_config.json with command and env.
+  - Claude Code: `claude mcp add falcon -- /home/<me>/.local/bin/falcon_mcp` with FALCON_DB_PATH set.
 7. Restart the client and verify by calling db_info.
 8. Tell me the readonly setting I chose and how to flip it later (pass --no-readonly or set FALCON_READONLY=false).
 ```
@@ -67,7 +67,7 @@ Set up the Falcon MCP server for me.
 ### Read-only vs read+write
 
 - Default: read-only (`FALCON_READONLY=true`). Only read tools are exposed.
-- To allow edits: pass `--no-readonly` (or `FALCON_READONLY=false`). Write tools appear and require `confirm=true` per call.
+- To allow edits: pass `--no-readonly` (or `FALCON_READONLY=false`). Write tools are available immediately.
 - Your agent should ask which mode you want during setup and never enable writes without your explicit consent.
 
 ---
@@ -125,21 +125,21 @@ The server refuses to start if the database schema version does not match the su
 | `get_recent_logs` | Recent log entries for diagnostics |
 | `find_missing_times` | Find flights missing total/block times |
 | `dedupe_crew` | Find crew members with duplicate names |
-| `create_flight` | Create a flight (dry run unless confirm=true) |
-| `update_flight` | Update a flight by id (dry run unless confirm=true) |
-| `delete_flight` | Delete a flight by id (dry run unless confirm=true) |
-| `add_aircraft` | Add an aircraft (dry run unless confirm=true) |
-| `update_aircraft` | Update an aircraft by id (dry run unless confirm=true) |
-| `delete_aircraft` | Delete an aircraft by id (dry run unless confirm=true) |
-| `add_crew` | Add a crew member (dry run unless confirm=true) |
-| `update_crew` | Update a crew member by id (dry run unless confirm=true) |
-| `delete_crew` | Delete a crew member by id (dry run unless confirm=true) |
-| `add_custom_airport` | Add a custom airport (dry run unless confirm=true) |
-| `delete_custom_airport` | Delete a custom airport by id (dry run unless confirm=true) |
-| `add_saved_route` | Add a saved route (dry run unless confirm=true) |
-| `update_saved_route` | Update a saved route by id (dry run unless confirm=true) |
-| `delete_saved_route` | Delete a saved route by id (dry run unless confirm=true) |
-| `update_flight_settings` | Update flight settings (dry run unless confirm=true) |
+| `create_flight` | Create a flight |
+| `update_flight` | Update a flight by id |
+| `delete_flight` | Delete a flight by id |
+| `add_aircraft` | Add an aircraft |
+| `update_aircraft` | Update an aircraft by id |
+| `delete_aircraft` | Delete an aircraft by id |
+| `add_crew` | Add a crew member |
+| `update_crew` | Update a crew member by id |
+| `delete_crew` | Delete a crew member by id |
+| `add_custom_airport` | Add a custom airport |
+| `delete_custom_airport` | Delete a custom airport by id |
+| `add_saved_route` | Add a saved route |
+| `update_saved_route` | Update a saved route by id |
+| `delete_saved_route` | Delete a saved route by id |
+| `update_flight_settings` | Update flight settings |
 
 Resource: `falcon://flights` (latest 100 flights as JSON).
 
@@ -157,7 +157,7 @@ No Flutter dependency. The server is a plain Dart console program, so it stays s
 ### Privacy and safety
 
 - **Local only.** The server reads your SQLite file directly. It opens no sockets and exposes no network endpoints (stdio mode).
-- **Writes are gated.** Write tools default to a dry-run preview and require `confirm=true` to apply.
+- **Writes are direct.** Write tools apply immediately. Every write is recorded in a local audit log (`.mcp_audit.jsonl` next to your database).
 - **Schema-gated.** The server refuses to run if the database schema version is unexpected.
 - **No telemetry.** Nothing is sent anywhere by the server itself.
 
