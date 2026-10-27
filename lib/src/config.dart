@@ -78,4 +78,5 @@ String defaultDbPath() {
   return p.join(home, 'Falcon', 'falcon_db.sqlite');
 }
 
-const int expectedSchemaVersion = 18;
+const int minSchemaVersion = 18;
+const int maxSchemaVersion = 19;

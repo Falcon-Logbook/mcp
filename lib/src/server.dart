@@ -44,8 +44,8 @@ Future<void> runServer(String dbPath, {bool readonly = true}) async {
   final db = openDb(dbPath);
 
   final sv = db.schemaVersion;
-  if (sv != expectedSchemaVersion) {
-    throw StateError('Falcon DB schema version mismatch: found $sv, expected $expectedSchemaVersion.');
+  if (sv < minSchemaVersion || sv > maxSchemaVersion) {
+    throw StateError('Falcon DB schema version mismatch: found $sv, supported $minSchemaVersion-$maxSchemaVersion.');
   }
 
   final server = McpServer(

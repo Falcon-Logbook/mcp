@@ -101,7 +101,7 @@ FALCON_DB_PATH=/path/to/falcon_db.sqlite ./falcon_mcp
 ./falcon_mcp --db /path/to/falcon_db.sqlite --no-readonly
 ```
 
-The server refuses to start if the database schema version does not match the supported version (currently 18).
+The server refuses to start if the database schema version does not match the supported version (currently 18-19).
 
 ### Tools
 
