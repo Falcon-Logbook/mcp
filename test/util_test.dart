@@ -42,6 +42,87 @@ void main() {
     });
   });
 
+  group('parseCalendarDate', () {
+    test('accepts exactly YYYY-MM-DD', () {
+      expect(parseCalendarDate('2025-01-31'), DateTime(2025, 1, 31));
+      expect(parseCalendarDate(' 2025-01-31 '), DateTime(2025, 1, 31));
+      expect(
+          formatCalendarDate(parseCalendarDate('2025-01-05')!), '2025-01-05');
+    });
+
+    test('rejects every other form a read filter must not guess at', () {
+      for (final bad in <Object?>[
+        null,
+        '',
+        '   ',
+        '2025',
+        '20250101',
+        '2025-13-01',
+        '2025-02-30',
+        '2025-1-31',
+        '2026-10-26T20:00:00Z',
+        1761408000,
+      ]) {
+        expect(parseCalendarDate(bad), isNull, reason: 'must reject $bad');
+      }
+    });
+
+    test('day bounds are local midnight and the next local midnight', () {
+      final day = DateTime(2025, 1, 5);
+      final start =
+          DateTime.fromMillisecondsSinceEpoch(epochForDayStart(day) * 1000);
+      expect([start.year, start.month, start.day], [2025, 1, 5]);
+      expect([start.hour, start.minute, start.second], [0, 0, 0]);
+      final next =
+          DateTime.fromMillisecondsSinceEpoch(epochForDayAfter(day) * 1000);
+      expect([next.year, next.month, next.day], [2025, 1, 6]);
+      expect([next.hour, next.minute], [0, 0]);
+    });
+  });
+
+  group('resolveDatePreset', () {
+    final now = DateTime(2026, 10, 28, 14, 37);
+
+    String from(String preset) =>
+        formatCalendarDate(resolveDatePreset(preset, now: now)!.from);
+    String to(String preset) =>
+        formatCalendarDate(resolveDatePreset(preset, now: now)!.to);
+
+    test('last N days includes today and the N-1 dates before it', () {
+      expect([from('last_7_days'), to('last_7_days')],
+          ['2026-10-22', '2026-10-28']);
+      expect([from('last_30_days'), to('last_30_days')],
+          ['2026-09-29', '2026-10-28']);
+      expect([from('last_90_days'), to('last_90_days')],
+          ['2026-07-31', '2026-10-28']);
+    });
+
+    test('calendar presets cover the whole period, not a rolling window', () {
+      expect(
+          [from('this_month'), to('this_month')], ['2026-10-01', '2026-10-31']);
+      expect(
+          [from('this_year'), to('this_year')], ['2026-01-01', '2026-12-31']);
+      expect(
+          [from('last_year'), to('last_year')], ['2025-01-01', '2025-12-31']);
+    });
+
+    test('steps back over a month and a year boundary', () {
+      final january = DateTime(2026, 1, 3, 9);
+      expect(
+          formatCalendarDate(
+              resolveDatePreset('last_7_days', now: january)!.from),
+          '2025-12-28');
+      expect(
+          formatCalendarDate(resolveDatePreset('this_month', now: january)!.to),
+          '2026-01-31');
+    });
+
+    test('an unknown preset resolves to null rather than an empty window', () {
+      expect(resolveDatePreset('last_6_months', now: now), isNull);
+      expect(resolveDatePreset('2025', now: now), isNull);
+    });
+  });
+
   group('coercion', () {
     test('asBool understands bools, numbers and strings', () {
       expect(asBool(true), isTrue);
