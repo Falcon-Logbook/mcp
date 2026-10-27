@@ -44,24 +44,36 @@ Reads and writes are both available. Every write is recorded in a local audit lo
 
 ## Get your AI to install it for you
 
-You do not need to install this yourself. Paste this prompt to your AI agent (Claude Code, Codex, etc.) and it will set everything up:
+Paste this prompt to your AI agent (Claude Code, Codex, Cursor, OpenCode, or any other) and it will install and configure Falcon MCP for you:
 
 ```
 Set up the Falcon MCP server for me.
 
-1. Check that Dart SDK 3.4+ is installed (`dart --version`). If not, install it.
-2. Clone https://github.com/Falcon-Logbook/mcp into a local directory and run `dart pub get`.
-3. Compile: `dart compile exe bin/falcon_mcp.dart -o ~/.local/bin/falcon_mcp`.
-4. Ensure libsqlite3 is available (symlink /lib64/libsqlite3.so.0 to ~/.local/lib/libsqlite3.so if needed).
+You are an AI agent. Detect which environment/client you are running in
+(OpenCode, Claude Code, Claude Desktop, Codex, Cursor, Windsurf, or other)
+and follow that client's documented way of registering a local stdio MCP server.
+If you are unsure how to register an MCP server in this client, search the web
+for "<client name> MCP server setup stdio" and follow the official instructions.
+
+Steps:
+1. Check that Dart SDK 3.4+ is installed (`dart --version`). If not, install it for this OS.
+2. Clone https://github.com/Falcon-Logbook/mcp into a sensible local directory and run `dart pub get`.
+3. Compile: `dart compile exe bin/falcon_mcp.dart -o <bin-dir>/falcon_mcp` (use ~/.local/bin or equivalent).
+4. Ensure libsqlite3 is available (symlink the system libsqlite3 to ~/.local/lib/libsqlite3.so if needed).
 5. Ask me:
-  - Where is my Falcon database? (default: ~/Documents/Falcon/falcon_db.sqlite)
-  - Do I want read-only mode (safe, AI can only read) or read+write mode (AI can create/update/delete)?
-6. Register the server in my MCP client config:
-  - OpenCode: add a "Falcon" entry under "mcp" in ~/.config/opencode/opencode.json, type "local", command ["/home/<me>/.local/bin/falcon_mcp"], enabled true, environment FALCON_DB_PATH=<db path>, FALCON_READONLY=<true|false>, LD_LIBRARY_PATH=/home/<me>/.local/lib.
-  - Claude Desktop: add to claude_desktop_config.json with command and env.
-  - Claude Code: `claude mcp add falcon -- /home/<me>/.local/bin/falcon_mcp` with FALCON_DB_PATH set.
-7. Restart the client and verify by calling db_info.
-8. Tell me the readonly setting I chose and how to flip it later (pass --no-readonly or set FALCON_READONLY=false).
+   - Where is my Falcon database? If I am not sure, search common locations:
+       Linux:   ~/Documents/Falcon/falcon_db.sqlite, ~/.local/share/*/falcon_db.sqlite
+       macOS:   ~/Library/Application Support/Falcon/falcon_db.sqlite, ~/Library/Application Support/*/Falcon/falcon_db.sqlite
+       Windows: %APPDATA%\Falcon\falcon_db.sqlite, %APPDATA%\*\Falcon\falcon_db.sqlite
+     and any custom path stored in db_path.conf. Pick the first match and confirm with me.
+   - Do I want read-only mode (safe, AI can only read) or read+write mode (AI can create/update/delete)?
+6. Register the server as a local stdio MCP server named "Falcon" in this client's config,
+   passing the binary path and these environment variables:
+     FALCON_DB_PATH=<db path>
+     FALCON_READONLY=<true|false>
+     LD_LIBRARY_PATH=<path to libsqlite3 dir> (Linux only)
+7. Restart/reload the client if required and verify by calling db_info.
+8. Tell me the mode I chose and how to flip it later (pass --no-readonly or set FALCON_READONLY=false).
 ```
 
 ### Read-only vs read+write
