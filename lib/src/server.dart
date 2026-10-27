@@ -2003,12 +2003,17 @@ Future<void> runServer(String dbPath, {bool readonly = true}) async {
     'flights',
     'falcon://flights',
     (
-      description: 'The 100 most recent flights as JSON.',
+      description: 'The 100 most recent local flights as JSON.',
       mimeType: 'application/json',
     ),
     (uri, extra) async {
-      final rows = db.query(
-          'SELECT * FROM flights ORDER BY date DESC, day_order DESC, id LIMIT 100');
+      // A resource takes no arguments, so it answers with local rows only, the
+      // same default as list_flights. Use list_flights include_shared for the
+      // rest.
+      final owner = _ownerClause(db, 'flights', includeShared: false);
+      final rows = db
+          .query('SELECT * FROM flights${owner.isEmpty ? '' : ' WHERE $owner'} '
+              'ORDER BY date DESC, day_order DESC, id LIMIT 100');
       return ReadResourceResult(
         contents: [
           TextResourceContents(

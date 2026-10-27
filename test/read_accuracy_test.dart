@@ -320,6 +320,19 @@ void main() {
     expect(shared['total'], 3);
     expect(idsOf(shared), ['fl-foreign', 'fl-null', 'fl-local']);
 
+    // The resource takes no arguments, so it defaults to local rows only.
+    final resource =
+        await server.send('resources/read', {'uri': 'falcon://flights'});
+    final contents =
+        ((resource['result'] as Map)['contents'] as List).single as Map;
+    expect(
+      [
+        for (final row in jsonDecode(contents['text'] as String) as List)
+          (row as Map)['id'] as String
+      ],
+      ['fl-null', 'fl-local'],
+    );
+
     final stats = payloadOf(await server.call('logbook_stats', {}));
     expect(stats['flights'], 2);
     expect(stats['total_minutes'], 120);
