@@ -15,6 +15,8 @@ Built by [Team Super Panda](https://www.teamsuperpanda.com).
 
 Falcon MCP is a bridge between your logbook and an AI chat. It runs locally on your machine, reads your Falcon SQLite database directly, and exposes your data to any AI client that speaks the [Model Context Protocol](https://modelcontextprotocol.io). Nothing is uploaded anywhere: your data stays on your computer unless you choose to use a cloud AI provider, and even then only the question and the relevant rows travel.
 
+**Desktop only.** It targets the database the Falcon desktop app writes on Windows, macOS and Linux. There is no Falcon Cloud support and none is planned: the server has no hosted endpoint, no account, no sync awareness, and it never opens a connection to a Falcon server. It also cannot reach the database inside the mobile app, which is sandboxed to that device.
+
 It works whether the Falcon app is open or closed.
 
 ---
@@ -35,7 +37,7 @@ Reads and writes are both available. Every write is recorded in a local audit lo
 ## Benefits
 
 - **Answers in seconds.** No manual filtering or counting. Ask in plain English, get the numbers.
-- **Your data stays yours.** The server reads your local SQLite file. No Falcon cloud, no telemetry, no account. Fully offline.
+- **Your data stays yours.** The server reads your local SQLite file. No Falcon Cloud, no telemetry, no account. Fully offline.
 - **No lock-in.** MCP is an open standard. Use Claude today, a different model tomorrow.
 - **Safe by design.** A schema version gate refuses unexpected databases, writes are off unless you enable them, and there is no network exposure (stdio mode).
 - **Complements the app.** Falcon stays the authority for your logbook: the server writes the same rows the app writes, including aircraft and crew links.
@@ -143,7 +145,6 @@ The server refuses to start if the database schema version is outside the suppor
 | `get_flight_settings` | Pilot name, formats, country, display preferences |
 | `get_app_settings` | Storage mode, theme, accent, and app preferences |
 | `get_general_settings` | Startup tab, language, coordinates format, etc. |
-| `get_sync_status` | Sync state per table/provider and pending tombstone count |
 | `get_recent_logs` | Recent log entries for diagnostics |
 | `find_missing_times` | Find draft flights (no total time) or flights with no day/night split |
 | `dedupe_crew` | Find crew members with duplicate names |
@@ -192,16 +193,17 @@ The suite builds a temporary database with the real Falcon schema and drives the
 
 - **Local only.** The server reads your SQLite file directly. It opens no sockets and exposes no network endpoints (stdio mode).
 - **Writes are direct.** Write tools apply immediately. Every write is recorded in a local audit log (`<database-name>.mcp_audit.jsonl` next to your database).
-- **Same shape as the app.** Foreign keys are enforced, deletes record sync tombstones when a Postgres sync provider has been used, and deleting a saved route unlinks the flights that used it.
+- **Same shape as the app.** Foreign keys are enforced, deletes record the same tombstones the app writes (only when a sync provider has already been used, so a later sync does not resurrect the row), and deleting a saved route unlinks the flights that used it. That is app parity on the local file, not cloud support: the server never talks to a sync server.
 - **Schema-gated.** The server refuses to run if the database schema version is unexpected.
 - **No telemetry.** Nothing is sent anywhere by the server itself.
 
 ### Roadmap
 
-- **Falcon Cloud MCP endpoint** - a hosted, HTTPS MCP server for Falcon Cloud subscribers.
+- **Exports and reports** - let the agent produce the app's exports and PDF reports, not just the rows behind them. Tracked as an issue.
 - **HTTP/SSE transport** for the local server (in addition to stdio).
-- **Postgres connection tools** - set up, test, and disconnect sync connections from the AI.
 - **In-app MCP server** - embed the MCP endpoint inside the Falcon app to reuse the real DAOs and stay the single writer.
+
+Not planned: anything Falcon Cloud. No hosted endpoint, no sync administration. The server is a local reader and writer of one desktop database file.
 
 ---
 

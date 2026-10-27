@@ -52,6 +52,23 @@ void main() {
     expect((stats.payload as Map)['total_minutes'], 120);
   });
 
+  test('exposes no sync or cloud surface', () async {
+    final server = await McpProcess.start(dbPath);
+    addTearDown(() async {
+      await server.stop();
+    });
+
+    // The server is desktop-only and has no Falcon Cloud or sync awareness.
+    // A reintroduced tool with these words in it means that scope came back.
+    final tools = await server.toolNames();
+    expect(
+      tools.where((tool) => RegExp(r'sync|cloud|server|provider').hasMatch(tool)),
+      isEmpty,
+      reason: 'desktop-only server must expose no sync or cloud tools',
+    );
+    expect(tools, isNot(contains('get_sync_status')));
+  });
+
   test('schema resource and get_schema describe the database', () async {
     final server = await McpProcess.start(dbPath);
     addTearDown(() async {

@@ -3,7 +3,7 @@ import 'dart:io';
 import 'package:path/path.dart' as p;
 
 /// Version advertised over MCP and by `--version`.
-const String serverVersion = '0.3.0';
+const String serverVersion = '0.4.0';
 
 /// Schema versions this server can read and write. Every query selects whole
 /// rows and writes only columns it knows about, so additive columns added by

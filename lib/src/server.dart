@@ -938,32 +938,6 @@ Future<void> runServer(String dbPath, {bool readonly = true}) async {
   );
 
   server.registerTool(
-    'get_sync_status',
-    description:
-        'Get sync state per table/provider and pending tombstone count.',
-    inputSchema: JsonSchema.object(properties: {}),
-    annotations: readOnlyAnnotations,
-    callback: (args, extra) async {
-      try {
-        final state =
-            db.query('SELECT * FROM sync_state ORDER BY sync_table, provider');
-        final deletions = db.query(
-          'SELECT provider, sync_table, COUNT(*) AS pending FROM sync_deletions GROUP BY provider, sync_table',
-        );
-        final pending =
-            db.query('SELECT COUNT(*) AS pending FROM sync_deletions');
-        return _ok({
-          'syncState': state,
-          'pendingDeletions': pending.isEmpty ? 0 : pending.first['pending'],
-          'tombstones': deletions,
-        });
-      } catch (error) {
-        return _fail('get_sync_status failed: $error');
-      }
-    },
-  );
-
-  server.registerTool(
     'get_recent_logs',
     description: 'Read recent log entries for diagnostics.',
     inputSchema: JsonSchema.object(properties: {
@@ -1734,7 +1708,7 @@ Future<void> runServer(String dbPath, {bool readonly = true}) async {
                   '${readonly ? '' : ' and edits'} a local Falcon pilot logbook (SQLite).\n\n'
                   'Read tools: db_info, get_schema, list_flights, get_flight, search_flights, list_aircraft, '
                   'get_aircraft, list_airports, list_custom_airports, list_crew, list_saved_routes, logbook_stats, '
-                  'get_flight_settings, get_app_settings, get_general_settings, get_sync_status, get_recent_logs, '
+                  'get_flight_settings, get_app_settings, get_general_settings, get_recent_logs, '
                   'find_missing_times, dedupe_crew.\n'
                   '$writeTools\n'
                   'Call get_schema for exact table/column names and read the falcon://conventions resource for field semantics (dates, minutes, registration format, draft rule).\n'
