@@ -1,23 +1,32 @@
 import 'dart:convert';
-import 'dart:io';
 
 import 'package:mcp_dart/mcp_dart.dart';
 
-import 'config.dart';
 import 'db.dart';
+
+/// Convert a date-only string (YYYY-MM-DD) to unix seconds (UTC midnight).
+/// Returns null if unparseable.
+int? _dateToEpoch(String? s, {bool endOfDay = false}) {
+  if (s == null || s.trim().isEmpty) return null;
+  try {
+    final d = DateTime.parse(s.trim()).toUtc();
+    final base = DateTime.utc(d.year, d.month, d.day);
+    if (endOfDay) {
+      return base.add(const Duration(days: 1)).subtract(const Duration(seconds: 1)).millisecondsSinceEpoch ~/ 1000;
+    }
+    return base.millisecondsSinceEpoch ~/ 1000;
+  } catch (_) {
+    return null;
+  }
+}
 
 Future<void> runServer(String dbPath) async {
   final db = openDb(dbPath);
 
-  // Schema version gate.
   final sv = db.schemaVersion;
-  if (sv != expectedSchemaVersion) {
-    stderr.writeln(
-      'Falcon DB schema version mismatch: found $sv, expected $expectedSchemaVersion. '
-      'Refusing to run. Update the app or the server.',
-    );
-    db.close();
-    exit(1);
+  const expected = 18;
+  if (sv != expected) {
+    throw StateError('Falcon DB schema version mismatch: found $sv, expected $expected.');
   }
 
   final server = McpServer(
@@ -69,29 +78,29 @@ Future<void> runServer(String dbPath) async {
         final offset = (args['offset'] as num?)?.toInt() ?? 0;
         final where = <String>[];
         final params = <Object?>[];
-        final df = args['date_from'];
-        if (df is String && df.isNotEmpty) {
+        final fromEpoch = _dateToEpoch(args['date_from'] as String?);
+        if (fromEpoch != null) {
           where.add('date >= ?');
-          params.add(df);
+          params.add(fromEpoch);
         }
-        final dt = args['date_to'];
-        if (dt is String && dt.isNotEmpty) {
+        final toEpoch = _dateToEpoch(args['date_to'] as String?, endOfDay: true);
+        if (toEpoch != null) {
           where.add('date <= ?');
-          params.add(dt);
+          params.add(toEpoch);
         }
         final ar = args['aircraft_registration'];
         if (ar is String && ar.isNotEmpty) {
-          where.add('aircraftRegistration = ?');
+          where.add('aircraft_registration = ?');
           params.add(ar);
         }
         final ft = args['flight_type'];
         if (ft is String && ft.isNotEmpty) {
-          where.add('flightType = ?');
+          where.add('flight_type = ?');
           params.add(ft);
         }
         final sql = 'SELECT * FROM flights'
             '${where.isEmpty ? '' : ' WHERE ${where.join(' AND ')}'}'
-            ' ORDER BY date DESC, dayOrder ASC LIMIT ? OFFSET ?';
+            ' ORDER BY date DESC, day_order ASC LIMIT ? OFFSET ?';
         params.addAll([limit, offset]);
         final rows = db.query(sql, params);
         return ok({'count': rows.length, 'flights': rows});
@@ -125,7 +134,7 @@ Future<void> runServer(String dbPath) async {
   // --- search_flights ---
   server.registerTool(
     'search_flights',
-    description: 'Search flights by free text (route, flight number, crew name).',
+    description: 'Search flights by free text (route, flight number, crew name, registration).',
     inputSchema: JsonSchema.object(
       properties: {
         'query': JsonSchema.string(),
@@ -140,7 +149,7 @@ Future<void> runServer(String dbPath) async {
         final limit = (args['limit'] as num?)?.toInt() ?? 50;
         final like = '%$q%';
         final rows = db.query(
-          'SELECT * FROM flights WHERE route LIKE ? OR flightNumber LIKE ? OR crewMembersName LIKE ? OR aircraftRegistration LIKE ? ORDER BY date DESC LIMIT ?',
+          'SELECT * FROM flights WHERE route LIKE ? OR flight_number LIKE ? OR crew_members_name LIKE ? OR aircraft_registration LIKE ? ORDER BY date DESC LIMIT ?',
           [like, like, like, like, limit],
         );
         return ok({'count': rows.length, 'flights': rows});
@@ -297,20 +306,20 @@ Future<void> runServer(String dbPath) async {
       try {
         final where = <String>[];
         final params = <Object?>[];
-        final df = args['date_from'];
-        if (df is String && df.isNotEmpty) {
+        final fromEpoch = _dateToEpoch(args['date_from'] as String?);
+        if (fromEpoch != null) {
           where.add('date >= ?');
-          params.add(df);
+          params.add(fromEpoch);
         }
-        final dt = args['date_to'];
-        if (dt is String && dt.isNotEmpty) {
+        final toEpoch = _dateToEpoch(args['date_to'] as String?, endOfDay: true);
+        if (toEpoch != null) {
           where.add('date <= ?');
-          params.add(dt);
+          params.add(toEpoch);
         }
         final sql = 'SELECT COUNT(*) AS flights, '
-            'COALESCE(SUM(totalTime),0) AS totalMinutes, '
-            'COALESCE(SUM(nightTime),0) AS nightMinutes, '
-            'COALESCE(SUM(dayTime),0) AS dayMinutes, '
+            'COALESCE(SUM(total_time),0) AS total_minutes, '
+            'COALESCE(SUM(night_time),0) AS night_minutes, '
+            'COALESCE(SUM(day_time),0) AS day_minutes, '
             'COALESCE(SUM(landings),0) AS landings, '
             'COALESCE(SUM(takeoffs),0) AS takeoffs '
             'FROM flights${where.isEmpty ? '' : ' WHERE ${where.join(' AND ')}'}';
@@ -322,7 +331,7 @@ Future<void> runServer(String dbPath) async {
     },
   );
 
-  // --- get_settings ---
+  // --- settings ---
   server.registerTool(
     'get_flight_settings',
     description: 'Get flight settings (pilot name, formats, country, etc.).',
@@ -337,26 +346,6 @@ Future<void> runServer(String dbPath) async {
     },
   );
 
-  // --- get_recent_logs ---
-  server.registerTool(
-    'get_recent_logs',
-    description: 'Read recent log entries for diagnostics.',
-    inputSchema: JsonSchema.object(properties: {'limit': JsonSchema.integer()}),
-    callback: (args, extra) async {
-      try {
-        final limit = (args['limit'] as num?)?.toInt() ?? 50;
-        final rows = db.query(
-          'SELECT * FROM log_entries ORDER BY timestamp DESC LIMIT ?',
-          [limit],
-        );
-        return ok({'count': rows.length, 'logs': rows});
-      } catch (e) {
-        return fail('get_recent_logs failed: $e');
-      }
-    },
-  );
-
-  // --- app settings ---
   server.registerTool(
     'get_app_settings',
     description: 'Get app settings (storage mode, theme, accent, etc.).',
@@ -402,6 +391,25 @@ Future<void> runServer(String dbPath) async {
     },
   );
 
+  // --- logs ---
+  server.registerTool(
+    'get_recent_logs',
+    description: 'Read recent log entries for diagnostics.',
+    inputSchema: JsonSchema.object(properties: {'limit': JsonSchema.integer()}),
+    callback: (args, extra) async {
+      try {
+        final limit = (args['limit'] as num?)?.toInt() ?? 50;
+        final rows = db.query(
+          'SELECT * FROM log_entries ORDER BY timestamp DESC LIMIT ?',
+          [limit],
+        );
+        return ok({'count': rows.length, 'logs': rows});
+      } catch (e) {
+        return fail('get_recent_logs failed: $e');
+      }
+    },
+  );
+
   // --- resources ---
   server.registerResource(
     'flights',
@@ -422,5 +430,4 @@ Future<void> runServer(String dbPath) async {
   );
 
   await server.connect(StdioServerTransport());
-  // Keep process alive; stdin/stdout managed by transport.
 }

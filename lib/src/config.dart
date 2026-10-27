@@ -2,10 +2,50 @@ import 'dart:io';
 
 import 'package:path/path.dart' as p;
 
-/// Resolves the SQLite database path.
-///
-/// Priority: explicit [override] (from --db) -> FALCON_DB_PATH env ->
-/// db_path.conf (best-effort) -> platform default.
+/// Candidate application-support directories where the Falcon app may have
+/// written `db_path.conf`. We try all of them and use the first that exists.
+List<String> _appSupportCandidates() {
+  final out = <String>[];
+  if (Platform.isLinux || Platform.isMacOS) {
+    final home = Platform.environment['HOME'] ?? '';
+    if (Platform.isMacOS) {
+      out.add(p.join(home, 'Library', 'Application Support'));
+      out.add(p.join(home, 'Library', 'Application Support', 'Falcon'));
+      out.add(p.join(home, 'Library', 'Application Support', 'com.teamsuperpanda.falcon'));
+    } else {
+      final xdg = Platform.environment['XDG_DATA_HOME'];
+      if (xdg != null && xdg.isNotEmpty) {
+        out.add(xdg);
+        out.add(p.join(xdg, 'falcon'));
+        out.add(p.join(xdg, 'com.teamsuperpanda.falcon'));
+      }
+      out.add(p.join(home, '.local', 'share'));
+      out.add(p.join(home, '.local', 'share', 'falcon'));
+      out.add(p.join(home, '.local', 'share', 'com.teamsuperpanda.falcon'));
+    }
+  } else if (Platform.isWindows) {
+    final appData = Platform.environment['APPDATA'] ?? '';
+    out.add(appData);
+    out.add(p.join(appData, 'Falcon'));
+    out.add(p.join(appData, 'Team Super Panda', 'Falcon'));
+    out.add(p.join(appData, 'com.teamsuperpanda.falcon'));
+  }
+  return out.where((d) => d.isNotEmpty).toList();
+}
+
+String? _readConfFile() {
+  for (final dir in _appSupportCandidates()) {
+    try {
+      final f = File(p.join(dir, 'db_path.conf'));
+      if (f.existsSync()) {
+        final v = f.readAsStringSync().trim();
+        if (v.isNotEmpty) return v;
+      }
+    } catch (_) {}
+  }
+  return null;
+}
+
 String resolveDbPath({String? override}) {
   if (override != null && override.trim().isNotEmpty) {
     return override.trim();
@@ -14,46 +54,11 @@ String resolveDbPath({String? override}) {
   if (env != null && env.trim().isNotEmpty) {
     return env.trim();
   }
-
-  // Best-effort db_path.conf lookup.
   final conf = _readConfFile();
   if (conf != null && conf.isNotEmpty) {
     return conf;
   }
-
   return defaultDbPath();
-}
-
-String? _readConfFile() {
-  try {
-    final dir = _appSupportDir();
-    if (dir == null) return null;
-    final f = File(p.join(dir, 'db_path.conf'));
-    if (!f.existsSync()) return null;
-    final v = f.readAsStringSync().trim();
-    return v.isEmpty ? null : v;
-  } catch (_) {
-    return null;
-  }
-}
-
-String? _appSupportDir() {
-  if (Platform.isLinux || Platform.isMacOS) {
-    final xdg = Platform.environment['XDG_DATA_HOME'];
-    if (xdg != null && xdg.isNotEmpty) return p.join(xdg, 'falcon');
-    final home = Platform.environment['HOME'];
-    if (home == null || home.isEmpty) return null;
-    if (Platform.isMacOS) {
-      return p.join(home, 'Library', 'Application Support', 'falcon');
-    }
-    return p.join(home, '.local', 'share', 'falcon');
-  }
-  if (Platform.isWindows) {
-    final appData = Platform.environment['APPDATA'];
-    if (appData == null || appData.isEmpty) return null;
-    return p.join(appData, 'falcon');
-  }
-  return null;
 }
 
 String defaultDbPath() {
@@ -63,13 +68,12 @@ String defaultDbPath() {
   }
   if (Platform.isMacOS) {
     final home = Platform.environment['HOME'] ?? '';
-    return p.join(home, 'Library', 'Application Support', 'falcon', 'Falcon', 'falcon_db.sqlite');
+    return p.join(home, 'Library', 'Application Support', 'Falcon', 'falcon_db.sqlite');
   }
   if (Platform.isWindows) {
     final appData = Platform.environment['APPDATA'] ?? '';
-    return p.join(appData, 'falcon', 'Falcon', 'falcon_db.sqlite');
+    return p.join(appData, 'Falcon', 'falcon_db.sqlite');
   }
-  // Fallback
   final home = Platform.environment['HOME'] ?? '/tmp';
   return p.join(home, 'Falcon', 'falcon_db.sqlite');
 }
