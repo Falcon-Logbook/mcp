@@ -54,6 +54,7 @@ Future<void> runServer(String dbPath, {bool readonly = true}) async {
       capabilities: ServerCapabilities(
         resources: ServerCapabilitiesResources(),
         tools: ServerCapabilitiesTools(),
+        prompts: ServerCapabilitiesPrompts(),
       ),
     ),
   );
@@ -1013,6 +1014,56 @@ Future<void> runServer(String dbPath, {bool readonly = true}) async {
       ],
     );
   });
+
+  // --- prompt: falcon_help ---
+  server.registerPrompt(
+    'falcon_help',
+    description: 'How to use the Falcon MCP server: available tools and example questions.',
+    callback: (args, extra) async {
+      return const GetPromptResult(
+        messages: [
+          PromptMessage(
+            role: PromptMessageRole.user,
+            content: TextContent(
+              text:
+                  'You have access to the Falcon MCP server, which reads and edits a local Falcon pilot logbook (SQLite).\n\n'
+                  'Read tools: db_info, list_flights, get_flight, search_flights, list_aircraft, get_aircraft, list_airports, '
+                  'list_custom_airports, list_crew, list_saved_routes, logbook_stats, get_flight_settings, get_app_settings, '
+                  'get_general_settings, get_sync_status, get_recent_logs, find_missing_times, dedupe_crew.\n'
+                  'Write tools: create_flight, update_flight, delete_flight, add_aircraft, update_aircraft, delete_aircraft, '
+                  'add_crew, update_crew, delete_crew, add_custom_airport, delete_custom_airport, add_saved_route, '
+                  'update_saved_route, delete_saved_route, update_flight_settings.\n\n'
+                  'Writes apply immediately; an audit log is written next to the database.\n\n'
+                  'Example questions: "How many hours did I fly last year?", "List flights into YSSY in 2025", '
+                  '"Are there flights missing block times?", "Add a flight today in VH-XZO from YSSY to NZQN".\n'
+                  'Always confirm destructive or bulk operations with the user first.',
+            ),
+          ),
+        ],
+      );
+    },
+  );
+
+  // --- resource: overview ---
+  server.registerResource(
+    'overview',
+    'falcon://overview',
+    null,
+    (uri, extra) async {
+      return ReadResourceResult(
+        contents: [
+          TextResourceContents(
+            uri: uri.toString(),
+            mimeType: 'text/plain',
+            text:
+                'Falcon MCP server: read and edit a local Falcon pilot logbook.\n'
+                'Tools cover flights, aircraft, airports, crew, routes, stats, settings, logs, and writes (gated by --readonly).\n'
+                'Use the falcon_help prompt for details.',
+          ),
+        ],
+      );
+    },
+  );
 
   await server.connect(StdioServerTransport());
 }
