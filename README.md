@@ -50,7 +50,7 @@ Falcon stays the authority. The agent is the shortcut.
 - "Is my medical still valid, and when does my type rating run out?"
 - "Where are my gaps?"
 
-It answers with a picker or a short form when it needs a detail, rather than inventing one.
+It asks when it needs a detail, rather than inventing one.
 
 ---
 
@@ -61,8 +61,8 @@ It answers with a picker or a short form when it needs a detail, rather than inv
 - **Local and offline.** The server reads your SQLite file directly. It opens no sockets and sends
   nothing anywhere: no cloud, no account, no telemetry, and it never talks to a sync server.
 - **Works with the app open or closed.**
-- **Every write is logged** to `falcon_db.mcp_audit.jsonl` next to your database, so you can see what
-  changed and when.
+- **Every write is logged** to an audit file next to your database, named after it
+  (`<database-name>.mcp_audit.jsonl`), so you can see what changed and when.
 - **Free and open source.** Apache 2.0, same as the app.
 
 ---
@@ -91,10 +91,13 @@ Steps:
    `LD_LIBRARY_PATH=~/.local/lib` for the server.
 5. Ask me:
    - Where is my Falcon database? If I am not sure, search common locations:
-       Linux:   ~/Documents/Falcon/falcon_db.sqlite, ~/.local/share/com.teamsuperpanda.falcon/falcon_db.sqlite
+       Linux:   ~/Documents/Falcon/falcon_db.sqlite
        macOS:   ~/Library/Application Support/com.teamsuperpanda.falcon/Falcon/falcon_db.sqlite
        Windows: %APPDATA%\com.teamsuperpanda.falcon\Falcon\falcon_db.sqlite
-     and any custom path stored in db_path.conf inside the app-support directory above.
+     and any custom path stored in db_path.conf. That file lives in the app-support
+     directory, e.g. ~/.local/share/com.teamsuperpanda.falcon on Linux,
+     ~/Library/Application Support/com.teamsuperpanda.falcon on macOS,
+     %APPDATA%\com.teamsuperpanda.falcon on Windows.
      Pick the first match and confirm with me.
    - Do I want read-only mode (safe, AI can only read) or read+write mode (AI can create/update/delete)?
 6. Register the server as a local stdio MCP server named "Falcon" in this client's config,
