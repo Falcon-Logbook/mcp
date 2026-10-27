@@ -71,6 +71,52 @@ void main() {
         120);
   });
 
+  test('a nested transaction nests as a savepoint', () {
+    final db = openDb(dbPath);
+    addTearDown(db.close);
+
+    db.transaction(() {
+      db.execute("UPDATE flights SET route = 'outer' WHERE id = 'fl-1'");
+      db.transaction(() {
+        db.execute("UPDATE flights SET total_time = 60 WHERE id = 'fl-1'");
+      });
+    });
+    expect(
+      db
+          .query("SELECT route, total_time FROM flights WHERE id = 'fl-1'")
+          .single,
+      {'route': 'outer', 'total_time': 60},
+    );
+
+    // A failure inside the nested call rolls the whole outer body back.
+    expect(
+      () => db.transaction(() {
+        db.execute("UPDATE flights SET route = 'lost' WHERE id = 'fl-1'");
+        db.transaction(() => throw StateError('boom'));
+      }),
+      throwsStateError,
+    );
+    expect(
+      db.query("SELECT route FROM flights WHERE id = 'fl-1'").single['route'],
+      'outer',
+    );
+
+    // The connection is usable again after both unwound.
+    db.transaction(() => db.execute("UPDATE flights SET route = 'again' "
+        "WHERE id = 'fl-1'"));
+    expect(
+      db.query("SELECT route FROM flights WHERE id = 'fl-1'").single['route'],
+      'again',
+    );
+  });
+
+  test('execute reports how many rows it changed', () {
+    final db = openDb(dbPath);
+    addTearDown(db.close);
+    expect(db.execute("UPDATE flights SET route = 'x' WHERE id = 'fl-1'"), 1);
+    expect(db.execute("UPDATE flights SET route = 'x' WHERE id = 'nope'"), 0);
+  });
+
   test('write connections enforce foreign keys', () {
     final db = openDb(dbPath);
     addTearDown(db.close);

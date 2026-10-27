@@ -102,19 +102,51 @@ class FalconDb {
         .toList();
   }
 
-  void execute(String sql, [List<Object?> params = const []]) {
+  /// Runs a write statement and returns how many rows it changed, so a caller
+  /// can tell "updated one row" from "the row was gone".
+  int execute(String sql, [List<Object?> params = const []]) {
     _db.execute(sql, params);
+    return _db.updatedRows;
   }
 
   int lastInsertRowId() => _db.lastInsertRowId;
 
-  /// Runs [body] in a write transaction. Callbacks that return a value can use
-  /// [transaction].
-  void transaction(void Function() body) {
+  /// Depth of nested [transaction] calls, so a write body that opens its own
+  /// transaction nests instead of failing: SQLite has no nested `BEGIN`.
+  int _transactionDepth = 0;
+
+  /// Runs [body] in a write transaction and returns its result. A call made
+  /// while a transaction is already open uses a savepoint, so the outer call
+  /// still decides whether the whole change commits or rolls back.
+  T transaction<T>(T Function() body) {
+    if (_transactionDepth > 0) {
+      final savepoint = 'sp_$_transactionDepth';
+      _db.execute('SAVEPOINT $savepoint');
+      _transactionDepth++;
+      try {
+        final result = body();
+        _db.execute('RELEASE $savepoint');
+        return result;
+      } catch (_) {
+        try {
+          _db.execute('ROLLBACK TO $savepoint');
+          _db.execute('RELEASE $savepoint');
+        } catch (_) {
+          // The outer transaction unwinds the statement that failed; its error
+          // matters more than this one.
+        }
+        rethrow;
+      } finally {
+        _transactionDepth--;
+      }
+    }
+
     _db.execute('BEGIN IMMEDIATE');
+    _transactionDepth++;
     try {
-      body();
+      final result = body();
       _db.execute('COMMIT');
+      return result;
     } catch (_) {
       try {
         _db.execute('ROLLBACK');
@@ -122,6 +154,8 @@ class FalconDb {
         // Connection may already be unwound; the original error matters more.
       }
       rethrow;
+    } finally {
+      _transactionDepth--;
     }
   }
 
