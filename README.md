@@ -28,7 +28,7 @@ It works whether the Falcon app is open or closed.
 - **Edit** - create, update, and delete flights, aircraft, crew, airports, and saved routes.
 - **Diagnostics** - read settings and recent log entries to troubleshoot.
 
-Reads and writes are both available. Every write is recorded in a local audit log (`.mcp_audit.jsonl` next to your database).
+Reads and writes are both available. Every write is recorded in a local audit log (`<database-name>.mcp_audit.jsonl` next to your database).
 
 ---
 
@@ -37,8 +37,8 @@ Reads and writes are both available. Every write is recorded in a local audit lo
 - **Answers in seconds.** No manual filtering or counting. Ask in plain English, get the numbers.
 - **Your data stays yours.** The server reads your local SQLite file. No Falcon cloud, no telemetry, no account. Fully offline.
 - **No lock-in.** MCP is an open standard. Use Claude today, a different model tomorrow.
-- **Safe by design.** A schema version gate refuses unexpected databases, and there is no network exposure by default (stdio mode).
-- **Complements the app.** Falcon stays the authority for your logbook; the MCP server only writes when you explicitly approve each change.
+- **Safe by design.** A schema version gate refuses unexpected databases, writes are off unless you enable them, and there is no network exposure (stdio mode).
+- **Complements the app.** Falcon stays the authority for your logbook: the server writes the same rows the app writes, including aircraft and crew links.
 
 ---
 
@@ -59,13 +59,18 @@ Steps:
 1. Check that Dart SDK 3.4+ is installed (`dart --version`). If not, install it for this OS.
 2. Clone https://github.com/Falcon-Logbook/mcp into a sensible local directory and run `dart pub get`.
 3. Compile: `dart compile exe bin/falcon_mcp.dart -o <bin-dir>/falcon_mcp` (use ~/.local/bin or equivalent).
-4. Ensure libsqlite3 is available (symlink the system libsqlite3 to ~/.local/lib/libsqlite3.so if needed).
+4. Check that SQLite is available. The server loads the system library itself
+   (including the Linux runtime name libsqlite3.so.0). If your system only has a
+   differently named library, create a symlink: `mkdir -p ~/.local/lib &&
+   ln -sf /path/to/libsqlite3.so ~/.local/lib/libsqlite3.so` and add
+   `LD_LIBRARY_PATH=~/.local/lib` for the server.
 5. Ask me:
    - Where is my Falcon database? If I am not sure, search common locations:
-       Linux:   ~/Documents/Falcon/falcon_db.sqlite, ~/.local/share/*/falcon_db.sqlite
-       macOS:   ~/Library/Application Support/Falcon/falcon_db.sqlite, ~/Library/Application Support/*/Falcon/falcon_db.sqlite
-       Windows: %APPDATA%\Falcon\falcon_db.sqlite, %APPDATA%\*\Falcon\falcon_db.sqlite
-     and any custom path stored in db_path.conf. Pick the first match and confirm with me.
+       Linux:   ~/Documents/Falcon/falcon_db.sqlite, ~/.local/share/com.teamsuperpanda.falcon/falcon_db.sqlite
+       macOS:   ~/Library/Application Support/com.teamsuperpanda.falcon/Falcon/falcon_db.sqlite
+       Windows: %APPDATA%\com.teamsuperpanda.falcon\Falcon\falcon_db.sqlite
+     and any custom path stored in db_path.conf inside the app-support directory above.
+     Pick the first match and confirm with me.
    - Do I want read-only mode (safe, AI can only read) or read+write mode (AI can create/update/delete)?
 6. Register the server as a local stdio MCP server named "Falcon" in this client's config,
    passing the binary path and these environment variables:
@@ -74,12 +79,14 @@ Steps:
      LD_LIBRARY_PATH=<path to libsqlite3 dir> (Linux only)
 7. Restart/reload the client if required and verify by calling db_info.
 8. Tell me the mode I chose and how to flip it later (pass --no-readonly or set FALCON_READONLY=false).
+   An explicit flag always wins over the environment variable.
 ```
 
 ### Read-only vs read+write
 
-- Default: read-only (`FALCON_READONLY=true`). Only read tools are exposed.
+- Default: read-only (`FALCON_READONLY=true`). Only read tools are exposed and the database is opened read-only.
 - To allow edits: pass `--no-readonly` (or `FALCON_READONLY=false`). Write tools are available immediately.
+- An explicit `--readonly`/`--no-readonly` flag overrides `FALCON_READONLY`.
 - Your agent should ask which mode you want during setup and never enable writes without your explicit consent.
 
 ---
@@ -88,7 +95,7 @@ Steps:
 
 - A Falcon Logbook database file (`falcon_db.sqlite`), produced by the Falcon app.
 - An MCP-capable AI client on your computer (Claude Desktop, Claude Code, Codex, Cursor, etc.).
-- Dart SDK 3.4+ and `libsqlite3` are only needed to build; your agent handles this.
+- Dart SDK 3.4+ and `libsqlite3` are only needed to build and run the server binary, not the app; your agent handles this.
 
 ---
 
@@ -113,7 +120,9 @@ FALCON_DB_PATH=/path/to/falcon_db.sqlite ./falcon_mcp
 ./falcon_mcp --db /path/to/falcon_db.sqlite --no-readonly
 ```
 
-The server refuses to start if the database schema version does not match the supported version (currently 18-19).
+The database path is resolved in this order: `--db`, then `FALCON_DB_PATH`, then the app's `db_path.conf`, then the platform default (`~/Documents/Falcon/falcon_db.sqlite` on Linux). A configured path that no longer exists is ignored.
+
+The server refuses to start if the database schema version is outside the supported range (currently 18-19), and it never creates an empty database. Queries select whole rows, writes only touch known columns, and tool schemas only advertise columns the file actually has, so additive columns from newer migrations are tolerated and v19-only fields are hidden on a v18 file.
 
 ### Tools
 
@@ -121,7 +130,7 @@ The server refuses to start if the database schema version does not match the su
 |---|---|
 | `db_info` | Database path, schema version, table list, readonly flag |
 | `get_schema` | Describe tables and columns (name, type, nullability, default, PK) |
-| `list_flights` | List flights with optional filters (date range, aircraft registration, flight type) |
+| `list_flights` | List flights with optional filters (date range, aircraft registration, flight type, crew name) |
 | `get_flight` | Get a single flight by id |
 | `search_flights` | Free-text search over route, flight number, crew name, registration |
 | `list_aircraft` | List aircraft, optionally including archived |
@@ -130,13 +139,13 @@ The server refuses to start if the database schema version does not match the su
 | `list_custom_airports` | List user-defined custom airports |
 | `list_crew` | List crew members, optionally including archived |
 | `list_saved_routes` | List saved routes |
-| `logbook_stats` | Totals for flights, minutes, night time, landings, takeoffs (optional date range) |
+| `logbook_stats` | Totals for flights, drafts, minutes, night time, landings, takeoffs (optional date range) |
 | `get_flight_settings` | Pilot name, formats, country, display preferences |
 | `get_app_settings` | Storage mode, theme, accent, and app preferences |
 | `get_general_settings` | Startup tab, language, coordinates format, etc. |
 | `get_sync_status` | Sync state per table/provider and pending tombstone count |
 | `get_recent_logs` | Recent log entries for diagnostics |
-| `find_missing_times` | Find flights missing total/block times |
+| `find_missing_times` | Find draft flights (no total time) or flights with no day/night split |
 | `dedupe_crew` | Find crew members with duplicate names |
 | `create_flight` | Create a flight |
 | `update_flight` | Update a flight by id |
@@ -148,13 +157,17 @@ The server refuses to start if the database schema version does not match the su
 | `update_crew` | Update a crew member by id |
 | `delete_crew` | Delete a crew member by id |
 | `add_custom_airport` | Add a custom airport |
+| `update_custom_airport` | Update a custom airport by id |
 | `delete_custom_airport` | Delete a custom airport by id |
 | `add_saved_route` | Add a saved route |
 | `update_saved_route` | Update a saved route by id |
 | `delete_saved_route` | Delete a saved route by id |
 | `update_flight_settings` | Update flight settings |
 
+Write tools derive the same links the app does: `aircraft_registration` is matched against the aircraft table (bare `XZO` and display `VH-XZO` both work) to set `aircraft_id`, and `crew_members_name` sets `crew_member_id`. Unknown argument names are rejected instead of silently ignored, and `get_schema` plus `falcon://conventions` describe every writable column.
+
 Resources: `falcon://flights` (latest 100 flights as JSON), `falcon://overview`, `falcon://conventions` (field semantics: dates, minutes, registration format, draft rule), `falcon://schema`.
+Prompt: `falcon_help` (tool list and example questions, write tools only listed when enabled).
 
 ### Tech
 
@@ -167,10 +180,19 @@ Resources: `falcon://flights` (latest 100 flights as JSON), `falcon://overview`,
 
 No Flutter dependency. The server is a plain Dart console program, so it stays small and fast.
 
+### Test
+
+```bash
+dart test
+```
+
+The suite builds a temporary database with the real Falcon schema and drives the server over stdio, so writes are exercised end to end without touching your own logbook.
+
 ### Privacy and safety
 
 - **Local only.** The server reads your SQLite file directly. It opens no sockets and exposes no network endpoints (stdio mode).
-- **Writes are direct.** Write tools apply immediately. Every write is recorded in a local audit log (`.mcp_audit.jsonl` next to your database).
+- **Writes are direct.** Write tools apply immediately. Every write is recorded in a local audit log (`<database-name>.mcp_audit.jsonl` next to your database).
+- **Same shape as the app.** Foreign keys are enforced, deletes record sync tombstones when a Postgres sync provider has been used, and deleting a saved route unlinks the flights that used it.
 - **Schema-gated.** The server refuses to run if the database schema version is unexpected.
 - **No telemetry.** Nothing is sent anywhere by the server itself.
 
