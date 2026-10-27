@@ -33,6 +33,7 @@ The AI reads your local Falcon database directly, so the answers are based on yo
 Falcon MCP is a small, fast, read-only program that runs on your machine alongside your logbook. It speaks the Model Context Protocol over standard input/output, so any MCP-capable AI client can launch it and ask it questions.
 
 - **Flight queries** - list, search, and filter flights by date, aircraft, route, flight number, or free text.
+- **Flight writes** - create, update, and delete flights (with dry-run preview and confirmation).
 - **Aircraft** - list and inspect your fleet, including archived airframes.
 - **Airports** - search the built-in airport database and your custom airports by ICAO, IATA, name, or city.
 - **Crew** - list crew members, including archived ones.
@@ -172,6 +173,23 @@ Add an MCP server entry of type `stdio` with the command path and the `--db` arg
 | `get_general_settings` | Startup tab, language, coordinates format, etc. |
 | `get_sync_status` | Sync state per table/provider and pending tombstone count |
 | `get_recent_logs` | Recent log entries for diagnostics |
+| `create_flight` | Create a flight (dry run unless confirm=true) |
+| `update_flight` | Update a flight by id (dry run unless confirm=true) |
+| `delete_flight` | Delete a flight by id (dry run unless confirm=true) |
+| `add_aircraft` | Add an aircraft (dry run unless confirm=true) |
+| `update_aircraft` | Update an aircraft by id (dry run unless confirm=true) |
+| `delete_aircraft` | Delete an aircraft by id (dry run unless confirm=true) |
+| `add_crew` | Add a crew member (dry run unless confirm=true) |
+| `update_crew` | Update a crew member by id (dry run unless confirm=true) |
+| `delete_crew` | Delete a crew member by id (dry run unless confirm=true) |
+| `add_custom_airport` | Add a custom airport (dry run unless confirm=true) |
+| `delete_custom_airport` | Delete a custom airport by id (dry run unless confirm=true) |
+| `add_saved_route` | Add a saved route (dry run unless confirm=true) |
+| `update_saved_route` | Update a saved route by id (dry run unless confirm=true) |
+| `delete_saved_route` | Delete a saved route by id (dry run unless confirm=true) |
+| `update_flight_settings` | Update flight settings (dry run unless confirm=true) |
+| `find_missing_times` | Find flights missing total/block times |
+| `dedupe_crew` | Find crew members with duplicate names |
 
 Resource: `falcon://flights` (latest 100 flights as JSON).
 
@@ -180,7 +198,7 @@ Resource: `falcon://flights` (latest 100 flights as JSON).
 ## Privacy and safety
 
 - **Local only.** The server reads your SQLite file directly. It opens no sockets and exposes no network endpoints.
-- **Read-only.** No tool writes, updates, or deletes anything. Your logbook is never modified.
+- **Writes are gated.** Write tools default to a dry-run preview and require `confirm=true` to apply. Every write is recorded in a local audit log (`falcon_mcp_audit.jsonl` next to your database).
 - **Schema-gated.** The server refuses to run if the database schema version is unexpected.
 - **No telemetry.** Nothing is sent anywhere by the server itself. (Your AI provider's own privacy policy still applies to the prompts you send it.)
 
@@ -201,7 +219,16 @@ No Flutter dependency. The server is a plain Dart console program, so it stays s
 
 ## Status
 
-Phase 1: read-only queries. Phase 2 (confirmed writes, in-app server, HTTP/SSE transport) is planned. See the project issue tracker for details.
+Local server now supports read and write operations with dry-run previews, confirmation, and an audit log. In-app server, HTTP/SSE transport, and Falcon Cloud hosting are on the roadmap.
+
+---
+
+## Roadmap
+
+- **Falcon Cloud MCP endpoint** - a hosted, HTTPS MCP server for Falcon Cloud subscribers, so AI assistants can reach your logbook from anywhere (including claude.ai web) without a local server. Same tool surface, authenticated per account.
+- **HTTP/SSE transport** for the local server (in addition to stdio).
+- **Postgres connection tools** - set up, test, and disconnect sync connections from the AI.
+- **In-app MCP server** - embed the MCP endpoint inside the Falcon app to reuse the real DAOs and stay the single writer.
 
 ---
 

@@ -57,7 +57,7 @@ const Set<String> _boolColumns = {
 
 class FalconDb {
   FalconDb(this.path) {
-    _db = sqlite3.open(path, mode: OpenMode.readOnly);
+    _db = sqlite3.open(path, mode: OpenMode.readWrite);
     _db.execute('PRAGMA busy_timeout = 5000');
   }
 
@@ -82,6 +82,12 @@ class FalconDb {
     final rows = _db.select(sql, params);
     return rows.map(_rowToMap).toList();
   }
+
+  void execute(String sql, [List<Object?> params = const []]) {
+    _db.execute(sql, params);
+  }
+
+  int lastInsertRowId() => _db.lastInsertRowId;
 
   Map<String, dynamic> _rowToMap(Row row) {
     final out = <String, dynamic>{};
