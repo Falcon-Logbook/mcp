@@ -53,7 +53,7 @@ CallToolResult _confirmRequired(String tool, Map<String, dynamic> preview) {
   ]);
 }
 
-Future<void> runServer(String dbPath) async {
+Future<void> runServer(String dbPath, {bool readonly = true}) async {
   final db = openDb(dbPath);
 
   final sv = db.schemaVersion;
@@ -88,7 +88,7 @@ Future<void> runServer(String dbPath) async {
 
   server.registerTool('db_info', description: 'Show database path, schema version, and table list.',
       inputSchema: JsonSchema.object(properties: {}),
-      callback: (args, extra) async => ok({'path': dbPath, 'schemaVersion': sv, 'tables': db.tables}));
+      callback: (args, extra) async => ok({'path': dbPath, 'schemaVersion': sv, 'tables': db.tables, 'readonly': readonly}));
 
   server.registerTool('list_flights',
       description: 'List flights with optional filters (date range, aircraft registration, flight type).',
@@ -388,8 +388,9 @@ Future<void> runServer(String dbPath) async {
       });
 
   // ============================================================
-  // WRITE TOOLS (confirm required)
+  // WRITE TOOLS (confirm required) - only when not readonly
   // ============================================================
+  if (!readonly) {
 
   // --- create_flight ---
   server.registerTool('create_flight',
@@ -1074,6 +1075,8 @@ Future<void> runServer(String dbPath) async {
           return fail('update_flight_settings failed: $e');
         }
       });
+
+  } // end writes
 
   // ============================================================
   // RESOURCES

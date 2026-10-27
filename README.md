@@ -237,3 +237,33 @@ Local server now supports read and write operations with dry-run previews, confi
 Apache License 2.0. Copyright 2026 Team Super Panda. Free to use, modify and
 redistribute, including commercially. See https://falconlogbook.com/license for
 the full terms. The Falcon name and logo are trademarks, not licensed.
+
+---
+
+## AI-assisted setup
+
+Paste this prompt to your AI agent (Claude Code, Codex, etc.) and it will install and configure Falcon MCP for you:
+
+```
+Set up the Falcon MCP server for me.
+
+1. Check that Dart SDK 3.4+ is installed (`dart --version`). If not, install it.
+2. Clone https://github.com/Falcon-Logbook/mcp into a local directory and run `dart pub get`.
+3. Compile: `dart compile exe bin/falcon_mcp.dart -o ~/.local/bin/falcon_mcp`.
+4. Ensure libsqlite3 is available (symlink /lib64/libsqlite3.so.0 to ~/.local/lib/libsqlite3.so if needed).
+5. Ask me:
+   - Where is my Falcon database? (default: ~/Documents/Falcon/falcon_db.sqlite)
+   - Do I want read-only mode (safe, AI can only read) or read+write mode (AI can create/update/delete with confirmation)?
+6. Register the server in my MCP client config:
+   - OpenCode: add a "Falcon" entry under "mcp" in ~/.config/opencode/opencode.json, type "local", command ["/home/<me>/.local/bin/falcon_mcp"], enabled true, environment FALCON_DB_PATH=<db path>, FALCON_READONLY=<true|false>, LD_LIBRARY_PATH=/home/<me>/.local/lib.
+   - Claude Desktop: add to claude_desktop_config.json with command and env.
+   - Claude Code: `claude mcp add falcon -- /home/<me>/.local/bin/falcon_mcp` with FALCON_DB_PATH set.
+7. Restart the client and verify by calling db_info.
+8. Tell me the readonly setting I chose and how to flip it later (pass --no-readonly or set FALCON_READONLY=false).
+```
+
+### Read-only vs read+write
+
+- Default: `--readonly` (or `FALCON_READONLY=true`). Only read tools are exposed.
+- To allow edits: pass `--no-readonly` (or `FALCON_READONLY=false`). Write tools appear and require `confirm=true` per call.
+- Ask the user during setup which mode they want; never enable writes without explicit consent.
