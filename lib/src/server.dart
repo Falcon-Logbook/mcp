@@ -1124,5 +1124,32 @@ Future<void> runServer(String dbPath, {bool readonly = true}) async {
     },
   );
 
+  server.registerResource(
+    'schema',
+    'falcon://schema',
+    null,
+    (uri, extra) async {
+      final out = <String, dynamic>{};
+      for (final t in db.tables) {
+        out[t] = db.query('PRAGMA table_info("$t")').map((c) => {
+              'name': c['name'],
+              'type': c['type'],
+              'notnull': c['notnull'],
+              'default': c['dflt_value'],
+              'pk': c['pk'],
+            }).toList();
+      }
+      return ReadResourceResult(
+        contents: [
+          TextResourceContents(
+            uri: uri.toString(),
+            mimeType: 'application/json',
+            text: const JsonEncoder.withIndent('  ').convert(out),
+          ),
+        ],
+      );
+    },
+  );
+
   await server.connect(StdioServerTransport());
 }
