@@ -146,6 +146,14 @@ default. A configured path that no longer exists is ignored. Transport is stdio;
 plain Dart console program, no Flutter. Tests run with `dart test` against a temporary database, so
 your own logbook stays untouched.
 
+Flight reads are shaped for context cost. `list_flights`, `search_flights`, `find_missing_times` and
+the `falcon://flights` resource return a twelve-field summary per flight (id, date, route, flight
+number, registration, crew name, total/day/night minutes, takeoffs, landings, simulator flag); add
+`full: true` for every column at about four times the tokens. `get_flight` always returns the whole
+row, because it is the detail call. Pages hold 20 rows by default and at most 200, and every paged
+read returns `count`, `total`, `has_more` and `offset` so a client can page instead of inflating
+`limit`. Responses are compact JSON; your client pretty-prints them if you want them readable.
+
 Apache License 2.0. Copyright 2026 Team Super Panda. Free to use, modify and redistribute, including
 commercially. See [falconlogbook.com/license](https://falconlogbook.com/license) for the full terms.
 The Falcon name and logo are trademarks, not licensed.

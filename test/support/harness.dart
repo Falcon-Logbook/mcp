@@ -99,6 +99,16 @@ T withFixtureDb<T>(String path, T Function(sqlite.Database db) body) {
   }
 }
 
+/// The `units.date` declaration that matches [value]'s actual shape. A row's
+/// date is serialised by the server as a local ISO-8601 string, never as the
+/// epoch integer the column stores; deriving the expectation from the value
+/// keeps the declaration and the value from drifting apart.
+String dateTypeOf(Object? value) => switch (value) {
+      int() => 'epoch_seconds',
+      String() when DateTime.tryParse(value) != null => 'iso8601_local',
+      _ => throw ArgumentError('not a date value: $value'),
+    };
+
 /// A JSON-RPC line protocol client for the compiled-in server script.
 class McpProcess {
   McpProcess._(this._process) {

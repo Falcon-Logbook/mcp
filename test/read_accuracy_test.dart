@@ -237,7 +237,8 @@ void main() {
         await server.send('resources/read', {'uri': 'falcon://flights'});
     final contents =
         ((resource['result'] as Map)['contents'] as List).single as Map;
-    final rows = jsonDecode(contents['text'] as String) as List;
+    final rows =
+        (jsonDecode(contents['text'] as String) as Map)['rows'] as List;
     expect(
       [for (final row in rows) (row as Map)['id'] as String],
       expected,
@@ -325,11 +326,10 @@ void main() {
         await server.send('resources/read', {'uri': 'falcon://flights'});
     final contents =
         ((resource['result'] as Map)['contents'] as List).single as Map;
+    final rows =
+        (jsonDecode(contents['text'] as String) as Map)['rows'] as List;
     expect(
-      [
-        for (final row in jsonDecode(contents['text'] as String) as List)
-          (row as Map)['id'] as String
-      ],
+      [for (final row in rows) (row as Map)['id'] as String],
       ['fl-null', 'fl-local'],
     );
 
@@ -392,6 +392,8 @@ void main() {
     ]);
     final server = await start();
 
+    final declarations = <String, String>{};
+    Object? serialisedDate;
     for (final (tool, args) in [
       ('list_flights', <String, dynamic>{}),
       ('search_flights', <String, dynamic>{'query': 'YSSY'}),
@@ -400,9 +402,21 @@ void main() {
       ('find_missing_times', <String, dynamic>{}),
     ]) {
       final payload = payloadOf(await server.call(tool, args));
-      expect(payload['units'], {'time': 'minutes', 'date': 'epoch_seconds'},
-          reason: '$tool must state its units');
+      final units = payload['units'] as Map;
+      expect(units['time'], 'minutes',
+          reason: '$tool must state its time unit');
+      declarations[tool] = '${units['date']}';
+      serialisedDate ??= _serialisedDate(payload);
     }
+
+    // Asserted against the shape of a value the server actually returns, not
+    // against a literal: the date columns are rendered as local ISO-8601
+    // strings, so a declaration that says epoch seconds fails here.
+    expect(serialisedDate, isNotNull,
+        reason: 'a row date to check the declaration against');
+    expect(declarations.values.toSet(), hasLength(1),
+        reason: 'every response declares the same date type: $declarations');
+    expect(declarations.values.toSet().single, dateTypeOf(serialisedDate));
   });
 
   test('accepts hours aliases on write and rejects supplying both forms',
@@ -439,4 +453,14 @@ void main() {
     expect(both.isError, isTrue);
     expect('${both.payload}', contains('total_time_hours'));
   });
+}
+
+/// A date value [payload] serialises, or null when it carries no row date
+/// (logbook_stats answers with a calendar range, not a row).
+Object? _serialisedDate(Map<String, dynamic> payload) {
+  final flights = payload['flights'];
+  if (flights is List && flights.isNotEmpty) {
+    return (flights.first as Map)['date'];
+  }
+  return payload['date'];
 }

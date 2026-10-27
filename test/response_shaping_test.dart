@@ -1,0 +1,320 @@
+import 'dart:convert';
+import 'dart:io';
+
+import 'package:test/test.dart';
+
+import 'support/harness.dart';
+
+/// Issue #11: a flight read answers with a twelve-field summary by default, an
+/// agent can ask for every column, a page is 20 rows by default, and the cost of
+/// the common answers is asserted in bytes rather than estimated. Tokens are
+/// roughly bytes/4, so every budget here is a byte count of the text a client
+/// actually puts in context.
+void main() {
+  late Directory tempDir;
+  late String dbPath;
+
+  /// The summary row: what a pilot question needs, in a fixed key order.
+  const slimKeys = {
+    'id',
+    'date',
+    'route',
+    'flight_number',
+    'aircraft_registration',
+    'crew_members_name',
+    'total_time',
+    'day_time',
+    'night_time',
+    'takeoffs',
+    'landings',
+    'is_simulator',
+  };
+
+  setUp(() {
+    tempDir = Directory.systemTemp.createTempSync('falcon_mcp_shaping_test');
+    dbPath = createEmptyFixture('${tempDir.path}/falcon_db.sqlite');
+  });
+
+  tearDown(() => tempDir.deleteSync(recursive: true));
+
+  Future<McpProcess> start({bool write = false}) async {
+    final server = await McpProcess.start(dbPath, write: write);
+    addTearDown(() async {
+      await server.stop();
+    });
+    return server;
+  }
+
+  Map<String, dynamic> payloadOf(({bool isError, Object? payload}) result) =>
+      result.payload as Map<String, dynamic>;
+
+  /// Fifty complete flights plus two drafts: enough that the default page
+  /// leaves rows behind, and enough to measure a page at the 200-row cap.
+  void seedLogbook() {
+    insertFlights(dbPath, [
+      for (var day = 1; day <= 50; day++)
+        {
+          'id': 'fl-$day',
+          'date': DateTime(2025, 1, 1).add(Duration(days: day)),
+          'day_order': day % 3,
+          'aircraft_registration': 'VH-XZO',
+          'crew_members_name': day % 5 == 0 ? null : 'Jane Doe',
+          'route': 'YSSY - NZQN',
+          'flight_number': day % 4 == 0 ? null : 'QF$day',
+          'total_time': 90 + day,
+          'day_time': 60,
+          'night_time': 30 + day,
+          'takeoffs': 1,
+          'landings': 1,
+          'created_at': 1700000000,
+        },
+      {'id': 'fl-draft', 'date': DateTime(2025, 3, 1), 'route': 'YSBK - YSSY'},
+    ]);
+  }
+
+  /// The exact text a read returns, and its size. Measured on the wire rather
+  /// than on a re-encoded payload, so an encoding change cannot hide here.
+  Future<int> bytesOf(McpProcess server, String tool, Map<String, dynamic> args,
+      {String? uri}) async {
+    final Object? text;
+    if (uri != null) {
+      final response = await server.send('resources/read', {'uri': uri});
+      final contents =
+          ((response['result'] as Map)['contents'] as List).single as Map;
+      text = contents['text'];
+    } else {
+      final response =
+          await server.send('tools/call', {'name': tool, 'arguments': args});
+      final content = ((response['result'] as Map)['content'] as List)
+          .cast<Map<String, dynamic>>();
+      text = content.first['text'];
+    }
+    return utf8.encode(text as String).length;
+  }
+
+  test('a default flight read is a twelve-field summary page', () async {
+    seedLogbook();
+    final server = await start();
+
+    final payload = payloadOf(await server.call('list_flights', {}));
+    expect(payload['count'], 20, reason: 'the default page is 20 rows');
+    expect(payload['total'], 51);
+    expect(payload['has_more'], isTrue);
+    expect(payload['offset'], 0);
+
+    final rows = payload['flights'] as List;
+    for (final row in rows) {
+      expect((row as Map).keys.toSet(), slimKeys,
+          reason: 'every summary row carries exactly the twelve keys');
+    }
+
+    // The summary still answers "what did I fly, and how long was it".
+    final first = rows.first as Map;
+    expect(first['id'], 'fl-draft');
+    expect(first['route'], 'YSBK - YSSY');
+    expect(first['date'], isA<String>());
+    expect(first['total_time'], isNull, reason: 'the draft is still a draft');
+
+    final flown = rows[2] as Map;
+    expect(flown['id'], 'fl-49');
+    expect(flown['total_time'], 139);
+    expect(flown['day_time'], 60);
+    expect(flown['night_time'], 79);
+    expect(flown['takeoffs'], 1);
+    expect(flown['landings'], 1);
+    expect(flown['crew_members_name'], 'Jane Doe');
+    expect(flown['flight_number'], 'QF49');
+    expect(flown['is_simulator'], isFalse);
+  });
+
+  test('a flight with nothing recorded keeps every summary key', () async {
+    insertFlights(dbPath, [
+      {'id': 'fl-empty', 'date': DateTime(2025, 4, 1)},
+    ]);
+    final server = await start();
+
+    final rows =
+        payloadOf(await server.call('list_flights', {}))['flights'] as List;
+    final flight = rows.single as Map;
+    // A key that vanishes reads as "not recorded" only to a caller who knows it
+    // exists, so the durations and counts are present and null.
+    expect(flight.keys.toSet(), slimKeys);
+    for (final key in [
+      'route',
+      'flight_number',
+      'aircraft_registration',
+      'crew_members_name',
+      'total_time',
+      'day_time',
+      'night_time',
+      'takeoffs',
+      'landings',
+    ]) {
+      expect(flight.containsKey(key), isTrue, reason: '$key must be present');
+      expect(flight[key], isNull, reason: '$key has nothing recorded');
+    }
+    expect(flight['is_simulator'], isFalse);
+  });
+
+  test('full: true returns every column of the live schema', () async {
+    seedLogbook();
+    final server = await start();
+    final columnCount = withFixtureDb(
+      dbPath,
+      (db) => db.select('PRAGMA table_info(flights)').length,
+    );
+
+    final full = payloadOf(
+        await server.call('list_flights', {'limit': 1, 'full': true}));
+    final rows =
+        payloadOf(await server.call('list_flights', {'limit': 1}))['flights']
+            as List;
+    final row = (full['flights'] as List).single as Map;
+
+    expect(row, hasLength(columnCount),
+        reason: 'full is the whole row, not the summary plus a few fields');
+    expect(row['id'], (rows.single as Map)['id']);
+    for (final key in ['created_at', 'custom_columns', 'hobbs_start']) {
+      expect(row.keys, contains(key));
+    }
+
+    // The same row through the detail call, minus its own units block.
+    final detail = payloadOf(await server.call('get_flight', {'id': row['id']}))
+      ..remove('units');
+    expect(row, detail, reason: 'full and get_flight agree on the row');
+  });
+
+  test('search_flights and find_missing_times are slim unless full', () async {
+    seedLogbook();
+    final server = await start();
+    final columnCount = withFixtureDb(
+      dbPath,
+      (db) => db.select('PRAGMA table_info(flights)').length,
+    );
+
+    final searched = payloadOf(
+        await server.call('search_flights', {'query': 'NZQN', 'limit': 2}));
+    expect(searched['count'], 2);
+    for (final row in searched['flights'] as List) {
+      expect((row as Map).keys.toSet(), slimKeys);
+    }
+    final searchedFull = payloadOf(await server
+        .call('search_flights', {'query': 'NZQN', 'limit': 2, 'full': true}));
+    for (final row in searchedFull['flights'] as List) {
+      expect(row as Map, hasLength(columnCount));
+    }
+
+    final missing = payloadOf(await server.call('find_missing_times', {}));
+    expect(missing['count'], 1);
+    expect(((missing['flights'] as List).single as Map).keys.toSet(), slimKeys);
+    expect((missing['flights'] as List).single, containsPair('id', 'fl-draft'));
+
+    final missingFull =
+        payloadOf(await server.call('find_missing_times', {'full': true}));
+    expect(
+        (missingFull['flights'] as List).single as Map, hasLength(columnCount));
+  });
+
+  test('pages default to 20 rows and refuse more than 200', () async {
+    seedLogbook();
+    final server = await start();
+
+    final tooMany = await server.call('list_flights', {'limit': 201});
+    expect(tooMany.isError, isTrue,
+        reason: 'the cap is enforced before the callback runs');
+    expect('${tooMany.payload}', contains('200'),
+        reason: 'the refusal names the limit');
+
+    final tooManySearch =
+        await server.call('search_flights', {'query': 'NZQN', 'limit': 201});
+    expect(tooManySearch.isError, isTrue);
+
+    final cap = payloadOf(await server.call('list_flights', {'limit': 200}));
+    expect(cap['count'], 51,
+        reason: 'the cap is a page size, not a truncation');
+    expect(cap['has_more'], isFalse);
+
+    // A misspelled opt-out is refused by name, like every other argument.
+    final typo = await server.call('list_flights', {'fulll': true});
+    expect(typo.isError, isTrue);
+    expect('${typo.payload}', contains('fulll'));
+  });
+
+  test('the flights resource is capped, slim and states its units', () async {
+    seedLogbook();
+    final server = await start();
+
+    final response =
+        await server.send('resources/read', {'uri': 'falcon://flights'});
+    final contents =
+        ((response['result'] as Map)['contents'] as List).single as Map;
+    final payload = jsonDecode(contents['text'] as String) as Map;
+
+    final rows = payload['rows'] as List;
+    expect(rows, hasLength(20), reason: 'the resource stops at 20 rows');
+    for (final row in rows) {
+      expect((row as Map).keys.toSet(), slimKeys);
+    }
+    expect((rows.first as Map)['id'], 'fl-draft',
+        reason: 'newest first, the same order as list_flights');
+
+    // The resource is the one payload a client may read without asking, so it
+    // carries the units a tool response carries.
+    final units = payload['units'] as Map;
+    expect(units['time'], 'minutes');
+    expect(units['date'], dateTypeOf((rows.first as Map)['date']));
+    final listPayload = payloadOf(await server.call('list_flights', {}));
+    expect(units, listPayload['units']);
+  });
+
+  test('the common answers stay inside their byte budgets', () async {
+    seedLogbook();
+    final server = await start();
+
+    // The default list on a fifty-row logbook. A page of fifty rows cannot fit
+    // 8 KB at the 300 B row budget, so the promise is the default page.
+    final defaultList = await bytesOf(server, 'list_flights', {});
+    expect(defaultList, lessThan(8000),
+        reason: 'a default flight answer costs $defaultList B');
+
+    // One summary row, measured from a real response.
+    final single =
+        payloadOf(await server.call('list_flights', {'limit': 1}))['flights']
+            as List;
+    final rowBytes = utf8.encode(jsonEncode(single.single)).length;
+    expect(rowBytes, lessThan(300),
+        reason: 'one summary row costs $rowBytes B');
+
+    final resource = await bytesOf(server, '', {}, uri: 'falcon://flights');
+    expect(resource, lessThan(6000),
+        reason: 'the flights resource costs $resource B');
+
+    final readOnlyCatalog = utf8
+        .encode(jsonEncode((await server.send('tools/list', {}))['result']))
+        .length;
+    expect(readOnlyCatalog, lessThan(12000),
+        reason: 'the read-only catalog costs $readOnlyCatalog B');
+
+    final typo = await bytesOf(server, 'list_flights', {'limt': 5});
+    expect(typo, lessThan(400), reason: 'a typo error costs $typo B');
+
+    final help = await server.send('prompts/get', {'name': 'falcon_help'});
+    final messages = (help['result'] as Map)['messages'] as List;
+    final helpText = ((messages.single as Map)['content'] as Map)['text'];
+    final helpBytes = utf8.encode(helpText as String).length;
+    expect(helpBytes, lessThan(1500), reason: 'falcon_help costs $helpBytes B');
+
+    // Write mode is the catalog most sessions never pay for, and it grows with
+    // the write schemas. Issue #11 budgets 28 KB, but that figure was measured
+    // before #15 grew the catalog to 27,193 B with write validation text; the
+    // read-side text here takes it to about 28.0 KB, so 28 KB is not reachable
+    // until PR 2 collapses the flight write schemas, which is when it should be
+    // tightened to the 22 KB target. This guards against re-inflation meanwhile.
+    final writer = await start(write: true);
+    final writeCatalog = utf8
+        .encode(jsonEncode((await writer.send('tools/list', {}))['result']))
+        .length;
+    expect(writeCatalog, lessThan(29000),
+        reason: 'the write-mode catalog costs $writeCatalog B');
+  });
+}
