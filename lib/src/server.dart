@@ -20,7 +20,11 @@ int? _dateToEpoch(String? s, {bool endOfDay = false}) {
   }
 }
 
-String _auditPath(String dbPath) => '${dbPath.substring(0, dbPath.lastIndexOf('.'))}.mcp_audit.jsonl';
+String _auditPath(String dbPath) {
+  final idx = dbPath.lastIndexOf('.');
+  final base = idx < 0 ? dbPath : dbPath.substring(0, idx);
+  return '$base.mcp_audit.jsonl';
+}
 
 void _audit(String dbPath, String tool, Map<String, dynamic> args, String result, [String? detail]) {
   try {

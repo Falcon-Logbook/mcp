@@ -10,7 +10,7 @@ Future<void> main(List<String> args) async {
 
   final result = parser.parse(args);
   if (result['version'] == true) {
-    stdout.writeln('falcon_mcp 0.1.0');
+    stdout.writeln('falcon_mcp 0.3.0');
     return;
   }
 

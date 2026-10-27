@@ -5,7 +5,7 @@
 
 # Falcon MCP Server
 
-Talk to your logbook with AI. Falcon MCP is a [Model Context Protocol](https://modelcontextprotocol.io) server that lets your preferred AI assistant (Claude, ChatGPT, Gemini, Codex, and others) read your Falcon Logbook and answer questions about your flying.
+Talk to your logbook with AI. Falcon MCP is a [Model Context Protocol](https://modelcontextprotocol.io) server that lets your preferred AI assistant (Claude, ChatGPT, Gemini, Codex, and others) read and edit your Falcon Logbook.
 
 Built by [Team Super Panda](https://www.teamsuperpanda.com).
 
@@ -30,7 +30,7 @@ The AI reads your local Falcon database directly, so the answers are based on yo
 
 ## What it does
 
-Falcon MCP is a small, fast, read-only program that runs on your machine alongside your logbook. It speaks the Model Context Protocol over standard input/output, so any MCP-capable AI client can launch it and ask it questions.
+Falcon MCP is a small, fast program that runs on your machine alongside your logbook. It speaks the Model Context Protocol over standard input/output, so any MCP-capable AI client can launch it and ask it questions.
 
 - **Flight queries** - list, search, and filter flights by date, aircraft, route, flight number, or free text.
 - **Flight writes** - create, update, and delete flights (with dry-run preview and confirmation).
@@ -41,7 +41,7 @@ Falcon MCP is a small, fast, read-only program that runs on your machine alongsi
 - **Statistics** - totals for flights, hours, night time, landings, and takeoffs, with optional date ranges.
 - **Settings & diagnostics** - read flight settings and recent log entries to help troubleshoot.
 
-Everything is **read-only** in this release. The AI can look, never touch. Your logbook stays authoritative.
+Reads are always allowed. Writes (create/update/delete) default to a dry-run preview and require `confirm=true` to apply. Every write is recorded in a local audit log. Your logbook stays authoritative.
 
 ---
 
@@ -61,7 +61,7 @@ Everything is **read-only** in this release. The AI can look, never touch. Your 
 - **Instructors and operators** tracking currency, hours, and aircraft usage across many entries.
 - **Anyone** who wants an AI copilot for their logbook data but does not want to upload it anywhere.
 
-If you have never used an MCP server before, think of it as a safe, read-only bridge between your logbook and an AI chat.
+If you have never used an MCP server before, think of it as a safe bridge between your logbook and an AI chat: it can read freely and writes only with your explicit confirmation.
 
 ---
 
@@ -198,7 +198,7 @@ Resource: `falcon://flights` (latest 100 flights as JSON).
 ## Privacy and safety
 
 - **Local only.** The server reads your SQLite file directly. It opens no sockets and exposes no network endpoints.
-- **Writes are gated.** Write tools default to a dry-run preview and require `confirm=true` to apply. Every write is recorded in a local audit log (`falcon_mcp_audit.jsonl` next to your database).
+- **Writes are gated.** Write tools default to a dry-run preview and require `confirm=true` to apply. Every write is recorded in a local audit log (`.mcp_audit.jsonl` next to your database).
 - **Schema-gated.** The server refuses to run if the database schema version is unexpected.
 - **No telemetry.** Nothing is sent anywhere by the server itself. (Your AI provider's own privacy policy still applies to the prompts you send it.)
 
@@ -210,7 +210,7 @@ Resource: `falcon://flights` (latest 100 flights as JSON).
 |---|---|
 | Language | Dart |
 | MCP protocol | `mcp_dart` (stdio transport) |
-| Storage | `sqlite3` (read-only queries) |
+| Storage | `sqlite3` (read/write SQL) |
 | Build | `dart compile exe` |
 
 No Flutter dependency. The server is a plain Dart console program, so it stays small and fast.

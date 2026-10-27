@@ -20,6 +20,7 @@ const Set<String> _boolColumns = {
   'helicopter',
   'float_plane',
   'archived',
+  'block_on_next_day',
   'is_simulator',
   'is_ifr',
   'show_summary_card',
