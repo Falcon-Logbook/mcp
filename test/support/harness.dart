@@ -51,6 +51,43 @@ String createFixture(String path) {
   return path;
 }
 
+/// Creates a Falcon-shaped database at [path] with the schema and no seed rows,
+/// for tests that need exact counts.
+String createEmptyFixture(String path) {
+  ensureSqliteLibrary();
+  final file = File(path);
+  if (file.existsSync()) file.deleteSync();
+  final db = sqlite.sqlite3.open(path);
+  try {
+    for (final statement in fixtureStatements) {
+      db.execute(statement);
+    }
+    db.execute('PRAGMA user_version = $fixtureSchemaVersion');
+  } finally {
+    db.dispose();
+  }
+  return path;
+}
+
+/// Inserts extra flight rows. Each entry is a column map; a `DateTime` date is
+/// stored as local midnight epoch seconds, the way the app writes it.
+void insertFlights(String path, List<Map<String, Object?>> rows) {
+  withFixtureDb(path, (db) {
+    for (final row in rows) {
+      final values = <String, Object?>{};
+      for (final entry in row.entries) {
+        final value = entry.value;
+        values[entry.key] = value is DateTime ? epochForDayStart(value) : value;
+      }
+      db.execute(
+        'INSERT INTO flights (${values.keys.join(', ')}) '
+        'VALUES (${List.filled(values.length, '?').join(', ')})',
+        values.values.toList(),
+      );
+    }
+  });
+}
+
 /// Raw SQL access for assertions.
 T withFixtureDb<T>(String path, T Function(sqlite.Database db) body) {
   ensureSqliteLibrary();

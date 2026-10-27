@@ -37,6 +37,94 @@ int? dateToEpoch(Object? value, {bool endOfDay = false}) {
       endOfDay: endOfDay);
 }
 
+/// The only date form a read tool accepts, and the text every rejection names.
+const String dateFormatHint = 'YYYY-MM-DD';
+
+final RegExp _strictDate = RegExp(r'^(\d{4})-(\d{2})-(\d{2})$');
+
+/// Parses a date argument for a read filter. Accepts exactly `YYYY-MM-DD` and
+/// returns null for anything else: timestamps, compact forms, impossible
+/// dates, blanks. A caller must treat null as a rejection, never as "no
+/// filter", because dropping the filter turns a period answer into a career
+/// answer.
+///
+/// [dateToEpoch] stays as it is for the write path, where a wider input form
+/// is already part of the contract.
+DateTime? parseCalendarDate(Object? value) {
+  if (value is! String) return null;
+  final match = _strictDate.firstMatch(value.trim());
+  if (match == null) return null;
+  final year = int.parse(match.group(1)!);
+  final month = int.parse(match.group(2)!);
+  final day = int.parse(match.group(3)!);
+  final date = DateTime(year, month, day);
+  if (date.year != year || date.month != month || date.day != day) return null;
+  return date;
+}
+
+/// Local midnight at the start of [day], as the `date` column stores it.
+int epochForDayStart(DateTime day) =>
+    DateTime(day.year, day.month, day.day).millisecondsSinceEpoch ~/ 1000;
+
+/// Local midnight at the start of the day after [day]: the exclusive upper
+/// bound that includes every row on [day].
+int epochForDayAfter(DateTime day) =>
+    DateTime(day.year, day.month, day.day + 1).millisecondsSinceEpoch ~/ 1000;
+
+/// [day] as `YYYY-MM-DD`, the form read filters accept and echo back.
+String formatCalendarDate(DateTime day) {
+  final year = day.year.toString().padLeft(4, '0');
+  final month = day.month.toString().padLeft(2, '0');
+  final date = day.day.toString().padLeft(2, '0');
+  return '$year-$month-$date';
+}
+
+/// Named date windows a tool can ask for instead of doing its own arithmetic.
+const List<String> datePresets = [
+  'last_7_days',
+  'last_30_days',
+  'last_90_days',
+  'this_month',
+  'this_year',
+  'last_year',
+];
+
+/// Resolves one of [datePresets] against [now]. Both bounds are inclusive
+/// calendar dates, matching the app: a last-N-days window is today plus the
+/// N-1 preceding dates. Returns null for an unknown preset.
+({DateTime from, DateTime to})? resolveDatePreset(String preset,
+    {required DateTime now}) {
+  // Calendar arithmetic rather than Duration so a DST change cannot move a
+  // boundary off midnight.
+  return switch (preset) {
+    'last_7_days' => (
+        from: DateTime(now.year, now.month, now.day - 6),
+        to: DateTime(now.year, now.month, now.day),
+      ),
+    'last_30_days' => (
+        from: DateTime(now.year, now.month, now.day - 29),
+        to: DateTime(now.year, now.month, now.day),
+      ),
+    'last_90_days' => (
+        from: DateTime(now.year, now.month, now.day - 89),
+        to: DateTime(now.year, now.month, now.day),
+      ),
+    'this_month' => (
+        from: DateTime(now.year, now.month, 1),
+        to: DateTime(now.year, now.month + 1, 0),
+      ),
+    'this_year' => (
+        from: DateTime(now.year, 1, 1),
+        to: DateTime(now.year, 12, 31),
+      ),
+    'last_year' => (
+        from: DateTime(now.year - 1, 1, 1),
+        to: DateTime(now.year - 1, 12, 31),
+      ),
+    _ => null,
+  };
+}
+
 int _epochFor(DateTime start, {required bool endOfDay}) {
   if (!endOfDay) return start.millisecondsSinceEpoch ~/ 1000;
   // Calendar arithmetic rather than +24h so DST days stay at 23:59:59.
