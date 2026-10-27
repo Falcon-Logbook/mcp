@@ -63,6 +63,11 @@ It asks when it needs a detail, rather than inventing one.
 - **Works with the app open or closed.**
 - **Every write is logged** to an audit file next to your database, named after it
   (`<database-name>.mcp_audit.jsonl`), so you can see what changed and when.
+- **Writes are checked before they land.** Flight times are capped at 525600 minutes (8760 hours)
+  and counts at 10000, the same limits the app enforces; block times must be a real 24-hour clock
+  time; day and night must add up to the total; and a zero total is refused, because the app would
+  store it as a complete flight. New rows get the same UUID ids the app uses, so they sync. A
+  refused write changes nothing. There is no preview yet: an accepted write applies immediately.
 - **Free and open source.** Apache 2.0, same as the app.
 
 ---
