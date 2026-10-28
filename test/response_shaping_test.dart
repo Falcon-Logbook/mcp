@@ -398,13 +398,14 @@ void main() {
     // 11,096 B to 13,798 B. Slice 2's `entity_totals` and `get_settings` add
     // 2,344 B, the flights_complete rename 55 B, #6's `ask_user` 888 B and
     // the type/sort enums with the offset argument 138 B. #12's
-    // `data_quality_report` adds 1,421 B and #7's `logbook_overview` 640 B,
-    // measured at 19,973 B. The bound is the measurement plus 1,024 B of
-    // headroom, which leaves room to reword a description but trips on a new
-    // tool or a description that grows materially.
-    expect(readOnlyCatalog, lessThanOrEqualTo(20997),
+    // `data_quality_report` adds 1,421 B and #7's `logbook_overview` 640 B.
+    // #3's `validate_flight_drafts` adds 1,460 B, measured at 21,433 B. The
+    // bound is the measurement plus 1,024 B of headroom, which leaves room to
+    // reword a description but trips on a new tool or a description that grows
+    // materially.
+    expect(readOnlyCatalog, lessThanOrEqualTo(22457),
         reason: 'the read-only catalog costs $readOnlyCatalog B, against '
-            '19,973 B measured plus 1,024 B of wording headroom');
+            '21,433 B measured plus 1,024 B of wording headroom');
 
     final typo = await bytesOf(server, 'list_flights', {'limt': 5});
     expect(typo, lessThan(400), reason: 'a typo error costs $typo B');
