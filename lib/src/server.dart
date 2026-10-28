@@ -196,11 +196,59 @@ const Map<String, String> _hoursAliases = {
 };
 
 /// Every response that carries a time or date field states its units here,
-/// once per response rather than per row.
+/// once per response rather than per row. `date` describes what a read
+/// serialises, which is the local ISO-8601 string [epochToIso] renders, not the
+/// epoch integer the column stores.
 const Map<String, String> _units = {
   'time': 'minutes',
-  'date': 'epoch_seconds',
+  'date': 'iso8601_local',
 };
+
+/// The columns a flight summary carries: what was flown, when, in what, with
+/// whom and how long. Every key is present even when the value is null, so a
+/// missing reading reads as "not recorded" rather than as a key the caller has
+/// to know about.
+const List<String> _slimFlightKeys = [
+  'id',
+  'date',
+  'route',
+  'flight_number',
+  'aircraft_registration',
+  'crew_members_name',
+  'total_time',
+  'day_time',
+  'night_time',
+  'takeoffs',
+  'landings',
+  'is_simulator',
+];
+
+/// [row] as a flight read returns it: the twelve-field summary, or every column
+/// when [full]. A column the live database does not have stays null rather than
+/// disappearing from the row.
+Map<String, dynamic> _flightView(Map<String, dynamic> row,
+        {bool full = false}) =>
+    full ? row : {for (final key in _slimFlightKeys) key: row[key]};
+
+/// The `full` argument on the paged flight reads. The cost is stated here
+/// because this is the argument a caller weighs.
+JsonSchema get _fullFlightSchema => JsonSchema.boolean(
+    description: 'Every column instead of the twelve-field summary, at about '
+        'four times the tokens.');
+
+/// The `limit` argument on the two paged flight reads, `list_flights` and
+/// `search_flights`: 20 rows by default, 200 at most, so the page size is honest
+/// and `has_more` says what is left. `find_missing_times` is not paged and
+/// returns every match up to the cap, so it declares its own default; reusing
+/// this schema there would promise 20 rows and deliver 200.
+JsonSchema get _flightLimitSchema => JsonSchema.integer(
+    minimum: 1, maximum: 200, description: 'Default 20, maximum 200.');
+
+/// The `limit` argument on `find_missing_times`, which exists to find every
+/// draft rather than to page: 200 rows by default, which is what its callback
+/// does, so the catalog and the response agree.
+JsonSchema get _missingTimesLimitSchema => JsonSchema.integer(
+    minimum: 1, maximum: 200, description: 'Default 200, maximum 200.');
 
 /// Arguments that select the date window, shared by every filtered read.
 const Set<String> _dateFilterKeys = {'date_from', 'date_to', 'period'};
@@ -227,8 +275,9 @@ class _ToolError implements Exception {
   String toString() => message;
 }
 
-TextContent _jsonContent(Object? value) =>
-    TextContent(text: const JsonEncoder.withIndent('  ').convert(value));
+/// A tool result as compact JSON: a client can pretty-print for a human, and an
+/// agent reading a page of rows does not pay for indentation it cannot use.
+TextContent _jsonContent(Object? value) => TextContent(text: jsonEncode(value));
 
 CallToolResult _ok(Object? value) =>
     CallToolResult.fromContent([_jsonContent(value)]);
@@ -1029,12 +1078,15 @@ Future<void> runServer(String dbPath, {bool readonly = true}) async {
     'list_flights',
     description:
         'List flights, newest first (date, then day_order, then id). Times are '
-        'minutes and dates are epoch seconds. Returns count (rows on this page), '
-        'total (all matching rows), has_more, offset and the applied range. '
-        'Dates are YYYY-MM-DD. Local rows only unless include_shared is true.',
+        'minutes and dates come back as local ISO-8601 strings; filters take '
+        'YYYY-MM-DD. Returns count (rows on this page), total (all matching '
+        'rows), has_more, offset and the applied range. Each flight is a '
+        'twelve-field summary unless full is true. Local rows only unless '
+        'include_shared is true.',
     inputSchema: JsonSchema.object(properties: {
-      'limit': JsonSchema.integer(minimum: 1, maximum: 1000),
+      'limit': _flightLimitSchema,
       'offset': JsonSchema.integer(minimum: 0),
+      'full': _fullFlightSchema,
       ..._dateFilterProperties(),
       'aircraft_registration': JsonSchema.string(),
       'flight_type': JsonSchema.string(),
@@ -1049,15 +1101,17 @@ Future<void> runServer(String dbPath, {bool readonly = true}) async {
         _rejectUnknown(args, {
           'limit',
           'offset',
+          'full',
           'aircraft_registration',
           'flight_type',
           'crew_members_name',
           ..._flightFilterKeys,
         });
-        final limit = asInt(args['limit']) ?? 50;
+        final limit = asInt(args['limit']) ?? 20;
         if (limit < 1) return _fail('limit must be >= 1');
         final offset = asInt(args['offset']) ?? 0;
         if (offset < 0) return _fail('offset must be >= 0');
+        final full = asBool(args['full']) ?? false;
         final window = _flightDateFilter(args, now: DateTime.now());
         final where = [...window.where];
         final params = [...window.params];
@@ -1089,7 +1143,7 @@ Future<void> runServer(String dbPath, {bool readonly = true}) async {
           'offset': offset,
           'range': _rangeOf(window),
           'units': _units,
-          'flights': rows,
+          'flights': [for (final row in rows) _flightView(row, full: full)],
         });
       } on _ToolError catch (error) {
         return _fail(error.message);
@@ -1102,8 +1156,10 @@ Future<void> runServer(String dbPath, {bool readonly = true}) async {
   server.registerTool(
     'get_flight',
     description:
-        'Get a single flight by id. Times are minutes and dates are epoch '
-        'seconds. Local rows only unless include_shared is true.',
+        'Get a single flight by id, with every column. Times are minutes and '
+        'dates come back as local ISO-8601 strings. This is the detail call: '
+        'use it when a summary row does not answer the question. Local rows '
+        'only unless include_shared is true.',
     inputSchema: JsonSchema.object(properties: {
       'id': JsonSchema.string(),
       _includeSharedKey: JsonSchema.boolean(
@@ -1138,14 +1194,17 @@ Future<void> runServer(String dbPath, {bool readonly = true}) async {
     'search_flights',
     description:
         'Search flights by free text (route, flight number, crew name, '
-        'registration). Times are minutes and dates are epoch seconds. Returns '
-        'count (rows on this page), total (all matching rows), has_more, offset '
-        'and the applied range. Ordered newest first (date, then day_order, '
-        'then id). Local rows only unless include_shared is true.',
+        'registration). Times are minutes and dates come back as local ISO-8601 '
+        'strings; filters take YYYY-MM-DD. Returns count (rows on this page), '
+        'total (all matching rows), has_more, offset and the applied range. '
+        'Ordered newest first (date, then day_order, then id). Each flight is a '
+        'twelve-field summary unless full is true. Local rows only unless '
+        'include_shared is true.',
     inputSchema: JsonSchema.object(properties: {
       'query': JsonSchema.string(),
-      'limit': JsonSchema.integer(minimum: 1, maximum: 1000),
+      'limit': _flightLimitSchema,
       'offset': JsonSchema.integer(minimum: 0),
+      'full': _fullFlightSchema,
       ..._dateFilterProperties(),
       _includeSharedKey: JsonSchema.boolean(
           description:
@@ -1160,14 +1219,16 @@ Future<void> runServer(String dbPath, {bool readonly = true}) async {
           'query',
           'limit',
           'offset',
+          'full',
           ..._flightFilterKeys,
         });
         final text = asText(args['query']);
         if (text == null) return _fail('Missing or invalid query');
-        final limit = asInt(args['limit']) ?? 50;
+        final limit = asInt(args['limit']) ?? 20;
         if (limit < 1) return _fail('limit must be >= 1');
         final offset = asInt(args['offset']) ?? 0;
         if (offset < 0) return _fail('offset must be >= 0');
+        final full = asBool(args['full']) ?? false;
         final like = '%${escapeLike(text)}%';
         final window = _flightDateFilter(args, now: DateTime.now());
         final where = <String>[
@@ -1200,7 +1261,7 @@ Future<void> runServer(String dbPath, {bool readonly = true}) async {
           'offset': offset,
           'range': _rangeOf(window),
           'units': _units,
-          'flights': rows,
+          'flights': [for (final row in rows) _flightView(row, full: full)],
         });
       } on _ToolError catch (error) {
         return _fail(error.message);
@@ -1546,10 +1607,12 @@ Future<void> runServer(String dbPath, {bool readonly = true}) async {
     'find_missing_times',
     description:
         'Find flights with no total time (drafts) or no day/night split. Times '
-        'are minutes and dates are epoch seconds. Local rows only unless '
+        'are minutes and dates come back as local ISO-8601 strings. Each flight '
+        'is a twelve-field summary unless full is true. Local rows only unless '
         'include_shared is true.',
     inputSchema: JsonSchema.object(properties: {
-      'limit': JsonSchema.integer(minimum: 1, maximum: 1000),
+      'limit': _missingTimesLimitSchema,
+      'full': _fullFlightSchema,
       _includeSharedKey: JsonSchema.boolean(
           description:
               'Include rows owned by another device or account. Default false.'),
@@ -1557,8 +1620,9 @@ Future<void> runServer(String dbPath, {bool readonly = true}) async {
     annotations: readOnlyAnnotations,
     callback: (args, extra) async {
       try {
-        _rejectUnknown(args, {'limit', _includeSharedKey});
+        _rejectUnknown(args, {'limit', 'full', _includeSharedKey});
         final limit = asInt(args['limit']) ?? 200;
+        final full = asBool(args['full']) ?? false;
         final owner = _ownerClause(db, 'flights',
             includeShared: asBool(args[_includeSharedKey]) ?? false);
         final rows = db.query(
@@ -1568,7 +1632,11 @@ Future<void> runServer(String dbPath, {bool readonly = true}) async {
           'ORDER BY date DESC, day_order DESC, id LIMIT ?',
           [limit],
         );
-        return _ok({'count': rows.length, 'units': _units, 'flights': rows});
+        return _ok({
+          'count': rows.length,
+          'units': _units,
+          'flights': [for (final row in rows) _flightView(row, full: full)],
+        });
       } on _ToolError catch (error) {
         return _fail(error.message);
       } catch (error) {
@@ -2259,23 +2327,28 @@ Future<void> runServer(String dbPath, {bool readonly = true}) async {
     'flights',
     'falcon://flights',
     (
-      description: 'The 100 most recent local flights as JSON.',
+      description: 'The 20 most recent local flights as JSON: {rows, units}, '
+          'with each row a twelve-field summary. Use list_flights for filters, '
+          'paging and full rows.',
       mimeType: 'application/json',
     ),
     (uri, extra) async {
       // A resource takes no arguments, so it answers with local rows only, the
       // same default as list_flights. Use list_flights include_shared for the
-      // rest.
+      // rest, and full: true for every column.
       final owner = _ownerClause(db, 'flights', includeShared: false);
       final rows = db
           .query('SELECT * FROM flights${owner.isEmpty ? '' : ' WHERE $owner'} '
-              'ORDER BY date DESC, day_order DESC, id LIMIT 100');
+              'ORDER BY date DESC, day_order DESC, id LIMIT 20');
       return ReadResourceResult(
         contents: [
           TextResourceContents(
             uri: uri.toString(),
             mimeType: 'application/json',
-            text: const JsonEncoder.withIndent('  ').convert(rows),
+            text: jsonEncode({
+              'rows': [for (final row in rows) _flightView(row)],
+              'units': _units,
+            }),
           ),
         ],
       );
@@ -2320,7 +2393,7 @@ Future<void> runServer(String dbPath, {bool readonly = true}) async {
             uri: uri.toString(),
             mimeType: 'text/plain',
             text: 'FALCON DB CONVENTIONS\n\n'
-                '- Dates and timestamps are unix epoch seconds. The flights.date column holds local midnight of the flight date; tool inputs accept YYYY-MM-DD and are converted the same way.\n'
+                '- Dates and timestamps are stored as unix epoch seconds and returned as local ISO-8601 strings, for example 2026-10-27T00:00:00.000. The flights.date column holds local midnight of the flight date; tool inputs accept YYYY-MM-DD and are converted the same way.\n'
                 '- Read filters accept only YYYY-MM-DD (or a named period) and reject anything else instead of ignoring it. Every filtered response echoes the applied window as range {from, to}.\n'
                 '- Flight time columns (total_time, day_time, night_time, actual_instrument, simulated_instrument, icus_day_time, icus_night_time) are integer MINUTES. Responses state this in a units object. Write tools also accept total_time_hours, day_time_hours and night_time_hours.\n'
                 '- Flight time is capped at 525600 minutes (8760 hours) and takeoff/landing counts at 10000, the same limits the app enforces. A value outside either is refused, and the error names the limit.\n'
@@ -2330,7 +2403,7 @@ Future<void> runServer(String dbPath, {bool readonly = true}) async {
                 '- ids for flights, aircraft, crew_members, custom_airports and flights_settings are RFC 4122 version 4 UUIDs, lowercase and hyphenated, the shape the cloud schema requires before a row can sync. A create tool accepts an optional UUID v4 id so an import can keep its own, and refuses any other shape. saved_routes keeps its integer id.\n'
                 '- day_order is the order of a flight within its date: a create takes the next free order for that day, and an update recomputes it when the date moves the flight to another day. updated_at records the last write.\n'
                 '- Flights are ordered date DESC, day_order DESC, id, the same as the app. Flights on the same date are newest-first within the day.\n'
-                '- Reads return local rows only (owner_id NULL or "local") unless include_shared is true. Paged reads return count (rows on this page), total (all matching rows), has_more and offset.\n'
+                '- Reads return local rows only (owner_id NULL or "local") unless include_shared is true. Paged reads return count (rows on this page), total (all matching rows), has_more and offset, and default to 20 rows with a maximum of 200. A listed flight is a twelve-field summary unless full: true.\n'
                 '- aircraft.registration is the BARE registration (e.g. country_code=VH, registration=XZO). The app displays country_code + "-" + registration.\n'
                 '- flights.aircraft_registration is the display registration (e.g. VH-XZO). Write tools accept either form and set aircraft_id from the matching aircraft row; flights.crew_members_name is matched the same way to set crew_member_id.\n'
                 '- flight_type values: route, details. crew_role values: pilotInCommand, copilot, student.\n'
@@ -2362,7 +2435,7 @@ Future<void> runServer(String dbPath, {bool readonly = true}) async {
           TextResourceContents(
             uri: uri.toString(),
             mimeType: 'application/json',
-            text: const JsonEncoder.withIndent('  ').convert(out),
+            text: jsonEncode(out),
           ),
         ],
       );
