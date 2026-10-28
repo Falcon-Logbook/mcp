@@ -275,19 +275,18 @@ void main() {
       // #8's expiry and currency reads add 2,702 B (`list_expiries` 1,295 and
       // `currency_status` 1,405, schemas included), taking this from 11,713 B
       // to 14,415 B. Slice 2 adds 2,344 B (`entity_totals`, `get_settings` and
-      // the two list separators) and the flights_complete rename 55 B, for
-      // 16,814 B; enum values on entity_totals' type and sort plus its offset
-      // argument add 138 B: 16,952 B measured.
-      //
-      // The bound is the measurement plus 1,024 B. The headroom is for wording,
-      // not for tools: a new tool or a description that grows materially is
-      // hundreds of bytes and trips this, while wording that fixes a sentence
-      // does not, so the next author does not have to raise the figure to edit
-      // a phrase. Raising it is still a deliberate act with a new measurement.
+      // the two list separators), the flights_complete rename 55 B, and #6's
+      // `ask_user` 888 B; enum values on entity_totals' type and sort plus its
+      // offset argument add 138 B. The bound is the measurement plus 1,024 B.
+      // The headroom is for wording, not for tools: a new tool or a
+      // description that grows materially is hundreds of bytes and trips this,
+      // while wording that fixes a sentence does not, so the next author does
+      // not have to raise the figure to edit a phrase. Raising it is still a
+      // deliberate act with a new measurement.
       final readOnly =
           bytesOf(jsonEncode((await reader.send('tools/list', {}))['result']));
-      expect(readOnly, lessThanOrEqualTo(17976),
-          reason: 'the read-only catalog costs $readOnly B, against 16,952 B '
+      expect(readOnly, lessThanOrEqualTo(18936),
+          reason: 'the read-only catalog costs $readOnly B, against 17,912 B '
               'measured plus 1,024 B of wording headroom');
 
       // Issue #11 sets 22 KiB here, measured when the two flight write schemas
@@ -295,15 +294,15 @@ void main() {
       // the bounds, formats and draft rule that the write tests pin, so the
       // figure is out of reach without deleting typed properties or that text.
       // This is the reachable number: the read tools are in both catalogs, so
-      // slice 2's 2,344 B and the 55 B rename take this from 29,956 B to
-      // 32,355 B, and the 138 B of enum values and offset take it to 32,493 B
-      // measured. Same rule as above: measured plus 1,024 B, so wording has
-      // room and a tool does not.
+      // slice 2's 2,344 B, the 55 B rename and #6's `ask_user` at 973 B take
+      // this from 29,956 B to 33,428 B, and the 138 B of enum values and
+      // offset take it to 33,566 B measured. Same rule as above: measured plus
+      // 1,024 B, so wording has room and a tool does not.
       final writeMode =
           bytesOf(jsonEncode((await writer.send('tools/list', {}))['result']));
-      expect(writeMode, lessThanOrEqualTo(33517),
+      expect(writeMode, lessThanOrEqualTo(34590),
           reason: 'the write-mode catalog costs $writeMode B, against '
-              '32,493 B measured plus 1,024 B of wording headroom');
+              '33,566 B measured plus 1,024 B of wording headroom');
     });
   });
 

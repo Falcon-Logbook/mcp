@@ -3,6 +3,7 @@ import 'dart:convert';
 import 'package:mcp_dart/mcp_dart.dart';
 import 'package:sqlite3/sqlite3.dart' show SqliteException;
 
+import 'ask_user.dart';
 import 'config.dart';
 import 'currency.dart';
 import 'db.dart';
@@ -1216,6 +1217,51 @@ Future<void> runServer(String dbPath, {bool readonly = true}) async {
   // ============================================================
   // READ TOOLS
   // ============================================================
+
+  // A question, over whichever path the connection allows: a form on a client
+  // that declares elicitation, the same questions as data on one that does
+  // not. It writes nothing, so it stays available in read-only mode.
+  final askState = AskStateStore();
+
+  server.registerStatelessTool(
+    'ask_user',
+    description:
+        'Ask the pilot questions and get answers back, not in prose. A '
+        'question has a stable id, a type (choice, multi, boolean, text) and '
+        'options of value and label for choice and multi. Returns status '
+        'answered with the answers by id, and the ids in defaulted that were '
+        'filled in rather than answered, or declined or cancelled. On '
+        'needs_input this client cannot show a form: ask the questions '
+        'yourself, then call again with answers by id, with the questions '
+        'repeated or not.',
+    inputSchema: askUserInputSchema,
+    annotations: readOnlyAnnotations,
+    callback: (args, extra) async {
+      try {
+        _rejectUnknown(args, askUserArgumentFields, tool: 'ask_user');
+        final capabilities =
+            extra.clientCapabilities ?? server.server.getClientCapabilities();
+        return await askUser(
+          args,
+          stateless: isStatelessProtocolVersion(extra.protocolVersion ?? ''),
+          canElicit: capabilities?.elicitation?.supportsForm ?? false,
+          elicit: server.elicitInput,
+          state: askState,
+          inputResponses: extra.inputResponses,
+          requestState: extra.requestState,
+        );
+      } on AskUserError catch (error) {
+        return _fail(
+          error.message,
+          code: error.code,
+          field: error.field,
+          tool: error.code == 'unknown_field' ? 'ask_user' : null,
+        );
+      } catch (error) {
+        return _failWith(_asToolError(error));
+      }
+    },
+  );
 
   server.registerTool(
     'db_info',
@@ -3094,8 +3140,11 @@ Future<void> runServer(String dbPath, {bool readonly = true}) async {
                   'get_aircraft, list_airports, list_custom_airports, list_crew, list_saved_routes, logbook_stats, '
                   'entity_totals, list_expiries, currency_status, '
                   'get_flight_settings, get_app_settings, get_general_settings, get_settings, '
-                  'get_recent_logs, find_missing_times, dedupe_crew.\n'
+                  'get_recent_logs, find_missing_times, dedupe_crew, ask_user.\n'
                   '$writeTools\n'
+                  'When you need a decision from the pilot, such as which aircraft, which legs or whether to go '
+                  'ahead, call ask_user: the pilot picks from a list instead of typing an answer to a question you '
+                  'described.\n'
                   'Call get_schema for table names and column counts, pass table for one table\'s columns, and read the falcon://conventions resource for field semantics (dates, minutes, registration format, draft rule).\n'
                   'Example questions: "How many hours did I fly last year?", "List flights into YSSY in 2025", '
                   '"Are there flights missing block times?", "Add a flight today in VH-XZO from YSSY to NZQN".\n'

@@ -115,7 +115,44 @@ class McpProcess {
     _stderrDone = _process.stderr.transform(utf8.decoder).join();
   }
 
-  static Future<McpProcess> start(String dbPath, {bool write = false}) async {
+  static Future<McpProcess> start(String dbPath,
+      {bool write = false,
+      Map<String, dynamic> capabilities = const {}}) async {
+    final client = await _spawn(dbPath, write: write);
+    final init = await client.send('initialize', {
+      'protocolVersion': '2025-06-18',
+      'capabilities': capabilities,
+      'clientInfo': {'name': 'falcon_mcp_test', 'version': '1'},
+    });
+    if (init['error'] != null) {
+      throw StateError('initialize failed: ${init['error']}');
+    }
+    client._notify('notifications/initialized', {});
+    return client;
+  }
+
+  /// Starts the server on a connection that never calls `initialize`.
+  ///
+  /// Every request carries its own protocol version and client capabilities,
+  /// the way a 2026-07-28 client does. That is the only connection where a
+  /// tool can answer with an input request, so tests that need that path use
+  /// this and tests that need an older client use [start].
+  static Future<McpProcess> startStateless(String dbPath,
+      {bool write = false,
+      Map<String, dynamic> clientCapabilities = const {}}) async {
+    final client = await _spawn(dbPath, write: write);
+    client._statelessMeta = {
+      'io.modelcontextprotocol/protocolVersion': '2026-07-28',
+      'io.modelcontextprotocol/clientCapabilities': clientCapabilities,
+      'io.modelcontextprotocol/clientInfo': {
+        'name': 'falcon_mcp_test',
+        'version': '1',
+      },
+    };
+    return client;
+  }
+
+  static Future<McpProcess> _spawn(String dbPath, {bool write = false}) async {
     final libraryPath = Platform.environment['LD_LIBRARY_PATH'] ?? '';
     final process = await Process.start(
       Platform.resolvedExecutable,
@@ -132,17 +169,7 @@ class McpProcess {
         'LD_LIBRARY_PATH': libraryPath,
       },
     );
-    final client = McpProcess._(process);
-    final init = await client.send('initialize', {
-      'protocolVersion': '2025-06-18',
-      'capabilities': <String, dynamic>{},
-      'clientInfo': {'name': 'falcon_mcp_test', 'version': '1'},
-    });
-    if (init['error'] != null) {
-      throw StateError('initialize failed: ${init['error']}');
-    }
-    client._notify('notifications/initialized', {});
-    return client;
+    return McpProcess._(process);
   }
 
   final Process _process;
@@ -150,6 +177,7 @@ class McpProcess {
   late final StreamIterator<String> _lines = StreamIterator(
       _process.stdout.transform(utf8.decoder).transform(const LineSplitter()));
   int _nextId = 1;
+  Map<String, dynamic>? _statelessMeta;
 
   Future<String> _readLine() async {
     while (await _lines.moveNext()) {
@@ -159,17 +187,44 @@ class McpProcess {
     throw StateError('server closed stdout: ${await _stderrDone}');
   }
 
-  Future<Map<String, dynamic>> send(
-      String method, Map<String, dynamic> params) async {
+  /// Sends a request and returns its JSON-RPC id.
+  ///
+  /// Use this instead of [send] when the server may answer with a request of
+  /// its own first, as an older client sees an elicitation.
+  Future<int> write(String method, Map<String, dynamic> params) async {
     final id = _nextId++;
     _process.stdin.writeln(jsonEncode({
       'jsonrpc': '2.0',
       'id': id,
       'method': method,
-      'params': params,
+      'params': {
+        ...params,
+        if (_statelessMeta != null) '_meta': _statelessMeta,
+      },
     }));
     await _process.stdin.flush();
-    return jsonDecode(await _readLine()) as Map<String, dynamic>;
+    return id;
+  }
+
+  /// The next message from the server: a response, or a request it raised.
+  Future<Map<String, dynamic>> read() async =>
+      jsonDecode(await _readLine()) as Map<String, dynamic>;
+
+  /// Answers the server-initiated request [message].
+  Future<void> reply(
+      Map<String, dynamic> message, Map<String, dynamic> result) async {
+    _process.stdin.writeln(jsonEncode({
+      'jsonrpc': '2.0',
+      'id': message['id'],
+      'result': result,
+    }));
+    await _process.stdin.flush();
+  }
+
+  Future<Map<String, dynamic>> send(
+      String method, Map<String, dynamic> params) async {
+    await write(method, params);
+    return read();
   }
 
   void _notify(String method, Map<String, dynamic> params) {
@@ -183,16 +238,31 @@ class McpProcess {
   /// Calls [tool] and returns the decoded JSON payload, or the error text when
   /// the tool reported a failure.
   Future<({bool isError, Object? payload})> call(
-      String tool, Map<String, dynamic> args) async {
-    final response =
-        await send('tools/call', {'name': tool, 'arguments': args});
+          String tool, Map<String, dynamic> args) async =>
+      _unwrap(await callRaw(tool, args));
+
+  /// Sends `tools/call` and returns the whole response.
+  ///
+  /// [extra] are params-level fields next to `name` and `arguments`: on a
+  /// retry that is `requestState` and `inputResponses`.
+  Future<Map<String, dynamic>> callRaw(String tool, Map<String, dynamic> args,
+          {Map<String, dynamic>? extra}) =>
+      send('tools/call', {
+        'name': tool,
+        'arguments': args,
+        ...?extra,
+      });
+
+  ({bool isError, Object? payload}) _unwrap(Map<String, dynamic> response) {
     final error = response['error'];
     if (error is Map) {
       return (isError: true, payload: '${error['message']}');
     }
     final result = response['result'] as Map<String, dynamic>;
-    final content = (result['content'] as List).cast<Map<String, dynamic>>();
-    final text = content.isEmpty ? '' : content.first['text'] as String;
+    final content = (result['content'] as List?)?.cast<Map<String, dynamic>>();
+    final text = content == null || content.isEmpty
+        ? ''
+        : content.first['text'] as String;
     final isError = result['isError'] == true;
     return (
       isError: isError,
