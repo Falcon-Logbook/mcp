@@ -355,14 +355,23 @@ const Set<String> _flightPageFilterKeys = {
 ///
 /// [code] is a token a caller can branch on, [field] is the argument at fault,
 /// and [tool] is named when several tools could have refused. [detail] is one
-/// sentence: no SQL, no file path, no database text.
+/// sentence: no SQL, no file path, no database text. [data] carries extra
+/// fields for codes that answer a question, such as the current row of a
+/// conflict.
 class _ToolError implements Exception {
-  _ToolError(this.detail, {this.code = 'invalid_value', this.field, this.tool});
+  _ToolError(
+    this.detail, {
+    this.code = 'invalid_value',
+    this.field,
+    this.tool,
+    this.data,
+  });
 
   final String detail;
   final String code;
   final String? field;
   final String? tool;
+  final Map<String, Object?>? data;
 
   @override
   String toString() => detail;
@@ -377,12 +386,14 @@ CallToolResult _ok(Object? value) =>
 
 /// A failed call as the envelope an agent can act on: a stable error code, the
 /// field at fault, and one short sentence. Same encoding as a successful
-/// result, so a caller parses one shape either way.
+/// result, so a caller parses one shape either way. [data] merges extra
+/// fields into the envelope, such as the current row of a conflict.
 CallToolResult _fail(
   String detail, {
   String code = 'invalid_value',
   String? field,
   String? tool,
+  Map<String, Object?>? data,
 }) =>
     CallToolResult(
       content: [
@@ -390,6 +401,7 @@ CallToolResult _fail(
           'error': code,
           if (field != null) 'field': field,
           if (tool != null) 'tool': tool,
+          if (data != null) ...data,
           'detail': detail,
         }),
       ],
@@ -403,6 +415,7 @@ CallToolResult _failWith(_ToolError error) => _fail(
       code: error.code,
       field: error.field,
       tool: error.tool,
+      data: error.data,
     );
 
 /// Anything thrown inside a callback as a [_ToolError].
@@ -1451,6 +1464,72 @@ Map<String, dynamic> _deleted(String table, Object id) => {
       'id': id,
       'table': table,
     };
+
+/// The `expected_updated_at` argument every update tool accepts.
+JsonSchema get _expectedUpdatedAtSchema => JsonSchema.integer(
+    minimum: 0,
+    description: 'The updated_at you read. A conflict returns the current row '
+        'when it changed since. Omit to write unconditionally.');
+
+/// The extra WHERE fragment and bind values that turn an update into an
+/// optimistic one: with expected_updated_at the write applies only to the row
+/// as the caller read it, so a concurrent change fails the write instead of
+/// being silently overwritten. Empty when the field is omitted, which keeps
+/// the unconditional write for callers that read nothing.
+///
+/// The fragment expects the statement's WHERE clause to end with `id = ?` and
+/// the id to be bound last before these values.
+(String, List<Object?>) _optimisticGuard(Map<String, dynamic> args) {
+  final expected = asInt(args['expected_updated_at']);
+  if (expected == null) return ('', const []);
+  return (' AND updated_at = ?', [expected]);
+}
+
+/// The expected_updated_at argument, for the error message.
+int? _expectedUpdatedAtOf(Map<String, dynamic> args) =>
+    asInt(args['expected_updated_at']);
+
+/// Throws unless [changed] says the update wrote the row it aimed at.
+///
+/// Zero rows means either the row is gone (not_found) or, when the caller
+/// sent expected_updated_at, that another writer changed the row since it
+/// was read. The conflict carries the current row, shaped by [shape] where a
+/// tool has a row mapper, so a caller can retry against what is actually
+/// there.
+void _requireUpdated(
+  FalconDb db, {
+  required String table,
+  required Object id,
+  required int changed,
+  required String label,
+  required String tool,
+  required int? expected,
+  Map<String, Object?> Function(Map<String, dynamic> row)? shape,
+}) {
+  if (changed == 1) return;
+  final rows = db.query('SELECT * FROM $table WHERE id = ?', [id]);
+  if (rows.isEmpty) {
+    throw _ToolError('$label not found: $id', code: 'not_found', field: 'id');
+  }
+  final current = rows.first;
+  // The raw stamp: query() renders a `*_at` epoch as ISO text, and the
+  // comparison has to name the stored value the caller will send next time.
+  final stored = db.selectRaw(
+      'SELECT updated_at FROM $table WHERE id = ?', [id]).first['updated_at'];
+  throw _ToolError(
+    stored is! int
+        ? 'the row has no updated_at stamp yet, so it cannot be compared '
+            'with $expected. Re-read the row and retry without '
+            'expected_updated_at: the write stamps it, and later updates '
+            'can expect it'
+        : 'the row changed since it was read: its updated_at is $stored, '
+            'not $expected. Re-read the row and retry with the newer value',
+    code: 'conflict',
+    field: 'expected_updated_at',
+    tool: tool,
+    data: {'current': shape?.call(current) ?? current},
+  );
+}
 
 /// Inserts [fields] into [table], filling in any remaining writable columns
 /// from [args] first.
@@ -2793,6 +2872,7 @@ Future<void> runServer(String dbPath, {bool readonly = true}) async {
       inputSchema: JsonSchema.object(
         properties: {
           'id': JsonSchema.string(),
+          'expected_updated_at': _expectedUpdatedAtSchema,
           ..._flightWriteProperties(db, notes: false),
         },
         required: ['id'],
@@ -2808,7 +2888,11 @@ Future<void> runServer(String dbPath, {bool readonly = true}) async {
           throw _ToolError('Flight not found: $id',
               code: 'not_found', field: 'id');
         }
-        final flight = _flightValues(db, args, tool: 'update_flight');
+        // The guard is this tool's own argument; _flightValues rejects
+        // unknown flight fields, and create_flight does not take it.
+        final writeArgs = Map<String, dynamic>.of(args)
+          ..remove('expected_updated_at');
+        final flight = _flightValues(db, writeArgs, tool: 'update_flight');
         if (flight.values.isEmpty) throw _ToolError('No fields to update');
         final values = Map<String, Object?>.of(flight.values);
         final date = asInt(values['date']);
@@ -2816,14 +2900,19 @@ Future<void> runServer(String dbPath, {bool readonly = true}) async {
           values['day_order'] = _nextDayOrder(db, date);
         }
         final assignments = [for (final column in values.keys) '$column = ?'];
+        final guard = _optimisticGuard(args);
         final changed = db.execute(
-          'UPDATE flights SET ${assignments.join(', ')}, updated_at = ? WHERE id = ?',
-          [...values.values, nowEpochSeconds(), id],
+          'UPDATE flights SET ${assignments.join(', ')}, updated_at = ? '
+          'WHERE id = ?${guard.$1}',
+          [...values.values, nowEpochSeconds(), id, ...guard.$2],
         );
-        if (changed != 1) {
-          throw _ToolError('Flight not found: $id',
-              code: 'not_found', field: 'id');
-        }
+        _requireUpdated(db,
+            table: 'flights',
+            id: id,
+            changed: changed,
+            label: 'Flight',
+            tool: 'update_flight',
+            expected: _expectedUpdatedAtOf(args));
         final row = _flightRow(db, id)!;
         final warnings = [
           ...flight.warnings,
@@ -2923,6 +3012,7 @@ Future<void> runServer(String dbPath, {bool readonly = true}) async {
       inputSchema: JsonSchema.object(
         properties: {
           'id': JsonSchema.string(),
+          'expected_updated_at': _expectedUpdatedAtSchema,
           ..._propertiesOf(_supported(db, 'aircraft', _aircraftColumns))
         },
         required: ['id'],
@@ -2931,7 +3021,8 @@ Future<void> runServer(String dbPath, {bool readonly = true}) async {
           readOnlyHint: false, destructiveHint: false, openWorldHint: false),
       callback: (args, extra) async =>
           _runWrite(db, auditor, 'update_aircraft', args, () {
-        _rejectUnknown(args, _fieldNames(_aircraftColumns, {'id'}),
+        _rejectUnknown(
+            args, _fieldNames(_aircraftColumns, {'id', 'expected_updated_at'}),
             tool: 'update_aircraft');
         final id = asText(args['id']);
         if (id == null) throw _ToolError('Missing or invalid id', field: 'id');
@@ -2979,10 +3070,19 @@ Future<void> runServer(String dbPath, {bool readonly = true}) async {
         _collect(db, 'aircraft', _aircraftColumns, normalized, columns, values);
         if (columns.isEmpty) throw _ToolError('No fields to update');
         final assignments = [for (final column in columns) '$column = ?'];
-        db.execute(
-          'UPDATE aircraft SET ${assignments.join(', ')}, updated_at = ? WHERE id = ?',
-          [...values, nowEpochSeconds(), id],
+        final guard = _optimisticGuard(args);
+        final changed = db.execute(
+          'UPDATE aircraft SET ${assignments.join(', ')}, updated_at = ? '
+          'WHERE id = ?${guard.$1}',
+          [...values, nowEpochSeconds(), id, ...guard.$2],
         );
+        _requireUpdated(db,
+            table: 'aircraft',
+            id: id,
+            changed: changed,
+            label: 'Aircraft',
+            tool: 'update_aircraft',
+            expected: _expectedUpdatedAtOf(args));
         return {'status': 'updated', 'id': id};
       }),
     );
@@ -3056,6 +3156,7 @@ Future<void> runServer(String dbPath, {bool readonly = true}) async {
       inputSchema: JsonSchema.object(
         properties: {
           'id': JsonSchema.string(),
+          'expected_updated_at': _expectedUpdatedAtSchema,
           ..._propertiesOf(_supported(db, 'crew_members', _crewColumns))
         },
         required: ['id'],
@@ -3064,7 +3165,8 @@ Future<void> runServer(String dbPath, {bool readonly = true}) async {
           readOnlyHint: false, destructiveHint: false, openWorldHint: false),
       callback: (args, extra) async =>
           _runWrite(db, auditor, 'update_crew', args, () {
-        _rejectUnknown(args, _fieldNames(_crewColumns, {'id'}),
+        _rejectUnknown(
+            args, _fieldNames(_crewColumns, {'id', 'expected_updated_at'}),
             tool: 'update_crew');
         final id = asText(args['id']);
         if (id == null) throw _ToolError('Missing or invalid id', field: 'id');
@@ -3078,10 +3180,19 @@ Future<void> runServer(String dbPath, {bool readonly = true}) async {
         _collect(db, 'crew_members', _crewColumns, args, columns, values);
         if (columns.isEmpty) throw _ToolError('No fields to update');
         final assignments = [for (final column in columns) '$column = ?'];
-        db.execute(
-          'UPDATE crew_members SET ${assignments.join(', ')}, updated_at = ? WHERE id = ?',
-          [...values, nowEpochSeconds(), id],
+        final guard = _optimisticGuard(args);
+        final changed = db.execute(
+          'UPDATE crew_members SET ${assignments.join(', ')}, updated_at = ? '
+          'WHERE id = ?${guard.$1}',
+          [...values, nowEpochSeconds(), id, ...guard.$2],
         );
+        _requireUpdated(db,
+            table: 'crew_members',
+            id: id,
+            changed: changed,
+            label: 'Crew member',
+            tool: 'update_crew',
+            expected: _expectedUpdatedAtOf(args));
         return {'status': 'updated', 'id': id};
       }),
     );
@@ -3153,6 +3264,7 @@ Future<void> runServer(String dbPath, {bool readonly = true}) async {
       inputSchema: JsonSchema.object(
         properties: {
           'id': JsonSchema.string(),
+          'expected_updated_at': _expectedUpdatedAtSchema,
           ..._propertiesOf(
               _supported(db, 'custom_airports', _customAirportColumns))
         },
@@ -3162,7 +3274,8 @@ Future<void> runServer(String dbPath, {bool readonly = true}) async {
           readOnlyHint: false, destructiveHint: false, openWorldHint: false),
       callback: (args, extra) async =>
           _runWrite(db, auditor, 'update_custom_airport', args, () {
-        _rejectUnknown(args, _fieldNames(_customAirportColumns, {'id'}),
+        _rejectUnknown(args,
+            _fieldNames(_customAirportColumns, {'id', 'expected_updated_at'}),
             tool: 'update_custom_airport');
         final id = asText(args['id']);
         if (id == null) throw _ToolError('Missing or invalid id', field: 'id');
@@ -3177,10 +3290,19 @@ Future<void> runServer(String dbPath, {bool readonly = true}) async {
             values);
         if (columns.isEmpty) throw _ToolError('No fields to update');
         final assignments = [for (final column in columns) '$column = ?'];
-        db.execute(
-          'UPDATE custom_airports SET ${assignments.join(', ')}, updated_at = ? WHERE id = ?',
-          [...values, nowEpochSeconds(), id],
+        final guard = _optimisticGuard(args);
+        final changed = db.execute(
+          'UPDATE custom_airports SET ${assignments.join(', ')}, updated_at = ? '
+          'WHERE id = ?${guard.$1}',
+          [...values, nowEpochSeconds(), id, ...guard.$2],
         );
+        _requireUpdated(db,
+            table: 'custom_airports',
+            id: id,
+            changed: changed,
+            label: 'Custom airport',
+            tool: 'update_custom_airport',
+            expected: _expectedUpdatedAtOf(args));
         return {'status': 'updated', 'id': id};
       }),
     );
@@ -3250,6 +3372,7 @@ Future<void> runServer(String dbPath, {bool readonly = true}) async {
       inputSchema: JsonSchema.object(
         properties: {
           'id': JsonSchema.integer(),
+          'expected_updated_at': _expectedUpdatedAtSchema,
           ..._propertiesOf(_supported(db, 'saved_routes', _savedRouteColumns))
         },
         required: ['id'],
@@ -3258,7 +3381,8 @@ Future<void> runServer(String dbPath, {bool readonly = true}) async {
           readOnlyHint: false, destructiveHint: false, openWorldHint: false),
       callback: (args, extra) async =>
           _runWrite(db, auditor, 'update_saved_route', args, () {
-        _rejectUnknown(args, _fieldNames(_savedRouteColumns, {'id'}),
+        _rejectUnknown(args,
+            _fieldNames(_savedRouteColumns, {'id', 'expected_updated_at'}),
             tool: 'update_saved_route');
         final id = asInt(args['id']);
         if (id == null) throw _ToolError('Missing or invalid id', field: 'id');
@@ -3272,10 +3396,19 @@ Future<void> runServer(String dbPath, {bool readonly = true}) async {
         _collect(db, 'saved_routes', _savedRouteColumns, args, columns, values);
         if (columns.isEmpty) throw _ToolError('No fields to update');
         final assignments = [for (final column in columns) '$column = ?'];
-        db.execute(
-          'UPDATE saved_routes SET ${assignments.join(', ')}, updated_at = ? WHERE id = ?',
-          [...values, nowEpochSeconds(), id],
+        final guard = _optimisticGuard(args);
+        final changed = db.execute(
+          'UPDATE saved_routes SET ${assignments.join(', ')}, updated_at = ? '
+          'WHERE id = ?${guard.$1}',
+          [...values, nowEpochSeconds(), id, ...guard.$2],
         );
+        _requireUpdated(db,
+            table: 'saved_routes',
+            id: id,
+            changed: changed,
+            label: 'Saved route',
+            tool: 'update_saved_route',
+            expected: _expectedUpdatedAtOf(args));
         return {'status': 'updated', 'id': id};
       }),
     );
@@ -3324,14 +3457,18 @@ Future<void> runServer(String dbPath, {bool readonly = true}) async {
           'toggles). Creates the settings row when there is none. Returns the '
           'settings as written as settings.',
       inputSchema: JsonSchema.object(
-        properties: _propertiesOf(
-            _supported(db, 'flights_settings', _flightSettingsColumns)),
+        properties: {
+          'expected_updated_at': _expectedUpdatedAtSchema,
+          ..._propertiesOf(
+              _supported(db, 'flights_settings', _flightSettingsColumns)),
+        },
       ),
       annotations: const ToolAnnotations(
           readOnlyHint: false, destructiveHint: false, openWorldHint: false),
       callback: (args, extra) async =>
           _runWrite(db, auditor, 'update_flight_settings', args, () {
-        _rejectUnknown(args, _fieldNames(_flightSettingsColumns),
+        _rejectUnknown(
+            args, _fieldNames(_flightSettingsColumns, {'expected_updated_at'}),
             tool: 'update_flight_settings');
         final columns = <String>[];
         final values = <Object?>[];
@@ -3364,6 +3501,11 @@ Future<void> runServer(String dbPath, {bool readonly = true}) async {
           'id': id,
           ..._createdStamp(db, 'flights_settings'),
         };
+        // The guard only makes sense on the update path: a row this call
+        // inserts itself carries a stamp from now, not from the caller's
+        // read, so expecting one could never match.
+        final guard =
+            existing.isEmpty ? ('', const <Object?>[]) : _optimisticGuard(args);
         db.transaction(() {
           if (db.query(
               'SELECT id FROM flights_settings WHERE id = ?', [id]).isEmpty) {
@@ -3373,10 +3515,18 @@ Future<void> runServer(String dbPath, {bool readonly = true}) async {
               fields.values.toList(),
             );
           }
-          db.execute(
-            'UPDATE flights_settings SET ${assignments.join(', ')}, updated_at = ? WHERE id = ?',
-            [...values, nowEpochSeconds(), id],
+          final changed = db.execute(
+            'UPDATE flights_settings SET ${assignments.join(', ')}, updated_at = ? '
+            'WHERE id = ?${guard.$1}',
+            [...values, nowEpochSeconds(), id, ...guard.$2],
           );
+          _requireUpdated(db,
+              table: 'flights_settings',
+              id: id,
+              changed: changed,
+              label: 'Flight settings',
+              tool: 'update_flight_settings',
+              expected: existing.isEmpty ? null : _expectedUpdatedAtOf(args));
         });
         return {
           'status': 'updated',
@@ -3490,7 +3640,8 @@ Future<void> runServer(String dbPath, {bool readonly = true}) async {
                 '- Deleting a flight, aircraft, crew member or custom airport also records a sync tombstone when a Postgres sync provider has been used, so the deletion propagates.\n'
                 '- A field means the same thing wherever it appears: create_flight and update_flight take the same flight fields with the same types and limits, the per-field notes are written once on create_flight, and what a field means is written here.\n'
                 '- Use get_schema for table names and their column counts; pass table for one table\'s columns, and detail: "full" for its default and pk columns too.\n'
-                '- A failed call returns {error, field, detail}: error is a stable code (unknown_field, invalid_value, not_found, constraint, busy, internal), field is the argument at fault, and unknown_field also names the tool. detail is one sentence, and the accepted list is capped at eight names plus a count.',
+                '- Update tools accept expected_updated_at: the updated_at of the row as the caller read it. The write then applies only to an unchanged row, so a concurrent change from the app or another writer fails with a conflict that returns the current row, instead of being silently overwritten. Omitting it writes unconditionally, as before.\n'
+                '- A failed call returns {error, field, detail}: error is a stable code (unknown_field, invalid_value, not_found, conflict, constraint, busy, internal), field is the argument at fault, and unknown_field also names the tool. detail is one sentence, and the accepted list is capped at eight names plus a count. A conflict adds current, the row as it stands now.',
           ),
         ],
       );

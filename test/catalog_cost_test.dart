@@ -228,8 +228,12 @@ void main() {
           ((tools['update_flight']!['inputSchema'] as Map)['properties'] as Map)
               .cast<String, Map<String, dynamic>>();
 
-      expect(update.keys.toSet(), create.keys.toSet(),
-          reason: 'both tools take the same fields; only one explains them');
+      // expected_updated_at is the one argument only update takes: a create
+      // has nothing to guard.
+      expect(update.keys.toSet(),
+          create.keys.toSet().union({'expected_updated_at'}),
+          reason: 'update takes the same fields plus the concurrency guard; '
+              'only create explains the fields');
 
       for (final name in create.keys) {
         final noted = create[name]!;
@@ -255,7 +259,11 @@ void main() {
             reason: '$name repeats its note in update_flight');
       }
       for (final name in update.keys) {
-        if (name == 'draft' || name == 'id') continue;
+        // id and draft are the two bare flight arguments; expected_updated_at
+        // is the concurrency guard whose description lives on the argument.
+        if (name == 'draft' || name == 'id' || name == 'expected_updated_at') {
+          continue;
+        }
         expect(update[name]!['description'], isNull,
             reason: '$name carries no note on update_flight');
       }
@@ -295,14 +303,17 @@ void main() {
       // figure is out of reach without deleting typed properties or that text.
       // This is the reachable number: the read tools are in both catalogs, so
       // slice 2's 2,344 B, the 55 B rename and #6's `ask_user` at 973 B take
-      // this from 29,956 B to 33,428 B, and the 138 B of enum values and
-      // offset take it to 33,566 B measured. Same rule as above: measured plus
-      // 1,024 B, so wording has room and a tool does not.
+      // this from 29,956 B to 33,428 B, the 138 B of enum values and offset to
+      // 33,566 B, and #24's route rework moved it again. #10's conflict guard
+      // adds `expected_updated_at` to the six update tools (name, integer
+      // type and one line each). Measured on the rebased tree: 35,264 B. Same
+      // rule as above: measured plus 1,024 B, so wording has room and a tool
+      // does not.
       final writeMode =
           bytesOf(jsonEncode((await writer.send('tools/list', {}))['result']));
-      expect(writeMode, lessThanOrEqualTo(34590),
+      expect(writeMode, lessThanOrEqualTo(36288),
           reason: 'the write-mode catalog costs $writeMode B, against '
-              '33,566 B measured plus 1,024 B of wording headroom');
+              '35,264 B measured plus 1,024 B of wording headroom');
     });
   });
 

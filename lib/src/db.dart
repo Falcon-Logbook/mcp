@@ -102,6 +102,15 @@ class FalconDb {
     return rows.map(_rowToMap).toList();
   }
 
+  /// Rows exactly as SQLite stored them, without the JSON rendering [query]
+  /// applies, so a caller can compare stored values (a `*_at` epoch) rather
+  /// than the displayed ISO text.
+  List<Map<String, dynamic>> selectRaw(String sql,
+      [List<Object?> params = const []]) {
+    final rows = _db.select(sql, params);
+    return rows.map(Map<String, dynamic>.from).toList();
+  }
+
   /// Reads a table's schema for `get_schema` and the `falcon://schema` resource.
   List<Map<String, dynamic>> tableInfo(String table) {
     if (!hasTable(table)) return const [];
