@@ -58,6 +58,27 @@ answer. It does not invent an aircraft, a time or a column.
 
 ---
 
+## Rosters
+
+Paste a roster, a bid line or next month's schedule, as text, a PDF or a screenshot, and say "import my
+roster".
+
+- **What it asks.** Only what the roster does not say, in a few grouped questions: planned or flown, UTC
+  or local, which aircraft when a line carries no tail, your crew role on these legs, who else is
+  flying, and what to do about a leg that is already in the logbook. In a client that can show a form
+  those arrive as pickers and yes/no answers; anywhere else they arrive as plain questions in the chat.
+- **What it shows.** A table of date, route, departure and arrival, aircraft, crew role and draft
+  yes/no, with the row count and the rows that need attention, before it writes anything.
+- **What lands.** Draft flights. A schedule is not a logbook: the block time stays the plan and
+  `total_time` stays empty, so nothing is added to your hours until you fly the leg and enter the real
+  time. A leg that is already in the logbook is skipped, never overwritten, and every row that did not
+  make it is named with the reason.
+- **Planned times.** Keeping the planned departure, arrival and block on the flight needs the app's
+  next schema (Falcon-Logbook/app#231, v20). Until that ships, the drafts carry no planned times: the
+  tools say so plainly rather than putting the block into your total.
+
+---
+
 ## How it stays yours
 
 - **Read-only by default.** Writes happen only when you turn them on, with `--no-readonly` or
@@ -71,7 +92,8 @@ answer. It does not invent an aircraft, a time or a column.
   and counts at 10000, the same limits the app enforces; block times must be a real 24-hour clock
   time; day and night must add up to the total; and a zero total is refused, because the app would
   store it as a complete flight. New rows get the same UUID ids the app uses, so they sync. A
-  refused write changes nothing. There is no preview yet: an accepted write applies immediately.
+  refused write changes nothing. Every write tool takes `dry_run: true` to answer exactly what it
+  would write and change nothing, and the roster import previews by default.
 - **Free and open source.** Apache 2.0, same as the app.
 
 ---

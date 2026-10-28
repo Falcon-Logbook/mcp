@@ -16,6 +16,10 @@ const Set<String> _dateColumns = {
   'last_backed_up',
   'last_push_at',
   'last_pull_at',
+  // Planned-time columns (schema 20, Falcon-Logbook/app#231): unix seconds UTC,
+  // and the name ends in `_utc`, which the naming conventions do not catch.
+  'scheduled_departure_utc',
+  'scheduled_arrival_utc',
 };
 
 /// Integer 0/1 columns whose name is not caught by the prefix rules below.

@@ -316,3 +316,22 @@ void appendAudit(String dbPath, Map<String, dynamic> entry) {
     // Best effort only.
   }
 }
+
+/// The entries of the audit log next to [dbPath], oldest first. A missing,
+/// unreadable or partly written log reads as the entries that could be parsed:
+/// the log is a record, not a prerequisite for a write.
+List<Map<String, dynamic>> readAudit(String dbPath) {
+  final file = File(auditPathFor(dbPath));
+  if (!file.existsSync()) return const [];
+  final entries = <Map<String, dynamic>>[];
+  try {
+    for (final line in file.readAsLinesSync()) {
+      if (line.trim().isEmpty) continue;
+      final entry = jsonDecode(line);
+      if (entry is Map) entries.add(Map<String, dynamic>.from(entry));
+    }
+  } catch (_) {
+    // Return what was parseable.
+  }
+  return entries;
+}

@@ -294,9 +294,10 @@ void main() {
       // the two list separators), the flights_complete rename 55 B, and #6's
       // `ask_user` 888 B; enum values on entity_totals' type and sort plus its
       // offset argument add 138 B. #12's `data_quality_report` adds 1,421 B.
-      // #7's `logbook_overview` adds 640 B.
-      // The bound is the measurement plus 1,024 B: 19,973 B measured, so
-      // 20,997 B.
+      // #7's `logbook_overview` adds 640 B. #3's `validate_flight_drafts` adds
+      // 1,460 B, the read half of the roster flow.
+      // The bound is the measurement plus 1,024 B: 21,433 B measured, so
+      // 22,457 B.
       // The headroom is for wording, not for tools: a new tool or a
       // description that grows materially is hundreds of bytes and trips this,
       // while wording that fixes a sentence does not, so the next author does
@@ -304,8 +305,8 @@ void main() {
       // deliberate act with a new measurement.
       final readOnly =
           bytesOf(jsonEncode((await reader.send('tools/list', {}))['result']));
-      expect(readOnly, lessThanOrEqualTo(20997),
-          reason: 'the read-only catalog costs $readOnly B, against 19,973 B '
+      expect(readOnly, lessThanOrEqualTo(22457),
+          reason: 'the read-only catalog costs $readOnly B, against 21,433 B '
               'measured plus 1,024 B of wording headroom');
 
       // Issue #11 sets 22 KiB here, measured when the two flight write schemas
@@ -322,13 +323,16 @@ void main() {
       // boolean type and one line each) at 3,024 B. #12's three repairs
       // (`merge_crew`, `link_flights_to_aircraft`, `link_flights_to_crew`)
       // add 3,778 B of argument and description text. #7's `logbook_overview`
-      // is a read tool, so it is in this catalog too, at 640 B. Same rule as
-      // above: measured plus 1,024 B, so wording has room and a tool does not.
+      // is a read tool, so it is in this catalog too, at 640 B. #3 adds the
+      // roster twice over: `validate_flight_drafts` is in both catalogs at
+      // 1,460 B, and `apply_flight_batch` adds 1,685 B of its own. Same rule
+      // as above: measured plus 1,024 B, so wording has room and a tool does
+      // not.
       final writeMode =
           bytesOf(jsonEncode((await writer.send('tools/list', {}))['result']));
-      expect(writeMode, lessThanOrEqualTo(43730),
+      expect(writeMode, lessThanOrEqualTo(46875),
           reason: 'the write-mode catalog costs $writeMode B, against '
-              '42,706 B measured plus 1,024 B of wording headroom');
+              '45,851 B measured plus 1,024 B of wording headroom');
     });
   });
 
@@ -457,10 +461,11 @@ void main() {
       expect(envelope['detail'], isA<String>());
 
       // The accepted list is capped: eight names then a count, so the envelope
-      // stays inside the budget the issue sets.
+      // stays inside the budget the issue sets. The count grew with #3's three
+      // planned-time columns and their hours alias: 47 names, 39 left out.
       final detail = envelope['detail'] as String;
-      expect(detail, contains('and 35 more'),
-          reason: 'update_flight accepts 44 arguments; eight are named');
+      expect(detail, contains('and 39 more'),
+          reason: 'update_flight accepts 47 arguments; eight are named');
       final named = detail.replaceFirst('accepts ', '').split(' and ').first;
       expect(named.split(', '), hasLength(8));
       expect(

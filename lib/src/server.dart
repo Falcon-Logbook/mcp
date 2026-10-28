@@ -115,6 +115,19 @@ const _flightColumns = <_Column>[
   _Column('is_ifr', _Kind.boolean),
   _Column('custom_columns', _Kind.text,
       note: 'JSON blob for user-defined columns.'),
+  // Planned times, from Falcon-Logbook/app#231 (schema 20). _supported drops
+  // them on a database that has not migrated, so an older file is never offered
+  // a field it cannot store.
+  _Column('scheduled_departure_utc', _Kind.integer,
+      note: 'Planned departure as unix epoch seconds UTC. A leg with planned '
+          'times stays a draft: leave total_time empty.'),
+  _Column('scheduled_arrival_utc', _Kind.integer,
+      note: 'Planned arrival as unix epoch seconds UTC.'),
+  _Column('scheduled_block_minutes', _Kind.integer,
+      min: 0,
+      max: maxFlightMinutes,
+      note: 'Planned block time in minutes. Kept as the plan, never as '
+          'total_time: a scheduled block is not time flown.'),
 ];
 
 const _aircraftColumns = <_Column>[
@@ -210,16 +223,21 @@ const Set<String> _minuteColumns = {
   'ground_instrument',
   'icus_day_time',
   'icus_night_time',
+  'scheduled_block_minutes',
 };
 
 /// Time fields that also accept an `_hours` argument, converted once at the
 /// boundary. The column itself keeps its minutes name, so a caller can pass
 /// `1.5` hours without doing the arithmetic that turns a 1.5 hour flight into
 /// 1 minute.
+///
+/// `scheduled_block_minutes` is the planned block, so its alias is only
+/// advertised on a database that has the column.
 const Map<String, String> _hoursAliases = {
   'total_time': 'total_time_hours',
   'day_time': 'day_time_hours',
   'night_time': 'night_time_hours',
+  'scheduled_block_minutes': 'scheduled_block_minutes_hours',
 };
 
 /// Every response that carries a time or date field states its units here,
@@ -921,6 +939,7 @@ class _Auditor {
     String? error,
     String? result,
     List<String>? ids,
+    List<String>? refs,
   }) {
     appendAudit(dbPath, {
       'ts': DateTime.now().toUtc().toIso8601String(),
@@ -929,6 +948,7 @@ class _Auditor {
       'result': result ?? (error == null ? 'ok' : 'error'),
       if (id != null) 'id': id,
       if (ids != null) 'ids': ids,
+      if (refs != null) 'created_refs': refs,
       if (error != null) 'error': error,
     });
   }
@@ -963,14 +983,19 @@ CallToolResult _runWrite(
     });
     final id = result is Map ? result['id'] : null;
     final ids = result is Map ? result['affected_ids'] : null;
+    final refs = result is Map ? result['created_refs'] : null;
     auditor.record(tool, args,
-        id: id?.toString(), ids: ids is List ? ids.cast<String>() : null);
+        id: id?.toString(),
+        ids: ids is List ? ids.cast<String>() : null,
+        refs: refs is List ? refs.cast<String>() : null);
     return _ok(result);
   } on _DryRun catch (dry) {
     final ids = dry.result['affected_ids'];
+    final refs = dry.result['created_refs'];
     auditor.record(tool, args,
         id: dry.result['id']?.toString(),
         ids: ids is List ? ids.cast<String>() : null,
+        refs: refs is List ? refs.cast<String>() : null,
         result: 'dry_run');
     return _ok({...dry.result, 'dry_run': true});
   } on _ToolError catch (error) {
@@ -1490,6 +1515,518 @@ List<String> _checkDayNight(
   };
 }
 
+// ============================================================
+// Roster import
+// ============================================================
+
+/// The most rows one roster call takes. A roster is a month of flying and the
+/// answer carries an entry per row, so past this the agent splits the roster
+/// rather than paying for a response nobody reads.
+const int _rosterRowCap = 500;
+
+/// Roster-only row keys: what a pasted line carries that is not a flight
+/// column. `client_ref` identifies a row across retries, `aircraft_type` is a
+/// hint the validator uses to name a missing aircraft. Neither is stored.
+const String _clientRefKey = 'client_ref';
+const String _aircraftTypeKey = 'aircraft_type';
+
+/// The planned-time columns, from Falcon-Logbook/app#231 (schema 20). All three
+/// arrive together; a database that has none of them does not store planned
+/// times at all.
+const List<String> _plannedTimeFields = [
+  'scheduled_departure_utc',
+  'scheduled_arrival_utc',
+  'scheduled_block_minutes',
+];
+
+/// Whether this database stores planned times. The schema gate is the live
+/// table, not `maxSchemaVersion`: the app migration has not shipped, so a v19
+/// file simply has no such columns.
+bool _plannedTimesAvailable(FalconDb db) {
+  final columns = db.columnsOf('flights').toSet();
+  return _plannedTimeFields.every(columns.contains);
+}
+
+/// The fields one roster row may carry: the flight write fields, the `_hours`
+/// aliases, `draft`, and the two roster-only keys. `_flightValues` builds the
+/// row itself, so this set only says which names reach it.
+final Set<String> _rosterRowFields = _fieldNames(_flightColumns, {
+  ..._hoursAliases.values,
+  'draft',
+  _clientRefKey,
+  _aircraftTypeKey,
+});
+
+/// One roster row after validation: the values `_flightValues` built, the
+/// structured issues the roster rules (and its own refusal) raised, and the
+/// prose warnings that carry no code.
+///
+/// [ok] is the atomicity decision: a row with an error-severity issue would not
+/// be written, so `apply_flight_batch` refuses the whole batch by default.
+class _RosterRow {
+  _RosterRow(this.index, this.clientRef);
+
+  final int index;
+  final String? clientRef;
+  Map<String, Object?>? values;
+  final List<Map<String, dynamic>> issues = [];
+  final List<String> warnings = [];
+
+  bool get ok => !issues.any((issue) => issue['severity'] == 'error');
+
+  /// The first error message, for a one-line `failed` reason.
+  String get firstError {
+    for (final issue in issues) {
+      if (issue['severity'] == 'error') return '${issue['message']}';
+    }
+    return 'invalid row';
+  }
+
+  void add(
+    String code,
+    String message, {
+    String? field,
+    String severity = 'error',
+    List<Map<String, dynamic>> candidates = const [],
+  }) {
+    issues.add({
+      if (field != null) 'field': field,
+      'code': code,
+      'message': message,
+      'severity': severity,
+      if (candidates.isNotEmpty) 'candidates': candidates,
+    });
+  }
+
+  /// The code of the skip this row is, if any: a duplicate is not a failure,
+  /// it is a row the logbook already holds.
+  String? get skipCode {
+    for (final issue in issues) {
+      final code = issue['code'];
+      if (code == 'duplicate_existing' ||
+          code == 'duplicate_batch' ||
+          code == 'client_ref_seen') {
+        return code as String;
+      }
+    }
+    return null;
+  }
+}
+
+/// The `flights` argument, as the rows a roster call works through.
+List<dynamic> _rosterFlightRows(Map<String, dynamic> args) {
+  final raw = args['flights'];
+  if (raw is! List) {
+    throw _ToolError('flights must be an array of flight objects',
+        field: 'flights');
+  }
+  if (raw.length > _rosterRowCap) {
+    throw _ToolError(
+        'flights takes at most $_rosterRowCap rows; split the roster into '
+        'batches of $_rosterRowCap or fewer',
+        field: 'flights');
+  }
+  return raw;
+}
+
+/// The stated roster range, both bounds optional, refused when reversed.
+({DateTime? from, DateTime? to}) _rosterRange(Map<String, dynamic> args) {
+  final from = _readDate(args, 'date_from');
+  final to = _readDate(args, 'date_to');
+  if (from != null && to != null && from.isAfter(to)) {
+    throw _ToolError(
+        'date_from (${formatCalendarDate(from)}) must not be after '
+        'date_to (${formatCalendarDate(to)})',
+        field: 'date_from');
+  }
+  return (from: from, to: to);
+}
+
+/// The stable issue code for a refusal `_flightValues` raised on one row.
+/// Every class a roster can hit has a code an agent can branch on; anything
+/// else is one bad value.
+String _rosterIssueCode(_ToolError error) => switch (error.field) {
+      'crew_role' => 'invalid_crew_role',
+      'flight_type' => 'invalid_flight_type',
+      'calc_time_mode' => 'invalid_calc_time_mode',
+      'aircraft_id' => 'aircraft_not_found',
+      'crew_member_id' => 'crew_not_found',
+      _ => error.code == 'unknown_field' ? 'unknown_field' : 'invalid_row',
+    };
+
+/// The active tails of [type], for the row that names a type but no
+/// registration. Empty when the fleet has no such type, which is still said.
+List<Map<String, dynamic>> _aircraftOfType(FalconDb db, String type) {
+  final rows = db.query('SELECT id, type, country_code, registration, archived '
+      'FROM aircraft ORDER BY archived ASC, registration');
+  final wanted = _normalizeKey(type);
+  final matches = <Map<String, dynamic>>[];
+  for (final row in rows) {
+    final stored = asText(row['type']);
+    if (stored == null || _normalizeKey(stored) != wanted) continue;
+    matches.add({
+      'id': row['id'],
+      'registration': _displayRegistration(
+          asText(row['country_code']), asText(row['registration']) ?? ''),
+      'archived': asBool(row['archived']) ?? false,
+    });
+  }
+  final active = [
+    for (final match in matches)
+      if (match['archived'] != true) match,
+  ];
+  return active.isEmpty ? matches : active;
+}
+
+/// Whether the database holds any airport to resolve a route segment against.
+/// An empty reference list is the app's airport import not having run, not a
+/// typo, so the validator says nothing about segments in that case.
+bool _hasAirports(FalconDb db) {
+  for (final table in ['airports', 'custom_airports']) {
+    if (!db.hasTable(table)) continue;
+    if (db.query('SELECT 1 FROM $table LIMIT 1').isNotEmpty) return true;
+  }
+  return false;
+}
+
+/// Whether [code] is an ICAO or IATA code of a built-in or custom airport.
+bool _airportExists(FalconDb db, String code) {
+  final wanted = code.trim().toUpperCase();
+  if (wanted.isEmpty) return false;
+  for (final table in ['airports', 'custom_airports']) {
+    if (!db.hasTable(table)) continue;
+    final rows = db.query(
+      'SELECT 1 FROM $table WHERE upper(icao) = ? '
+      "OR upper(coalesce(iata, '')) = ? LIMIT 1",
+      [wanted, wanted],
+    );
+    if (rows.isNotEmpty) return true;
+  }
+  return false;
+}
+
+/// The id of an existing flight with the same identity a roster row would
+/// write: date, route, registration and total time. Null when there is none.
+String? _existingFlightId(FalconDb db, Object? date, String? route,
+    String? registration, Object? total) {
+  final rows = db.query(
+    "SELECT id FROM flights WHERE date = ? AND coalesce(route, '') = ? "
+    "AND coalesce(aircraft_registration, '') = ? AND total_time IS ? LIMIT 1",
+    [date, route ?? '', registration ?? '', total],
+  );
+  return rows.isEmpty ? null : rows.first['id'] as String?;
+}
+
+/// One row's identity for duplicate detection: date, route, registration and
+/// total time, as the write would store them.
+String _rosterIdentity(Map<String, Object?> values) => [
+      values['date'],
+      asText(values['route']) ?? '',
+      asText(values['aircraft_registration']) ?? '',
+      values['total_time'] ?? 'null',
+    ].join('\u{1}');
+
+/// Validates every row of a roster without writing anything, and returns one
+/// [_RosterRow] per input row, in input order.
+///
+/// Each row goes through `_flightValues`, so the validator accepts exactly what
+/// `create_flight` accepts and refuses exactly what it refuses. What is layered
+/// on top is the roster's own business: the stated date window, the order of
+/// the legs, duplicates in the logbook and in the batch, planned times this
+/// database cannot store, and a total on a scheduled leg.
+List<_RosterRow> _rosterRows(
+  FalconDb db,
+  Map<String, dynamic> args, {
+  required String tool,
+  required ({DateTime? from, DateTime? to}) range,
+}) {
+  final raw = _rosterFlightRows(args);
+  final plannedAvailable = _plannedTimesAvailable(db);
+  final airportsKnown = _hasAirports(db);
+  final rows = <_RosterRow>[];
+  DateTime? previousDate;
+  final seen = <String, int>{};
+
+  for (var index = 0; index < raw.length; index++) {
+    final entry = raw[index];
+    final row = entry is Map
+        ? _RosterRow(index, asText(entry[_clientRefKey]))
+        : _RosterRow(index, null);
+    rows.add(row);
+    if (entry is! Map) {
+      row.add('invalid_row',
+          'each flight must be an object using create_flight field names',
+          field: 'flights[$index]');
+      continue;
+    }
+    final flight = Map<String, dynamic>.from(entry);
+    flight.remove(_clientRefKey);
+    final aircraftType = asText(flight.remove(_aircraftTypeKey));
+
+    // A planned time on a database without the columns is refused, not
+    // silently dropped: the caller has to say whether the leg goes in as a
+    // draft with no times or not at all.
+    final planned = [
+      for (final field in _plannedTimeFields)
+        if (flight.containsKey(field)) field,
+    ];
+    if (planned.isNotEmpty && !plannedAvailable) {
+      row.add(
+        'planned_times_unsupported',
+        'This database does not store planned times yet: it has no '
+            '${_plannedTimeFields.join(', ')} columns (they come with '
+            'Falcon-Logbook/app#231 and schema 20). Drop those fields and send the '
+            'row with no total_time; it lands as a draft and the times are not '
+            'stored.',
+        field: planned.first,
+      );
+      for (final field in _plannedTimeFields) {
+        flight.remove(field);
+      }
+    }
+
+    try {
+      _rejectUnknown(flight, _rosterRowFields, tool: tool);
+      final built = _flightValues(db, flight, tool: tool);
+      row.values = built.values;
+      row.warnings.addAll(built.warnings.where((warning) =>
+          !warning.startsWith('No aircraft matched ') &&
+          !RegExp(r'^\d+ aircraft match ').hasMatch(warning) &&
+          !RegExp(r'^\d+ crew members match ').hasMatch(warning) &&
+          !warning.startsWith('route "')));
+    } on _ToolError catch (error) {
+      row.add(_rosterIssueCode(error), error.detail, field: error.field);
+      continue;
+    }
+
+    final values = row.values!;
+    final date = asInt(values['date']);
+    if (date == null) {
+      row.add(
+          'date_missing',
+          'date is required: every roster leg needs the local date it '
+              'operates on',
+          field: 'date');
+      continue;
+    }
+    final day = DateTime.fromMillisecondsSinceEpoch(date * 1000);
+    if (range.from != null && day.isBefore(range.from!)) {
+      row.add(
+        'date_out_of_range',
+        '${formatCalendarDate(day)} is before the stated roster start '
+            '${formatCalendarDate(range.from!)}',
+        field: 'date',
+        severity: 'warning',
+      );
+    }
+    if (range.to != null && day.isAfter(range.to!)) {
+      row.add(
+        'date_out_of_range',
+        '${formatCalendarDate(day)} is after the stated roster end '
+            '${formatCalendarDate(range.to!)}',
+        field: 'date',
+        severity: 'warning',
+      );
+    }
+    if (previousDate != null && day.isBefore(previousDate)) {
+      row.add(
+        'date_order',
+        '${formatCalendarDate(day)} is before the previous leg '
+            '(${formatCalendarDate(previousDate)}): check the dates or sort the '
+            'roster by departure',
+        field: 'date',
+        severity: 'warning',
+      );
+    }
+    previousDate = day;
+
+    final scheduled = _plannedTimeFields.any((field) => values[field] != null);
+    if (scheduled && values['total_time'] != null) {
+      row.add(
+        'scheduled_total_time',
+        'This leg has planned times, so total_time must be left empty: a total '
+            'makes the flight complete and adds hours that were never flown. Drop '
+            'total_time and day_time/night_time; the planned block stays in '
+            'scheduled_block_minutes.',
+        field: 'total_time',
+      );
+    }
+
+    try {
+      row.warnings.addAll(_checkDayNight(values));
+    } on _ToolError catch (error) {
+      row.add('split_mismatch', error.detail);
+    }
+
+    final registration = asText(values['aircraft_registration']);
+    if (registration != null) {
+      final matches = _aircraftCandidates(db, registration);
+      if (matches.isEmpty) {
+        row.add(
+          'aircraft_unmatched',
+          'No aircraft matches "$registration", so the flight is not linked to '
+              'one. Add it with add_aircraft, pass aircraft_id, or leave the '
+              'registration blank if there is no tail yet.',
+          field: 'aircraft_registration',
+          severity: 'warning',
+        );
+      } else if (matches.length > 1) {
+        row.add(
+          'aircraft_ambiguous',
+          '${matches.length} aircraft match "$registration", so the flight is '
+              'not linked. Pass aircraft_id to choose one.',
+          field: 'aircraft_registration',
+          severity: 'warning',
+          candidates: [
+            for (final match in matches)
+              {'id': match.id, 'registration': match.display},
+          ],
+        );
+      }
+    } else if (aircraftType != null) {
+      final tails = _aircraftOfType(db, aircraftType);
+      row.add(
+        'aircraft_missing',
+        tails.isEmpty
+            ? 'The roster names aircraft type $aircraftType but no '
+                'registration, and the fleet has no tail of that type. Leave '
+                'the aircraft blank, or add the tail with add_aircraft.'
+            : 'The roster names aircraft type $aircraftType but no '
+                'registration. Pick one of these tails or leave the aircraft '
+                'blank.',
+        field: _aircraftTypeKey,
+        severity: 'warning',
+        candidates: tails,
+      );
+    }
+
+    final crewName = asText(values['crew_members_name']);
+    if (crewName != null) {
+      final matches = _crewCandidates(db, crewName);
+      if (matches.isEmpty) {
+        row.add(
+          'crew_unmatched',
+          'No crew member matches "$crewName". The app stores the name as '
+              'text, so the row still lands; add the person with add_crew to link '
+              'the flight.',
+          field: 'crew_members_name',
+          severity: 'info',
+        );
+      } else if (matches.length > 1) {
+        row.add(
+          'crew_ambiguous',
+          '${matches.length} crew members match "$crewName", so the flight is '
+              'not linked. Pass crew_member_id to choose one.',
+          field: 'crew_members_name',
+          severity: 'warning',
+          candidates: [
+            for (final match in matches) {'id': match.id, 'name': match.name},
+          ],
+        );
+      }
+    }
+
+    final route = asText(values['route']);
+    final parsed = parseRoute(route);
+    if (route != null && parsed == null) {
+      row.add(
+        'route_unparsable',
+        'route "$route" is not an airport pair, so the app shows it as a '
+            'description and it has no departure or arrival. Write it as '
+            '"YSSY - NZQN".',
+        field: 'route',
+        severity: 'warning',
+      );
+    } else if (parsed != null && airportsKnown) {
+      final unresolved = [
+        for (final code in [parsed.departure, parsed.arrival])
+          if (!_airportExists(db, code)) code,
+      ];
+      if (unresolved.isNotEmpty) {
+        final matched = [
+          for (final code in [parsed.departure, parsed.arrival])
+            if (!unresolved.contains(code)) code,
+        ];
+        row.add(
+          'airport_unresolved',
+          'route "$route": ${unresolved.map((code) => '"$code"').join(' and ')} '
+              'matches no airport'
+              '${matched.isEmpty ? '' : ', while ${matched.map((code) => '"$code"').join(' and ')} does'}. '
+              'Check the code, or add the airport with add_custom_airport before '
+              'the row is written.',
+          field: 'route',
+          severity: 'warning',
+        );
+      }
+    }
+
+    final identity = _rosterIdentity(values);
+    final firstIndex = seen[identity];
+    if (firstIndex != null) {
+      row.add(
+          'duplicate_batch',
+          'Same date, route, registration and total time as row $firstIndex in '
+              'this batch',
+          severity: 'warning');
+    } else {
+      seen[identity] = index;
+      final existing = _existingFlightId(db, values['date'], route,
+          asText(values['aircraft_registration']), values['total_time']);
+      if (existing != null) {
+        row.add(
+          'duplicate_existing',
+          'A flight with the same date, route, registration and total time '
+              'already exists (id $existing), so the import skips this row.',
+          severity: 'warning',
+        );
+      }
+    }
+  }
+  return rows;
+}
+
+/// The per-row answer both roster tools share: the counts, the echoed range
+/// when one was stated, and one entry per row with its code and its warnings.
+Map<String, dynamic> _rosterReport(
+  List<_RosterRow> rows,
+  ({DateTime? from, DateTime? to}) range,
+) =>
+    {
+      'valid': rows.where((row) => row.ok).length,
+      'invalid': rows.where((row) => !row.ok).length,
+      if (range.from != null || range.to != null)
+        'range': {
+          'from': range.from == null ? null : formatCalendarDate(range.from!),
+          'to': range.to == null ? null : formatCalendarDate(range.to!),
+        },
+      'rows': [
+        for (final row in rows)
+          {
+            'index': row.index,
+            if (row.clientRef != null) 'client_ref': row.clientRef,
+            'ok': row.ok,
+            'issues': row.issues,
+            if (row.warnings.isNotEmpty) 'warnings': row.warnings,
+          },
+      ],
+    };
+
+/// The `client_ref` values an earlier applied batch already created, from the
+/// audit log: the log is the record of what a batch contained, so a retry needs
+/// no extra column. Only rows that actually landed are here, so a row that
+/// failed in a partial batch can be fixed and retried under the same ref.
+Set<String> _importedClientRefs(String dbPath) {
+  final refs = <String>{};
+  for (final entry in readAudit(dbPath)) {
+    if (entry['tool'] != 'apply_flight_batch') continue;
+    if (entry['result'] != 'ok') continue;
+    final created = entry['created_refs'];
+    if (created is! List) continue;
+    refs.addAll(created.whereType<String>());
+  }
+  return refs;
+}
+
 /// The flight row [id] as the read tools present it, or null when it is gone.
 Map<String, dynamic>? _flightRow(FalconDb db, String id) {
   final rows = db.query('SELECT * FROM flights WHERE id = ?', [id]);
@@ -1995,7 +2532,9 @@ const List<_HelpGroup> _helpGroups = [
       'Which flights are missing block times?',
       'Do I have the same crew member saved twice?',
     ],
-    tools: ['find_missing_times', 'dedupe_crew'],
+    // The pre-flight half of a roster: a read tool, so it is here in both
+    // modes, and the write half below only with writes on.
+    tools: ['find_missing_times', 'dedupe_crew', 'validate_flight_drafts'],
   ),
   (
     headline: 'Is it still current?',
@@ -2011,7 +2550,12 @@ const List<_HelpGroup> _helpGroups = [
       'Draft next month\'s roster into my logbook.',
       'Save the route I fly every week.',
     ],
-    tools: ['create_flight', 'add_saved_route'],
+    tools: [
+      'create_flight',
+      'add_saved_route',
+      'validate_flight_drafts',
+      'apply_flight_batch',
+    ],
   ),
   (
     headline: 'Fix a mistake',
@@ -3606,6 +4150,57 @@ Future<void> runServer(String dbPath, {bool readonly = true}) async {
     },
   );
 
+  // A pasted roster is checked before anything is written. The write tool below
+  // refuses on the same rule, but this one is read-only, so the questions the
+  // agent has to ask (which tail, which airport, which crew) can be asked
+  // before a single row lands.
+  server.registerTool(
+    'validate_flight_drafts',
+    description:
+        'Check a batch of proposed flights without writing anything. Pass '
+        'flights as up to $_rosterRowCap objects using create_flight field '
+        'names, plus optional date_from and date_to for the roster range. '
+        'Returns valid and invalid counts and one entry per row with index, '
+        'client_ref, ok, issues of {field, code, message, severity} and any '
+        'warnings. Severity error is a row apply_flight_batch would refuse; '
+        'warning is a row worth asking about (unknown aircraft, an airport that '
+        'does not resolve, a duplicate, a date out of range or out of order); '
+        'info is stored as text. A total_time on a leg with planned times is an '
+        'error, because a total makes the flight complete. Row fields not in '
+        'create_flight: client_ref (identity across retries) and aircraft_type '
+        '(a hint, never stored). Write nothing and check a whole roster first, '
+        'then apply it.',
+    inputSchema: JsonSchema.object(properties: {
+      'flights': JsonSchema.array(
+        items: JsonSchema.object(properties: {}),
+        description: 'Up to $_rosterRowCap flight objects, each with '
+            'create_flight field names; date is required per row.',
+      ),
+      'date_from': JsonSchema.string(
+          format: 'date',
+          description: 'Inclusive start of the stated roster range.'),
+      'date_to': JsonSchema.string(
+          format: 'date', description: 'Inclusive end of the roster range.'),
+    }, required: [
+      'flights'
+    ]),
+    annotations: readOnlyAnnotations,
+    callback: (args, extra) async {
+      try {
+        _rejectUnknown(args, {'flights', 'date_from', 'date_to'},
+            tool: 'validate_flight_drafts');
+        final range = _rosterRange(args);
+        final rows =
+            _rosterRows(db, args, tool: 'validate_flight_drafts', range: range);
+        return _ok(_rosterReport(rows, range));
+      } on _ToolError catch (error) {
+        return _failWith(error);
+      } catch (error) {
+        return _failWith(_asToolError(error));
+      }
+    },
+  );
+
   if (!readonly) {
     // --- flights ---
 
@@ -3663,6 +4258,155 @@ Future<void> runServer(String dbPath, {bool readonly = true}) async {
           if (warnings.isNotEmpty) 'warnings': warnings,
         };
       }),
+    );
+
+    // A whole roster lands in one call, one transaction and one audit entry,
+    // through the same row builder as create_flight. It previews by default:
+    // the resource tells the agent to show the plan and get an explicit yes
+    // before passing dry_run: false.
+    server.registerTool(
+      'apply_flight_batch',
+      description:
+          'Create up to $_rosterRowCap draft flights from a roster in one '
+          'transaction, using create_flight field names per row. Defaults to '
+          'dry_run: true, a preview with the same plan and verdicts and no '
+          'rows written; pass dry_run: false to apply. Every row is validated '
+          'first: by default any row with an error issue (the codes '
+          'validate_flight_drafts reports) writes nothing and the response '
+          'lists it with applied: 0. allow_partial: true writes the clean rows '
+          'and reports the rest. A duplicate in the logbook or the batch is '
+          'skipped, never overwritten, and so is a client_ref an earlier batch '
+          'already imported. Returns batch_id, dry_run, applied, created ids, '
+          'skipped and failed with {index, reason}. A leg with planned times '
+          'lands as a draft with total_time empty.',
+      inputSchema: JsonSchema.object(properties: {
+        'dry_run': _dryRunSchema,
+        'flights': JsonSchema.array(
+          items: JsonSchema.object(properties: {}),
+          description: 'Up to $_rosterRowCap flight objects, each with '
+              'create_flight field names plus optional client_ref and '
+              'aircraft_type; date is required per row.',
+        ),
+        'allow_partial': JsonSchema.boolean(
+            description: 'Default false. true writes the rows with no error '
+                'issue and reports each row it left out and why.'),
+        'batch_id': JsonSchema.string(
+            description: 'Optional id for this batch, recorded in the audit '
+                'log. Generated when omitted.'),
+      }, required: [
+        'flights'
+      ]),
+      annotations: const ToolAnnotations(
+          readOnlyHint: false, destructiveHint: false, openWorldHint: false),
+      callback: (args, extra) async {
+        final batchId = asText(args['batch_id']) ?? uuidV4();
+        final effectiveArgs = <String, dynamic>{
+          ...args,
+          'batch_id': batchId,
+          // A batch write previews unless it is told to apply, like the
+          // repairs: a plan the pilot has not seen must not fill the logbook.
+          'dry_run': asBool(args['dry_run']) != false,
+        };
+        return _runWrite(db, auditor, 'apply_flight_batch', effectiveArgs, () {
+          _rejectUnknown(
+              args, {'flights', 'dry_run', 'allow_partial', 'batch_id'},
+              tool: 'apply_flight_batch');
+          final allowPartial = asBool(args['allow_partial']) ?? false;
+          final rows = _rosterRows(db, args,
+              tool: 'apply_flight_batch', range: (from: null, to: null));
+          final imported = _importedClientRefs(dbPath);
+
+          final failed = <Map<String, dynamic>>[
+            for (final row in rows)
+              if (!row.ok)
+                {
+                  'index': row.index,
+                  'reason': row.firstError,
+                  'issues': row.issues,
+                },
+          ];
+          // Atomic by default: the whole roster is validated and one bad row
+          // writes nothing. The answer is the validator's, not an error
+          // envelope, so the agent can report exactly which rows to fix.
+          if (!allowPartial && failed.isNotEmpty) {
+            return {
+              'batch_id': batchId,
+              'dry_run': effectiveArgs['dry_run'] == true,
+              'applied': 0,
+              'created': const <String>[],
+              'skipped': const <Map<String, dynamic>>[],
+              'failed': failed,
+              'valid': rows.where((row) => row.ok).length,
+              'invalid': failed.length,
+              'affected_ids': const <String>[],
+              'created_refs': const <String>[],
+            };
+          }
+
+          final created = <String>[];
+          final createdRefs = <String>[];
+          final skipped = <Map<String, dynamic>>[];
+          for (final row in rows) {
+            if (!row.ok) continue;
+            final clientRef = row.clientRef;
+            if (clientRef != null && imported.contains(clientRef)) {
+              skipped.add({
+                'index': row.index,
+                'code': 'client_ref_seen',
+                'reason': 'client_ref "$clientRef" was already imported in an '
+                    'earlier batch',
+              });
+              continue;
+            }
+            final skip = row.skipCode;
+            if (skip != null) {
+              skipped.add({
+                'index': row.index,
+                'code': skip,
+                'reason': row.issues
+                    .firstWhere((issue) => issue['code'] == skip)['message'],
+              });
+              continue;
+            }
+            final values = row.values!;
+            final date = asInt(values['date']);
+            if (date == null) {
+              failed.add({
+                'index': row.index,
+                'reason': 'date is required',
+              });
+              continue;
+            }
+            final id = uuidV4();
+            final fields = <String, Object?>{
+              'id': id,
+              'day_order': _nextDayOrder(db, date),
+              ..._createdStamp(db, 'flights'),
+              ...values,
+            };
+            db.execute(
+              'INSERT INTO flights (${fields.keys.join(', ')}) VALUES (${List.filled(fields.length, '?').join(', ')})',
+              fields.values.toList(),
+            );
+            created.add(id);
+            if (clientRef != null) {
+              imported.add(clientRef);
+              createdRefs.add(clientRef);
+            }
+          }
+
+          return {
+            'batch_id': batchId,
+            'dry_run': effectiveArgs['dry_run'] == true,
+            'applied': created.length,
+            'created': created,
+            'skipped': skipped,
+            'failed': failed,
+            'affected_ids': created,
+            'created_refs': createdRefs,
+          };
+        });
+      },
     );
 
     server.registerTool(
@@ -4883,7 +5627,52 @@ Future<void> runServer(String dbPath, {bool readonly = true}) async {
                 '- Every write tool accepts dry_run: true: it resolves, validates and answers exactly as the write would (the row as written, computed ids, warnings), marks the response dry_run: true, and commits nothing. A preview error is the write error, so a clean preview means the write will apply; an id a preview generated is not reserved, so pass your own or let the real call make one.\n'
                 '- data_quality_report is one read-only call over every defect class an imported logbook can have: drafts, missing or mismatched splits, absurd totals, unlinked aircraft and crew, duplicate crew and flights, unparsable routes, future dates, dangling route links, simulator oddities, orphaned registration text. Each class carries a stable id, a count and a sample of up to 4 rows; a count is the finding, not the full list.\n'
                 '- The repair tools merge_crew, link_flights_to_aircraft and link_flights_to_crew default to dry_run: true and say so on the response; pass dry_run: false to apply the same diff. They run in one transaction, stamp updated_at, tombstone deletions so sync propagates them, never create rows beyond the operation named, and never delete flights: duplicate flights are reported for a human to decide.\n'
+                '- Planned times (scheduled_departure_utc, scheduled_arrival_utc, scheduled_block_minutes) come with Falcon-Logbook/app#231 and schema 20. The two instants are unix epoch seconds UTC and render as local ISO strings; the block is integer minutes. They exist only on a migrated database, so a write naming them on an older file is refused by name rather than silently dropped. A leg with planned times stays a draft: total_time empty, the block kept as the plan.\n'
+                '- validate_flight_drafts and apply_flight_batch take a roster as flights, an array of objects using create_flight field names, up to 500 rows. Each row also accepts client_ref (an identity for retries) and aircraft_type (a hint, never stored). validate writes nothing and answers per row with ok, issues of {field, code, message, severity} and warnings; severity error is a row apply refuses. apply is atomic by default (one bad row writes nothing, applied: 0), allows partial with allow_partial: true, skips a duplicate or an already imported client_ref instead of overwriting, records one audit entry per batch with batch_id and the created ids, and previews with dry_run: true (its default). A roster leg is written as a draft through the same row builder as create_flight, so updated_at and sync behave the same.\n'
                 '- A failed call returns {error, field, detail}: error is a stable code (unknown_field, invalid_value, not_found, conflict, constraint, busy, internal), field is the argument at fault, and unknown_field also names the tool. detail is one sentence, and the accepted list is capped at eight names plus a count. A conflict adds current, the row as it stands now.',
+          ),
+        ],
+      );
+    },
+  );
+
+  server.registerResource(
+    'roster_import',
+    'falcon://roster_import',
+    (
+      description:
+          'How to turn a pasted roster into draft flights: the questions to '
+              'ask, the plan to show, and the rules that keep a schedule out of the '
+              'hours.',
+      mimeType: 'text/plain'
+    ),
+    (uri, extra) async {
+      return ReadResourceResult(
+        contents: [
+          TextResourceContents(
+            uri: uri.toString(),
+            mimeType: 'text/plain',
+            text: 'FALCON ROSTER IMPORT\n\n'
+                'A roster is a schedule, not a logbook: it says what is planned, not what was flown. Read it yourself; this server cannot open a PDF, a spreadsheet or a screenshot and only ever sees the rows you send it. So this is protocol, validation and an atomic write, and every judgement about the file is yours.\n\n'
+                'QUESTIONS: ASK, DO NOT ASSUME\n'
+                'Ask only what you cannot read off the roster, in 3 to 5 grouped questions, never one field at a time, and never ask again anything the pilot has already answered. On a client that supports it, render them with ask_user (pickers and yes/no forms) and record each answer against its question id. The ten questions, grouped:\n'
+                '1. Intent and basis. Confirm this is a roster or schedule to be drafted, not a flown logbook to be imported as complete. Are the times scheduled local, scheduled UTC, or actual block times? If local, airport-local or one base zone? Prefer UTC, and never infer a timezone from a city name.\n'
+                '2. Times and aircraft. How should the times be stored? Recommended: planned times on the flight and total_time empty. Does the roster name a tail? If not, choose one of: a specific aircraft (offer list_aircraft), map by type, or leave the aircraft blank. Never infer a registration from a type that happens to match one aircraft. Are any legs FNPT/FFS sessions (is_simulator)?\n'
+                '3. Crew and airports. Is the pilot pilotInCommand, copilot or student on these legs? A roster leg is not automatically pilotInCommand, and crew_role drives currency. For other crew: create missing people with add_crew, or store crew_members_name text only? Resolve every airport code with list_airports and show what matched; ask before adding a custom airport.\n'
+                '4. Duplicates and order. For legs that already exist on that date and route: skip (the default), update, or create anyway? For several legs a day, order them by departure time ascending unless the pilot says otherwise.\n\n'
+                'PLAN BEFORE WRITE\n'
+                'Call validate_flight_drafts with the whole roster and the stated date_from/date_to. Then show a table of date, route, departure and arrival times, aircraft, crew role, and draft yes/no, with the row count and how many rows need attention, each with its code in one line. Change the plan until the pilot says yes explicitly. Only then call apply_flight_batch with dry_run: false.\n\n'
+                'A SCHEDULE IS NOT A LOGBOOK\n'
+                'Never write a scheduled time into total_time. A total makes the flight complete and adds hours the pilot never flew. A roster leg is a draft: total_time empty, the block kept as the plan. Planned times need the scheduled_departure_utc, scheduled_arrival_utc and scheduled_block_minutes columns, which come with Falcon-Logbook/app#231 (schema 20). Until this database has them, the tools say so and refuse a row that carries them: send the leg with no planned times and no total_time, and tell the pilot plainly that their app cannot store the planned times yet and where the times went.\n\n'
+                'NEVER FABRICATE\n'
+                'Never invent a registration, a tail, a timezone, a duration, a crew role, a crew member or an airport. Never guess which of several matching tails or crew a name means: ask, or pass the id. A blank field is honest; a filled-in guess is a wrong logbook.\n\n'
+                'NEVER OVERWRITE\n'
+                'Never overwrite an existing completed flight. A duplicate is skipped, not updated. Updating an existing draft is fine, with confirmation.\n\n'
+                'REPORT EVERY ROW THAT DID NOT MAKE IT\n'
+                'Silent partial success is the failure this flow exists to prevent. At the end, list every row that was skipped or failed, with its index, its client_ref if it had one, and the reason. Say how many landed, and name the batch_id.\n\n'
+                'TOOLS AND CODES\n'
+                'validate_flight_drafts writes nothing: flights (up to 500, create_flight field names), date_from, date_to. Every row answers ok, issues of {field, code, message, severity} and warnings; severity error means apply_flight_batch would refuse the row, warning means ask about it, info is stored as text. Codes: unknown_field, invalid_row, invalid_crew_role, invalid_flight_type, invalid_calc_time_mode, aircraft_not_found, crew_not_found, date_missing, date_out_of_range, date_order, aircraft_unmatched, aircraft_ambiguous, aircraft_missing, crew_unmatched, crew_ambiguous, route_unparsable, airport_unresolved, split_mismatch, duplicate_existing, duplicate_batch, scheduled_total_time, planned_times_unsupported.\n'
+                'apply_flight_batch (write mode only) takes the same flights plus dry_run (default true: a preview with the same plan), allow_partial (default false: atomic) and batch_id. Per row it accepts client_ref, which makes a retry idempotent, and aircraft_type, a hint that is never stored. It returns batch_id, dry_run, applied, created ids, skipped and failed, each entry {index, reason}. A duplicate in the logbook or the batch is skipped, never overwritten.\n',
           ),
         ],
       );
@@ -4979,6 +5768,25 @@ Future<void> runServer(String dbPath, {bool readonly = true}) async {
       'rather than inventing a pass, and offer the raw total currency_status '
       'answers with metric and no rule.\n'
       'End with the rule that needs attention soonest, and by how much.',
+    ),
+  );
+
+  // A pasted roster: the script lives in the resource, so the prompt is the
+  // entry point and the resource is the contract.
+  server.registerPrompt(
+    'roster_import',
+    description:
+        'Turn a pasted roster into draft flights: ask, plan, then apply.',
+    callback: (args, extra) async => _promptResult(
+      'Read falcon://roster_import and follow it. Read the roster the pilot '
+      'gave you, ask only the grouped questions whose answers are not on it '
+      '(with ask_user where the client supports it), then call '
+      'validate_flight_drafts and show the plan as a table with the row count '
+      'and the rows needing attention.\n'
+      'Get an explicit yes, then call apply_flight_batch with dry_run: false '
+      'when writes are on. Write drafts only: never a scheduled time into '
+      'total_time, never an invented tail, timezone, crew role or airport. '
+      'Report every row that was skipped or failed, with its reason.',
     ),
   );
 
