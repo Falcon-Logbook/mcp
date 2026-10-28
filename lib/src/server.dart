@@ -767,16 +767,11 @@ DateTime? _localDate(Object? value) => switch (value) {
       _ => null,
     };
 
-/// Display registration the app would show: country code plus registration,
-/// unless the stored value already carries the country code.
-String _displayRegistration(String? countryCode, String registration) {
-  final code = (countryCode ?? '').trim();
-  if (code.isEmpty ||
-      registration.toUpperCase().startsWith(code.toUpperCase())) {
-    return registration;
-  }
-  return '$code-$registration';
-}
+/// Display registration the app would show: the one rule [displayRegistration]
+/// writes, kept as a non-null wrapper for the matcher, which has already
+/// skipped a blank registration.
+String _displayRegistration(String? countryCode, String registration) =>
+    displayRegistration(countryCode, registration) ?? registration;
 
 /// Finds the aircraft matching a registration written either bare (`XZO`) or
 /// in display form (`VH-XZO`).
@@ -1871,16 +1866,19 @@ Future<void> runServer(String dbPath, {bool readonly = true}) async {
         'flights_complete is the same number logbook_stats calls by that name, '
         'where its flights counts every row including drafts. Simulator flights '
         'are included unless include_simulator is false. '
-        'Sorted by minutes unless sort says otherwise, and total is the number of '
-        'groups before limit. Local rows only unless include_shared is true.',
+        'Sorted by minutes unless sort says otherwise; count, total, has_more '
+        'and offset page through the groups the way the flight lists do. Local '
+        'rows only unless include_shared is true.',
     inputSchema: JsonSchema.object(properties: {
       'type': JsonSchema.string(
-          description:
-              'What to group by: ${entityTotalDimensions.join(', ')}.'),
+          enumValues: entityTotalDimensions,
+          description: 'What to group by.'),
       'sort': JsonSchema.string(
+          enumValues: entityTotalSorts,
           description: 'minutes and flights_complete order descending, label '
               'alphabetically. Default $defaultEntityTotalSort.'),
       'limit': _entityTotalLimitSchema,
+      'offset': JsonSchema.integer(minimum: 0),
       'include_simulator': JsonSchema.boolean(
           description:
               'Include simulator flights in both numbers. Default true, '
@@ -1894,8 +1892,16 @@ Future<void> runServer(String dbPath, {bool readonly = true}) async {
     annotations: readOnlyAnnotations,
     callback: (args, extra) async {
       try {
-        _rejectUnknown(args,
-            {'type', 'sort', 'limit', 'include_simulator', _includeSharedKey},
+        _rejectUnknown(
+            args,
+            {
+              'type',
+              'sort',
+              'limit',
+              'offset',
+              'include_simulator',
+              _includeSharedKey
+            },
             tool: 'entity_totals');
         final rawType = args['type'];
         final type = asText(rawType);
@@ -1915,6 +1921,8 @@ Future<void> runServer(String dbPath, {bool readonly = true}) async {
         }
         final limit = asInt(args['limit']) ?? 20;
         if (limit < 1) return _fail('limit must be >= 1', field: 'limit');
+        final offset = asInt(args['offset']) ?? 0;
+        if (offset < 0) return _fail('offset must be >= 0', field: 'offset');
         final includeSimulator = asBool(args['include_simulator']) ?? true;
         // Qualified for the joins this query makes: crew_members and aircraft
         // carry an owner_id too.
@@ -1926,6 +1934,7 @@ Future<void> runServer(String dbPath, {bool readonly = true}) async {
           type: type,
           sort: sort,
           limit: limit,
+          offset: offset,
           includeSimulator: includeSimulator,
           ownerClause: owner,
         );
@@ -1935,6 +1944,8 @@ Future<void> runServer(String dbPath, {bool readonly = true}) async {
           'include_simulator': includeSimulator,
           'count': totals.entities.length,
           'total': totals.total,
+          'has_more': offset + totals.entities.length < totals.total,
+          'offset': offset,
           'units': _units,
           'entities': totals.entities,
         });
@@ -3023,7 +3034,8 @@ Future<void> runServer(String dbPath, {bool readonly = true}) async {
                 '- is_simulator and is_ifr are stored as 0/1.\n'
                 '- Expiry status is computed at read time, never stored: whole local days from today to due_date, below the orange threshold is red (which includes today and every overdue day), below the green threshold is orange, green above it. Thresholds come from expiry_settings (a local row first, then the newest), or 90 and 30 days when that table has no row. list_expiries includes overdue rows by default.\n'
                 '- Currency thresholds are HOURS for the four time metrics, because the app divides those values by 60, and counts for the other four. is_exceeded means the rule needs attention: for a requirement that is being below the threshold, for a limit it is reaching it. currency_status reproduces the app\'s currency page, which applies no owner filter and counts drafts as flights, so its numbers can mix owners on a synced logbook.\n'
-                '- entity_totals.flights_complete counts COMPLETE flights, because it counts the rows its minutes come from; logbook_stats.flights counts every row including drafts, and its flights_complete is the same number. Aircraft and type group on flights.aircraft_id and crew groups on flights.crew_member_id, so a flight that only carries registration text is in the registration group alone.\n'
+                '- entity_totals.flights_complete counts COMPLETE flights, because it counts the rows its minutes come from; logbook_stats.flights counts every row including drafts, and its flights_complete is the same number. Aircraft and type group on flights.aircraft_id and crew groups on flights.crew_member_id, so a flight that only carries registration text is in the registration group alone. It pages with limit, offset, count, total and has_more like the flight lists, and the registration it reports for an aircraft is the app\'s display form (country code and tail joined, without doubling a tail that already carries the code).\n'
+                '- get_settings reads one allowlisted single-row settings table at a time (aircraft_settings, app_settings, crew_settings, expiry_settings, flights_settings, general_settings, routes_settings, sidebar_settings) and returns {} when the app has never written that row, which means the app defaults apply; it never creates the row. aircraft_type_settings is keyed by type, not a singleton, and is not readable here.\n'
                 '- Deleting a flight, aircraft, crew member or custom airport also records a sync tombstone when a Postgres sync provider has been used, so the deletion propagates.\n'
                 '- A field means the same thing wherever it appears: create_flight and update_flight take the same flight fields with the same types and limits, the per-field notes are written once on create_flight, and what a field means is written here.\n'
                 '- Use get_schema for table names and their column counts; pass table for one table\'s columns, and detail: "full" for its default and pk columns too.\n'

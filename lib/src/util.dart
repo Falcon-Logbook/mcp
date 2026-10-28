@@ -196,6 +196,25 @@ String? asText(Object? value) {
 String escapeLike(String value) =>
     value.replaceAllMapped(RegExp(r'[\\%_]'), (m) => '\\${m[0]}');
 
+/// The registration the app displays: `country_code` and [registration] joined
+/// by a hyphen, unless the registration already carries the country code, or
+/// there is no code. Returns null only when [registration] is null or blank,
+/// which is how a flight linked to a since-deleted aircraft reads.
+///
+/// The app's fleet stores the bare tail (`XZO`) and shows `VH-XZO`, but a
+/// simulator can be stored already prefixed (`SIM-73H` under country `SIM`),
+/// where joining again would print `SIM-SIM-73H`. One rule here, so a write
+/// stores and a read reports the same string.
+String? displayRegistration(String? countryCode, String? registration) {
+  if (registration == null || registration.trim().isEmpty) return null;
+  final code = (countryCode ?? '').trim();
+  if (code.isEmpty ||
+      registration.toUpperCase().startsWith(code.toUpperCase())) {
+    return registration;
+  }
+  return '$code-$registration';
+}
+
 /// A random RFC 4122 version 4 UUID, lowercase and hyphenated, in the same
 /// shape as the app's `uuidV4()`. The synced id columns are UUID in the cloud
 /// schema, so an id in any other shape cannot be pushed.

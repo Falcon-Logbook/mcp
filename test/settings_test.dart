@@ -102,15 +102,43 @@ void main() {
   });
 
   test('an allowlisted table this database lacks is not_found', () async {
+    // An older or partial file may not carry a table the current schema has:
+    // that is a missing table, which is not the same answer as a table with
+    // no row.
+    withFixtureDb(dbPath, (db) => db.execute('DROP TABLE sidebar_settings'));
     final server = await start();
 
-    // The fixture carries no sidebar_settings: an older or partial file is a
-    // missing table, which is not the same answer as a table with no row.
     final envelope = errorOf(
         await server.call('get_settings', {'table': 'sidebar_settings'}));
     expect(envelope['error'], 'not_found');
     expect(envelope['field'], 'table');
     expect(envelope['detail'], contains('has no sidebar_settings table'));
+  });
+
+  test('reads each singleton whole, uuid id and integer id alike', () async {
+    withFixtureDb(dbPath, (db) {
+      db.execute(
+        'INSERT INTO crew_settings (id, name_display_format, created_at) '
+        "VALUES ('cs-1', 'lastFirst', 1700000000)",
+      );
+      db.execute(
+        'INSERT INTO sidebar_settings (position, item_order) '
+        "VALUES ('right', '{\"flights\": 1}')",
+      );
+    });
+    final server = await start();
+
+    final crew =
+        payloadOf(await server.call('get_settings', {'table': 'crew_settings'}));
+    expect(crew['id'], 'cs-1');
+    expect(crew['name_display_format'], 'lastFirst');
+    expect(crew['show_badge'], isTrue,
+        reason: 'the default the app would have written shows as a boolean');
+
+    final sidebar =
+        payloadOf(await server.call('get_settings', {'table': 'sidebar_settings'}));
+    expect(sidebar['id'], 1, reason: 'app-managed settings use an integer id');
+    expect(sidebar['position'], 'right');
   });
 
   test('a typo argument names the tool that refused', () async {

@@ -30,10 +30,12 @@ class _Dimension {
     required this.groupBy,
     required this.conditions,
     required this.row,
+    required this.tiebreak,
+    required this.label,
     this.select = '',
   });
 
-  /// The grouped column: what the rows are ordered and tie-broken by.
+  /// The grouped column: what the rows are keyed on.
   final String key;
 
   /// The dimension's own selected columns, each `expr AS name`, or empty.
@@ -48,6 +50,15 @@ class _Dimension {
 
   /// [key] plus this dimension's columns, as the tool returns them.
   final Map<String, dynamic> Function(Map<String, dynamic> row) row;
+
+  /// The returned row's id, the deterministic tiebreak when the sorted field
+  /// ties (two aircraft flown for exactly the same minutes).
+  final String tiebreak;
+
+  /// The returned row's display name, what the label sort orders by. Null when
+  /// the entity behind the group is gone: a deleted aircraft row leaves the
+  /// flight's link dangling, and a deleted crew member leaves no name.
+  final String? Function(Map<String, dynamic> row) label;
 }
 
 final Map<String, _Dimension> _dimensions = {
@@ -64,9 +75,12 @@ final Map<String, _Dimension> _dimensions = {
     conditions: ['flights.aircraft_id IS NOT NULL'],
     row: (row) => {
       'aircraft_id': row['entity_key'],
-      'registration': _displayRegistration(row),
+      'registration': displayRegistration(
+          row['country_code'] as String?, row['registration'] as String?),
       'aircraft_type': row['aircraft_type'],
     },
+    tiebreak: 'aircraft_id',
+    label: (row) => row['registration'] as String?,
   ),
   // getAllCrewFlightCounts and getMostFlownCrew key on flights.crew_member_id.
   // A name is not required: a member deleted since the flight loses the link but
@@ -84,6 +98,8 @@ final Map<String, _Dimension> _dimensions = {
       'crew_member_id': row['entity_key'],
       'name': row['crew_name'],
     },
+    tiebreak: 'crew_member_id',
+    label: (row) => row['name'] as String?,
   ),
   // getMostFlownTypes joins aircraft and groups on its type, so a flight with
   // only registration text has no type to group under.
@@ -94,6 +110,8 @@ final Map<String, _Dimension> _dimensions = {
     groupBy: 'aircraft.type',
     conditions: ["aircraft.type IS NOT NULL", "aircraft.type != ''"],
     row: (row) => {'aircraft_type': row['entity_key']},
+    tiebreak: 'aircraft_type',
+    label: (row) => row['aircraft_type'] as String?,
   ),
   // getMostFlownRegistrations groups on the text column, not the link, so an
   // import with no aircraft rows still reports.
@@ -106,10 +124,13 @@ final Map<String, _Dimension> _dimensions = {
       "flights.aircraft_registration != ''",
     ],
     row: (row) => {'aircraft_registration': row['entity_key']},
+    tiebreak: 'aircraft_registration',
+    label: (row) => row['aircraft_registration'] as String?,
   ),
 };
 
-/// The aggregates for one [type], and how many groups matched before [limit].
+/// The aggregates for one [type] — one page of them, starting at [offset] — and
+/// how many groups matched before [limit] and [offset] were applied.
 ///
 /// Both numbers cover the same rows: a flight is counted and summed only when it
 /// has a total time, which is the filter `getFlightTimeTotalsForAircraft`,
@@ -130,6 +151,7 @@ final Map<String, _Dimension> _dimensions = {
   required String type,
   required String sort,
   required int limit,
+  required int offset,
   required bool includeSimulator,
   required String ownerClause,
 }) {
@@ -144,44 +166,68 @@ final Map<String, _Dimension> _dimensions = {
     if (!includeSimulator) 'flights.is_simulator = 0',
     if (ownerClause.isNotEmpty) ownerClause,
   ];
-  final grouped = 'SELECT ${spec.key} AS entity_key, ${spec.select}'
+  // Every group at once, not a page: a fleet is hundreds of groups, not the
+  // flight table behind them. Ordering and slicing happen in Dart so the label
+  // sort can use the label the row actually returns — for aircraft that is
+  // [displayRegistration]'s join of two columns, which SQL could repeat but
+  // then the displayed and the ordered form would be two rules to keep equal.
+  final rows = db.query(
+      'SELECT ${spec.key} AS entity_key, ${spec.select}'
       'COALESCE(SUM(flights.total_time), 0) AS minutes, '
       'COUNT(*) AS flight_count '
       'FROM flights${spec.join.isEmpty ? '' : ' ${spec.join}'} '
       'WHERE ${where.join(' AND ')} '
-      'GROUP BY ${spec.groupBy}';
-
-  final order = switch (sort) {
-    'flights_complete' => 'flight_count DESC, ${spec.key}',
-    'label' => spec.key,
-    _ => 'minutes DESC, ${spec.key}',
-  };
-  final rows = db.query('$grouped ORDER BY $order LIMIT ?', [limit]);
-  // The groups the limit left behind, so a top-ten answer cannot read as the
-  // whole fleet.
-  final total = asInt(db
-          .query('SELECT COUNT(*) AS groups FROM ($grouped)')
-          .first['groups']) ??
-      0;
+      'GROUP BY ${spec.groupBy}');
+  final entities = [
+    for (final row in rows)
+      {
+        ...spec.row(row),
+        'minutes': row['minutes'],
+        'flights_complete': row['flight_count'],
+      },
+  ];
+  entities.sort((a, b) => _compare(a, b, spec, sort));
   return (
-    entities: [
-      for (final row in rows)
-        {
-          ...spec.row(row),
-          'minutes': row['minutes'],
-          'flights_complete': row['flight_count'],
-        },
-    ],
-    total: total,
+    entities: entities.skip(offset).take(limit).toList(),
+    total: entities.length,
   );
 }
 
-/// The form the app shows: `country_code` and `registration` joined by a hyphen,
-/// or the bare registration when the code is missing. An aircraft row that has
-/// since been deleted leaves both null.
-String? _displayRegistration(Map<String, dynamic> row) {
-  final registration = asText(row['registration']);
-  if (registration == null) return null;
-  final country = asText(row['country_code']);
-  return country == null ? registration : '$country-$registration';
+/// The ordering one dimension is sorted by: the sorted field, then the
+/// dimension's own id, so the same logbook always answers in the same order.
+int _compare(
+  Map<String, dynamic> a,
+  Map<String, dynamic> b,
+  _Dimension spec,
+  String sort,
+) {
+  switch (sort) {
+    case 'flights_complete':
+      final byCount = (b['flights_complete'] as int)
+          .compareTo(a['flights_complete'] as int);
+      if (byCount != 0) return byCount;
+    case 'label':
+      final byLabel = _compareLabels(a, b, spec);
+      if (byLabel != 0) return byLabel;
+    default:
+      final byMinutes = (b['minutes'] as int).compareTo(a['minutes'] as int);
+      if (byMinutes != 0) return byMinutes;
+  }
+  return '${a[spec.tiebreak]}'.compareTo('${b[spec.tiebreak]}');
+}
+
+/// Label order, bytewise like SQLite's own collation elsewhere in this server,
+/// with a group whose entity is gone at the end rather than the top.
+int _compareLabels(
+  Map<String, dynamic> a,
+  Map<String, dynamic> b,
+  _Dimension spec,
+) {
+  final aLabel = spec.label(a);
+  final bLabel = spec.label(b);
+  if (aLabel == null || bLabel == null) {
+    if (aLabel == null && bLabel == null) return 0;
+    return aLabel == null ? 1 : -1;
+  }
+  return aLabel.compareTo(bLabel);
 }

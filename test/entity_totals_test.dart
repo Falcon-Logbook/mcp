@@ -178,6 +178,32 @@ void main() {
     expect(payload['total'], 5, reason: 'the top two are not the whole fleet');
   });
 
+  test('offset pages through the groups the flight lists page', () async {
+    final server = await start();
+
+    final first = payloadOf(
+        await server.call('entity_totals', {'type': 'registration', 'limit': 2}));
+    expect(first['offset'], 0);
+    expect(first['has_more'], isTrue);
+
+    final second = payloadOf(await server.call(
+        'entity_totals', {'type': 'registration', 'limit': 2, 'offset': 2}));
+    expect([for (final row in totals(second, 'aircraft_registration')) row.$1],
+        ['VH-ABC', 'VH-ZZZ']);
+    expect(second['total'], 5, reason: 'total is every group, not the page');
+    expect(second['has_more'], isTrue);
+
+    final last = payloadOf(await server.call(
+        'entity_totals', {'type': 'registration', 'limit': 2, 'offset': 4}));
+    expect(last['has_more'], isFalse);
+    expect(last['count'], 1);
+
+    final past = payloadOf(await server.call(
+        'entity_totals', {'type': 'registration', 'limit': 2, 'offset': 40}));
+    expect(past['entities'], isEmpty, reason: 'past the end is an empty page');
+    expect(past['count'], 0);
+  });
+
   test('include_simulator: false drops the simulator sector from both numbers',
       () async {
     final server = await start();
@@ -261,16 +287,16 @@ void main() {
   test('a bad type or sort is refused with the field at fault', () async {
     final server = await start();
 
-    final badType =
-        errorOf(await server.call('entity_totals', {'type': 'route'}));
-    expect(badType['error'], 'invalid_value');
-    expect(badType['field'], 'type');
-    expect(badType['detail'], contains('aircraft, crew, type, registration'));
+    final badType = await server.call('entity_totals', {'type': 'route'});
+    expect(badType.isError, isTrue);
+    expect('${badType.payload}', contains('type'),
+        reason: 'the schema enum refuses it before the callback, the same '
+            'way currency_status refuses an unknown metric');
 
-    final badSort = errorOf(await server
-        .call('entity_totals', {'type': 'aircraft', 'sort': 'hours'}));
-    expect(badSort['error'], 'invalid_value');
-    expect(badSort['field'], 'sort');
+    final badSort = await server
+        .call('entity_totals', {'type': 'aircraft', 'sort': 'hours'});
+    expect(badSort.isError, isTrue);
+    expect('${badSort.payload}', contains('sort'));
 
     // The declared minimum refuses a zero page before the callback runs, the
     // same way the paged reads refuse a limit above their maximum.
@@ -279,11 +305,115 @@ void main() {
     expect(badLimit.isError, isTrue);
     expect('${badLimit.payload}', contains('limit'));
 
+    final badOffset =
+        await server.call('entity_totals', {'type': 'aircraft', 'offset': -1});
+    expect(badOffset.isError, isTrue);
+    expect('${badOffset.payload}', contains('offset'));
+
     final typo = errorOf(
         await server.call('entity_totals', {'type': 'aircraft', 'sortt': 'x'}));
     expect(typo['error'], 'unknown_field');
     expect(typo['tool'], 'entity_totals');
     expect(typo['field'], 'sortt');
+  });
+
+  test('registration is the display form the app shows, prefix joined once',
+      () async {
+    dbPath = createEmptyFixture('${tempDir.path}/display.sqlite');
+    withFixtureDb(dbPath, (db) {
+      // The two forms a fleet really stores: a bare tail the display joins,
+      // and a tail that already carries its country code. Seen in a real
+      // logbook: a simulator stored as country SIM, registration SIM-73H,
+      // which the app shows as SIM-73H, not SIM-SIM-73H.
+      for (final (id, type, country, registration) in [
+        ('ac-vh', 'C172', 'VH', 'XZO'),
+        ('ac-sim', 'SIM', 'SIM', 'SIM-73H'),
+      ]) {
+        db.execute(
+          'INSERT INTO aircraft (id, type, country_code, registration, created_at) '
+          'VALUES (?, ?, ?, ?, 1700000000)',
+          [id, type, country, registration],
+        );
+      }
+    });
+    insertFlights(dbPath, [
+      {
+        'id': 'fl-1',
+        'date': _day(1),
+        'aircraft_id': 'ac-vh',
+        'aircraft_registration': 'VH-XZO',
+        'total_time': 60,
+      },
+      {
+        'id': 'fl-2',
+        'date': _day(2),
+        'aircraft_id': 'ac-sim',
+        'aircraft_registration': 'SIM-73H',
+        'total_time': 90,
+      },
+    ]);
+    final server = await start();
+
+    final entities = entitiesOf(
+        payloadOf(await server.call('entity_totals', {'type': 'aircraft'})));
+    expect([for (final entity in entities) entity['registration']],
+        ['SIM-73H', 'VH-XZO'],
+        reason: 'SIM + SIM-73H stays SIM-73H: the read rule is the write '
+            'rule (displayRegistration), or a pilot cannot match the row to '
+            'the aircraft the app shows');
+  });
+
+  test('label sort orders the displayed names, entity-less groups last',
+      () async {
+    dbPath = createEmptyFixture('${tempDir.path}/label.sqlite');
+    withFixtureDb(dbPath, (db) {
+      for (final (id, type, country, registration) in [
+        ('ac-1', 'C172', 'ZK', 'TAV'),
+        ('ac-2', 'C172', 'VH', 'XZO'),
+      ]) {
+        db.execute(
+          'INSERT INTO aircraft (id, type, country_code, registration, created_at) '
+          'VALUES (?, ?, ?, ?, 1700000000)',
+          [id, type, country, registration],
+        );
+      }
+    });
+    insertFlights(dbPath, [
+      // Equal minutes on purpose, so the label decides: VH-XZO before ZK-TAV,
+      // which bare-tail order (TAV before XZO) would get backwards.
+      {
+        'id': 'fl-1',
+        'date': _day(1),
+        'aircraft_id': 'ac-1',
+        'aircraft_registration': 'ZK-TAV',
+        'total_time': 60,
+      },
+      {
+        'id': 'fl-2',
+        'date': _day(2),
+        'aircraft_id': 'ac-2',
+        'aircraft_registration': 'VH-XZO',
+        'total_time': 60,
+      },
+      // Linked to an aircraft row that no longer exists: still counted, but
+      // with no name to sort by.
+      {
+        'id': 'fl-3',
+        'date': _day(3),
+        'aircraft_id': 'ac-gone',
+        'total_time': 60,
+      },
+    ]);
+    final server = await start();
+
+    final byLabel = entitiesOf(payloadOf(
+        await server
+            .call('entity_totals', {'type': 'aircraft', 'sort': 'label'})));
+    expect([for (final entity in byLabel) entity['registration']],
+        ['VH-XZO', 'ZK-TAV', null],
+        reason: 'the display form, not the bare tail, and the deleted aircraft '
+            'last rather than first');
+    expect([for (final entity in byLabel) entity['minutes']], [60, 60, 60]);
   });
 }
 
