@@ -3,7 +3,9 @@ import 'dart:convert';
 import 'package:mcp_dart/mcp_dart.dart';
 
 import 'config.dart';
+import 'currency.dart';
 import 'db.dart';
+import 'expiry.dart';
 import 'util.dart';
 
 // ============================================================
@@ -589,6 +591,15 @@ CallToolResult _runWrite(
 
 String _normalizeKey(String value) =>
     value.toUpperCase().replaceAll(RegExp(r'[^A-Z0-9]'), '');
+
+/// A `*_date` column's value as a local [DateTime]. [FalconDb] renders an epoch
+/// `*_date` column as a local ISO string, so that is what a read sees; an
+/// integer is accepted too, for a query that bypasses the mapper.
+DateTime? _localDate(Object? value) => switch (value) {
+      int() => DateTime.fromMillisecondsSinceEpoch(value * 1000),
+      String() => DateTime.tryParse(value)?.toLocal(),
+      _ => null,
+    };
 
 /// Display registration the app would show: country code plus registration,
 /// unless the stored value already carries the country code.
@@ -1474,6 +1485,101 @@ Future<void> runServer(String dbPath, {bool readonly = true}) async {
   );
 
   server.registerTool(
+    'list_expiries',
+    description:
+        'List document expiries (medical, licence, type rating) with the days '
+        'from today and the red/orange/green status the app shows. Red includes '
+        'today and anything overdue. due_date is YYYY-MM-DD and checked_on is '
+        'the day the status was computed for. Ordered by due date, soonest '
+        'first. Overdue rows are included unless include_past is false, and '
+        'due_within_days counts forward from today, so it keeps an overdue row '
+        'only while include_past is true. Thresholds come from expiry_settings, '
+        'or 90 and 30 days when that table has no row. Local rows only unless '
+        'include_shared is true.',
+    inputSchema: JsonSchema.object(properties: {
+      'include_past': JsonSchema.boolean(
+          description: 'Include overdue rows. Default true, because an expired '
+              'document is the one row that matters.'),
+      'due_within_days': JsonSchema.integer(
+          minimum: 0,
+          description: 'Only rows due within this many days, counting forward '
+              'from today.'),
+      'limit': JsonSchema.integer(
+          minimum: 1, maximum: 1000, description: 'Default 100, maximum 1000.'),
+      _includeSharedKey: JsonSchema.boolean(
+          description:
+              'Include rows owned by another device or account. Default false.'),
+    }),
+    annotations: readOnlyAnnotations,
+    callback: (args, extra) async {
+      try {
+        _rejectUnknown(args,
+            {'include_past', 'due_within_days', 'limit', _includeSharedKey});
+        if (!db.hasTable('expiries')) {
+          return _fail('This database (schema ${db.schemaVersion}) has no '
+              'expiries table');
+        }
+        final includePast = asBool(args['include_past']) ?? true;
+        final rawDays = args['due_within_days'];
+        final dueWithinDays = rawDays == null ? null : asInt(rawDays);
+        if (rawDays != null && (dueWithinDays == null || dueWithinDays < 0)) {
+          return _fail('due_within_days must be a whole number of days, 0 or '
+              'more (got "$rawDays")');
+        }
+        final limit = asInt(args['limit']) ?? 100;
+        if (limit < 1) return _fail('limit must be >= 1');
+
+        final thresholds = readExpiryThresholds(db);
+        final today = DateTime.now();
+        final owner = _ownerClause(db, 'expiries',
+            includeShared: asBool(args[_includeSharedKey]) ?? false);
+        // The app sorts on due date alone; the id tiebreak keeps two documents
+        // due the same day in a stable order instead of an arbitrary one.
+        final rows = db.query('SELECT id, name, due_date FROM expiries'
+            '${owner.isEmpty ? '' : ' WHERE $owner'} '
+            'ORDER BY due_date, id');
+        final expiries = <Map<String, dynamic>>[];
+        var matched = 0;
+        for (final row in rows) {
+          final due = _localDate(row['due_date']);
+          if (due == null) continue;
+          final days = daysUntilDue(due, today);
+          if (!includePast && days < 0) continue;
+          if (dueWithinDays != null && days > dueWithinDays) continue;
+          matched++;
+          if (expiries.length >= limit) continue;
+          expiries.add({
+            'id': row['id'],
+            'name': row['name'],
+            'due_date': formatCalendarDate(due),
+            'days_remaining': days,
+            'status': expiryStatusForDays(days,
+                greenThreshold: thresholds.green,
+                orangeThreshold: thresholds.orange),
+          });
+        }
+        return _ok({
+          'checked_on': formatCalendarDate(today),
+          'thresholds': {
+            'green': thresholds.green,
+            'orange': thresholds.orange,
+            'source': thresholds.source,
+          },
+          'include_past': includePast,
+          'due_within_days': dueWithinDays,
+          'count': expiries.length,
+          'total': matched,
+          'expiries': expiries,
+        });
+      } on _ToolError catch (error) {
+        return _fail(error.message);
+      } catch (error) {
+        return _fail('list_expiries failed: $error');
+      }
+    },
+  );
+
+  server.registerTool(
     'logbook_stats',
     description:
         'Aggregate logbook statistics. All times are minutes. flights counts '
@@ -1521,6 +1627,85 @@ Future<void> runServer(String dbPath, {bool readonly = true}) async {
         return _fail(error.message);
       } catch (error) {
         return _fail('logbook_stats failed: $error');
+      }
+    },
+  );
+
+  server.registerTool(
+    'currency_status',
+    description:
+        'The pilot\'s currency rules, computed as the app\'s currency page '
+        'computes them. Thresholds are hours for the four time metrics (the app '
+        'divides those by 60) and counts otherwise. is_exceeded keeps the app\'s '
+        'meaning, attention needed: for a requirement it is true when you are '
+        'short of the threshold, for a limit when you reach it. remaining is '
+        'what a requirement still needs, over_by how far over a limit is, both '
+        '0 once satisfied. Matches that page, including its missing owner '
+        'filter, so a synced logbook can mix owners and drafts count as flights. '
+        'Landings and takeoffs work here; the app cannot display those two '
+        'rules. Pass metric to ask about one with no rule: you get the raw total '
+        'for period and a note saying so.',
+    inputSchema: JsonSchema.object(properties: {
+      'metric': JsonSchema.string(
+        enumValues: currencyMetrics,
+        description: 'Ask whether a rule covers this metric. Omit for just the '
+            'configured rules.',
+      ),
+      'period': JsonSchema.string(
+        enumValues: currencyPeriods,
+        description: 'Window for the raw total when metric has no rule. '
+            'Default $defaultCurrencyPeriod. Only valid with metric.',
+      ),
+    }),
+    annotations: readOnlyAnnotations,
+    callback: (args, extra) async {
+      try {
+        _rejectUnknown(args, {'metric', 'period'});
+        if (!db.hasTable('user_currency')) {
+          return _fail('This database (schema ${db.schemaVersion}) has no '
+              'user_currency table');
+        }
+        final metric = asText(args['metric']);
+        if (metric != null && !currencyMetrics.contains(metric)) {
+          return _fail(
+              'metric must be one of ${currencyMetrics.join(', ')} (got "$metric")');
+        }
+        final rawPeriod = asText(args['period']);
+        final period = rawPeriod ?? defaultCurrencyPeriod;
+        if (!currencyPeriods.contains(period)) {
+          return _fail('period must be one of ${currencyPeriods.join(', ')} '
+              '(got "$period")');
+        }
+        if (rawPeriod != null && metric == null) {
+          return _fail('period only applies with metric: pass metric (one of '
+              '${currencyMetrics.join(', ')}) to ask about a metric, or omit '
+              'both for the configured rules');
+        }
+
+        final now = DateTime.now();
+        // No owner filter and no is_active filter: the app reads every row
+        // (`currency_dao.dart:14-20, 74`) and renders them in table order.
+        final rows = db.query(
+            'SELECT id, title, metric, period, threshold, type FROM user_currency '
+            'ORDER BY rowid');
+        final rules = [
+          for (final row in rows) computeCurrencyRule(db, row, now),
+        ];
+        final unconfigured =
+            metric != null && !rules.any((rule) => rule['metric'] == metric)
+                ? currencyUnconfigured(db, metric, period, now)
+                : null;
+        return _ok({
+          'checked_on': formatCalendarDate(now),
+          'units': {'time': 'hours', 'counts': 'count'},
+          'count': rules.length,
+          'rules': rules,
+          if (unconfigured != null) 'unconfigured': unconfigured,
+        });
+      } on _ToolError catch (error) {
+        return _fail(error.message);
+      } catch (error) {
+        return _fail('currency_status failed: $error');
       }
     },
   );
@@ -2369,7 +2554,7 @@ Future<void> runServer(String dbPath, {bool readonly = true}) async {
             mimeType: 'text/plain',
             text:
                 'Falcon MCP server ($writeMode): a local Falcon pilot logbook (SQLite).\n'
-                'Tools cover flights, aircraft, airports, crew, saved routes, stats, settings, logs'
+                'Tools cover flights, aircraft, airports, crew, saved routes, expiries, currency, stats, settings, logs'
                 '${readonly ? '' : ', and writes'}.\n'
                 'Use the falcon_help prompt for the tool list and falcon://conventions for field semantics.',
           ),
@@ -2411,6 +2596,8 @@ Future<void> runServer(String dbPath, {bool readonly = true}) async {
                 '- logbook_country is "AU", "NZ", or null.\n'
                 '- total_time is the authoritative flight duration; takeoffs/landings are counts per flight row.\n'
                 '- is_simulator and is_ifr are stored as 0/1.\n'
+                '- Expiry status is computed at read time, never stored: whole local days from today to due_date, below the orange threshold is red (which includes today and every overdue day), below the green threshold is orange, green above it. Thresholds come from expiry_settings (a local row first, then the newest), or 90 and 30 days when that table has no row. list_expiries includes overdue rows by default.\n'
+                '- Currency thresholds are HOURS for the four time metrics, because the app divides those values by 60, and counts for the other four. is_exceeded means the rule needs attention: for a requirement that is being below the threshold, for a limit it is reaching it. currency_status reproduces the app\'s currency page, which applies no owner filter and counts drafts as flights, so its numbers can mix owners on a synced logbook.\n'
                 '- Deleting a flight, aircraft, crew member or custom airport also records a sync tombstone when a Postgres sync provider has been used, so the deletion propagates.\n'
                 '- Use get_schema for exact table/column names before writing.',
           ),
@@ -2467,6 +2654,7 @@ Future<void> runServer(String dbPath, {bool readonly = true}) async {
                   '${readonly ? '' : ' and edits'} a local Falcon pilot logbook (SQLite).\n\n'
                   'Read tools: db_info, get_schema, list_flights, get_flight, search_flights, list_aircraft, '
                   'get_aircraft, list_airports, list_custom_airports, list_crew, list_saved_routes, logbook_stats, '
+                  'list_expiries, currency_status, '
                   'get_flight_settings, get_app_settings, get_general_settings, get_recent_logs, '
                   'find_missing_times, dedupe_crew.\n'
                   '$writeTools\n'
