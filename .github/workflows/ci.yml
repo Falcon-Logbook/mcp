@@ -18,11 +18,10 @@ concurrency:
 jobs:
   analyze_and_test:
     name: Analyze & Test
-    # Self-hosted runner on the Voyager home server (see the Falcon vault:
-    # CI/self-hosted-runner.md). It exists while this repo is private so CI
-    # does not spend GitHub Actions minutes. Revert to ubuntu-24.04 when the
-    # repo goes public.
-    runs-on: [self-hosted, linux, x64, dart]
+    # GitHub-hosted on purpose. This suite takes about a minute, so hosted
+    # minutes are not worth a self-hosted runner; the Flutter suite in `app`
+    # is the expensive one and runs on Voyager instead.
+    runs-on: ubuntu-24.04
     timeout-minutes: 20
 
     steps:
