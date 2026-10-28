@@ -236,6 +236,81 @@ void main() {
     });
   });
 
+  test('tombstones are normalised, deduplicated and never duplicated',
+      () async {
+    // sync_state holding the app's legacy provider name must not hide the
+    // tombstone from a push running under the canonical name, and a
+    // tombstone that already exists must not be written twice.
+    withFixtureDb(dbPath, (db) {
+      db.execute(
+        "INSERT INTO sync_state (sync_table, provider, last_push_count, last_pull_count) "
+        "VALUES ('flights', 'selfHostPg', 0, 0)",
+      );
+      // A tombstone the app itself already recorded for this row.
+      db.execute(
+        "INSERT INTO sync_deletions (sync_table, row_id, provider, created_at) "
+        "VALUES ('flights', 'fl-1', 'postgres', 1700000000)",
+      );
+    });
+
+    final server = await McpProcess.start(dbPath, write: true);
+    addTearDown(() async {
+      await server.stop();
+    });
+
+    final first = await server.call('delete_flight', {'id': 'fl-1'});
+    expect(first.isError, isFalse, reason: '${first.payload}');
+
+    // A second delete is a not_found error, not a silent success, and it
+    // writes nothing.
+    final second = await server.call('delete_flight', {'id': 'fl-1'});
+    expect(second.isError, isTrue);
+    expect(second.payload, contains('not_found'));
+    expect(second.payload, contains('fl-1'));
+
+    withFixtureDb(dbPath, (db) {
+      final tombstones = db.select(
+        "SELECT sync_table, row_id, provider FROM sync_deletions "
+        "WHERE row_id = 'fl-1'",
+      );
+      // Exactly one tombstone for the row, under the canonical provider name:
+      // the legacy sync_state row normalised onto the tombstone the app had
+      // already written, so nothing new was inserted.
+      expect(tombstones, [
+        {'sync_table': 'flights', 'row_id': 'fl-1', 'provider': 'postgres'},
+      ]);
+    });
+  });
+
+  test('a tombstone is written for the canonical name only once per provider',
+      () async {
+    // A database that has synced under both the legacy and the canonical
+    // provider name ends up with one tombstone, not two.
+    withFixtureDb(dbPath, (db) {
+      for (final provider in ['selfHostPg', 'postgres']) {
+        db.execute(
+          "INSERT INTO sync_state (sync_table, provider, last_push_count, last_pull_count) "
+          "VALUES ('flights', '$provider', 0, 0)",
+        );
+      }
+    });
+
+    final server = await McpProcess.start(dbPath, write: true);
+    addTearDown(() async {
+      await server.stop();
+    });
+
+    final deleted = await server.call('delete_crew', {'id': 'cr-1'});
+    expect(deleted.isError, isFalse, reason: '${deleted.payload}');
+
+    withFixtureDb(dbPath, (db) {
+      final tombstones = db.select(
+        "SELECT provider FROM sync_deletions WHERE row_id = 'cr-1'",
+      );
+      expect(tombstones.map((row) => row['provider']), ['postgres']);
+    });
+  });
+
   test('entity writes validate input and keep the app schema intact', () async {
     final server = await McpProcess.start(dbPath, write: true);
     addTearDown(() async {

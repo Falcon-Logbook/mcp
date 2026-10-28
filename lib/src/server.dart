@@ -1062,21 +1062,54 @@ bool _sameLocalDay(Object? storedDate, int date) =>
     storedDate == epochToIso(date);
 
 /// Records a sync tombstone so a deleted row is not resurrected by Postgres
-/// sync, mirroring the app's delete path. No-op when no provider has synced.
+/// sync, mirroring the app's `recordDeletion`. No-op when no provider has
+/// synced.
+///
+/// One tombstone per provider, deduplicated: `sync_deletions` has no unique
+/// index on `(sync_table, row_id, provider)`, so an existence check is what
+/// keeps a repeated delete from stacking identical tombstone rows. Provider
+/// names are normalised like the app's `normalizeSyncProvider`, because the
+/// push reads tombstones `WHERE provider = ?` and a tombstone stored under a
+/// legacy provider name would be invisible to it.
 void _recordTombstones(FalconDb db, String table, Object id) {
   if (!db.hasTable('sync_state') || !db.hasTable('sync_deletions')) return;
   final providers = db
       .query('SELECT DISTINCT provider FROM sync_state')
       .map((row) => row['provider'])
       .whereType<String>()
+      .map(normalizeSyncProvider)
       .toSet();
   final now = nowEpochSeconds();
   for (final provider in providers) {
+    final known = db.query(
+      'SELECT 1 FROM sync_deletions '
+      'WHERE sync_table = ? AND row_id = ? AND provider = ? LIMIT 1',
+      [table, id.toString(), provider],
+    );
+    if (known.isNotEmpty) continue;
     db.execute(
       'INSERT INTO sync_deletions (sync_table, row_id, provider, created_at) VALUES (?, ?, ?, ?)',
       [table, id.toString(), provider, now],
     );
   }
+}
+
+/// Deletes [id] from [table] and records its sync tombstones in one
+/// transaction, for the four synced tables' delete tools.
+///
+/// The delete's affected-row count decides whether anything happened at all:
+/// a row that a concurrent writer removed after the caller's existence check
+/// ends in a [notFoundLabel] error instead of a deleted result that never
+/// deleted anything, and no tombstone is written for a row that was already
+/// gone.
+void _deleteSyncedRow(FalconDb db, String table, Object id, String label) {
+  db.transaction(() {
+    final deleted = db.execute('DELETE FROM $table WHERE id = ?', [id]);
+    if (deleted == 0) {
+      throw _ToolError('$label not found: $id', code: 'not_found', field: 'id');
+    }
+    _recordTombstones(db, table, id);
+  });
 }
 
 Map<String, dynamic> _deleted(String table, Object id) => {
@@ -2283,10 +2316,7 @@ Future<void> runServer(String dbPath, {bool readonly = true}) async {
           throw _ToolError('Flight not found: $id',
               code: 'not_found', field: 'id');
         }
-        db.transaction(() {
-          db.execute('DELETE FROM flights WHERE id = ?', [id]);
-          _recordTombstones(db, 'flights', id);
-        });
+        _deleteSyncedRow(db, 'flights', id, 'Flight');
         return _deleted('flights', id);
       }),
     );
@@ -2434,10 +2464,7 @@ Future<void> runServer(String dbPath, {bool readonly = true}) async {
           throw _ToolError('Aircraft not found: $id',
               code: 'not_found', field: 'id');
         }
-        db.transaction(() {
-          db.execute('DELETE FROM aircraft WHERE id = ?', [id]);
-          _recordTombstones(db, 'aircraft', id);
-        });
+        _deleteSyncedRow(db, 'aircraft', id, 'Aircraft');
         return _deleted('aircraft', id);
       }),
     );
@@ -2537,10 +2564,7 @@ Future<void> runServer(String dbPath, {bool readonly = true}) async {
           throw _ToolError('Crew member not found: $id',
               code: 'not_found', field: 'id');
         }
-        db.transaction(() {
-          db.execute('DELETE FROM crew_members WHERE id = ?', [id]);
-          _recordTombstones(db, 'crew_members', id);
-        });
+        _deleteSyncedRow(db, 'crew_members', id, 'Crew member');
         return _deleted('crew_members', id);
       }),
     );
@@ -2638,10 +2662,7 @@ Future<void> runServer(String dbPath, {bool readonly = true}) async {
           throw _ToolError('Custom airport not found: $id',
               code: 'not_found', field: 'id');
         }
-        db.transaction(() {
-          db.execute('DELETE FROM custom_airports WHERE id = ?', [id]);
-          _recordTombstones(db, 'custom_airports', id);
-        });
+        _deleteSyncedRow(db, 'custom_airports', id, 'Custom airport');
         return _deleted('custom_airports', id);
       }),
     );
@@ -2738,10 +2759,18 @@ Future<void> runServer(String dbPath, {bool readonly = true}) async {
               code: 'not_found', field: 'id');
         }
         // The app clears route_id on linked flights when a route is deleted.
+        // The delete's affected-row count decides whether anything happened:
+        // a route a concurrent writer removed after the existence check ends
+        // in a not_found error instead of unlinking flights for nothing.
         db.transaction(() {
+          final deleted =
+              db.execute('DELETE FROM saved_routes WHERE id = ?', [id]);
+          if (deleted == 0) {
+            throw _ToolError('Saved route not found: $id',
+                code: 'not_found', field: 'id');
+          }
           db.execute(
               'UPDATE flights SET route_id = NULL WHERE route_id = ?', [id]);
-          db.execute('DELETE FROM saved_routes WHERE id = ?', [id]);
         });
         return _deleted('saved_routes', id);
       }),
