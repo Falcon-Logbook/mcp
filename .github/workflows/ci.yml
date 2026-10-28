@@ -1,0 +1,46 @@
+name: CI
+
+on:
+  pull_request:
+    branches: ['main']
+    types: [opened, synchronize, reopened]
+  push:
+    branches: ['main']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  analyze_and_test:
+    name: Analyze & Test
+    # Self-hosted runner on the Voyager home server (see the Falcon vault:
+    # CI/self-hosted-runner.md). It exists while this repo is private so CI
+    # does not spend GitHub Actions minutes. Revert to ubuntu-24.04 when the
+    # repo goes public.
+    runs-on: [self-hosted, linux, x64, dart]
+    timeout-minutes: 20
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          persist-credentials: false
+
+      - name: Setup Dart
+        uses: dart-lang/setup-dart@6afc89df92d6eb3834022f73cd65adc8cdfcb92d # v1
+        with:
+          sdk: '3.13.5'
+
+      - name: Install dependencies
+        run: dart pub get
+
+      - name: Analyze
+        run: dart analyze --fatal-infos
+
+      - name: Test
+        run: dart test
