@@ -195,19 +195,14 @@ const Set<String> _minuteColumns = {
   'icus_night_time',
 };
 
-/// Every minute column that also accepts an `_hours` argument, converted once
-/// at the boundary. The column itself keeps its minutes name, so a caller can
-/// pass `1.5` hours without doing the arithmetic that turns a 1.5 hour flight
-/// into 1 minute.
+/// Time fields that also accept an `_hours` argument, converted once at the
+/// boundary. The column itself keeps its minutes name, so a caller can pass
+/// `1.5` hours without doing the arithmetic that turns a 1.5 hour flight into
+/// 1 minute.
 const Map<String, String> _hoursAliases = {
   'total_time': 'total_time_hours',
   'day_time': 'day_time_hours',
   'night_time': 'night_time_hours',
-  'actual_instrument': 'actual_instrument_hours',
-  'simulated_instrument': 'simulated_instrument_hours',
-  'ground_instrument': 'ground_instrument_hours',
-  'icus_day_time': 'icus_day_time_hours',
-  'icus_night_time': 'icus_night_time_hours',
 };
 
 /// Every response that carries a time or date field states its units here,
@@ -222,17 +217,12 @@ const Map<String, String> _units = {
 /// The columns a flight summary carries: what was flown, when, in what, with
 /// whom and how long. Every key is present even when the value is null, so a
 /// missing reading reads as "not recorded" rather than as a key the caller has
-/// to know about.
-///
-/// `departure_icao` and `arrival_icao` are derived from `route` rather than
-/// stored: they say which way the flight went, and stay null when the route is
-/// a description, the same call the app makes.
+/// to know about. Exactly these twelve: the summary is a cost contract, and
+/// `route` already carries the direction a summary answers.
 const List<String> _slimFlightKeys = [
   'id',
   'date',
   'route',
-  'departure_icao',
-  'arrival_icao',
   'flight_number',
   'aircraft_registration',
   'crew_members_name',
@@ -244,19 +234,18 @@ const List<String> _slimFlightKeys = [
   'is_simulator',
 ];
 
-/// [row] as a flight read returns it: the summary, or every column when [full].
-/// A column the live database does not have stays null rather than disappearing
-/// from the row. The two route codes are always derived, so `full` is the whole
-/// row plus them.
+/// [row] as a flight read returns it: the twelve-field summary, or every column
+/// plus the two derived route codes when [full].
+///
+/// `departure_icao` and `arrival_icao` are parsed from `route`, never stored:
+/// they say which way the flight went and stay null when the route is a
+/// description, the same call the app makes. They are on `full` rows and
+/// `get_flight` only, not the summary, because two mostly-null keys on every
+/// listed row cost more than the raw route text they restate.
 Map<String, dynamic> _flightView(Map<String, dynamic> row,
     {bool full = false}) {
   if (full) return {...row, ..._routeCodes(asText(row['route']))};
-  return {
-    // The codes are derived below, not read from the row.
-    for (final key in _slimFlightKeys)
-      if (key != 'departure_icao' && key != 'arrival_icao') key: row[key],
-    ..._routeCodes(asText(row['route'])),
-  };
+  return {for (final key in _slimFlightKeys) key: row[key]};
 }
 
 /// The direction a flight's free-text route describes, as the two read keys.
@@ -294,15 +283,6 @@ JsonSchema get _missingTimesLimitSchema => JsonSchema.integer(
 /// aid, so the page is small: 20 entries by default, 200 at most.
 JsonSchema get _logLimitSchema => JsonSchema.integer(
     minimum: 1, maximum: 200, description: 'Default 20, maximum 200.');
-
-/// The `limit` argument on the plain list reads (aircraft, airports, crew,
-/// routes and duplicates). They return every match up to a cap rather than a
-/// page, so each states its own default and maximum, and the response says
-/// `has_more` when the cap cut the list short.
-JsonSchema _listLimitSchema(int byDefault, int atMost) => JsonSchema.integer(
-    minimum: 1,
-    maximum: atMost,
-    description: 'Default $byDefault, maximum $atMost.');
 
 /// How much of a log message a projection carries. A log entry can hold a
 /// multi-kilobyte message and a multi-kilobyte stack trace, neither of which is
@@ -712,17 +692,11 @@ Map<String, dynamic> _rangeOf(_DateWindow window) =>
 /// that there is no such flight.
 Map<String, JsonSchema> _flightNarrowingProperties() => {
       'aircraft_registration': JsonSchema.string(
-          description: 'Bare (XZO) or display (VH-XZO), any case.'),
-      'flight_type':
-          JsonSchema.string(description: 'route or details, any case.'),
-      'crew_members_name': JsonSchema.string(
-          description:
-              'Any case. Also matches a flight linked to that crew row.'),
-      'departure_icao': JsonSchema.string(
-          description: 'Where the route started, e.g. YSSY. Direction only: '
-              'a description never matches.'),
-      'arrival_icao': JsonSchema.string(
-          description: 'Where the route ended, e.g. NZQN. Direction only.'),
+          description: 'Bare (XZO) or display (VH-XZO).'),
+      'flight_type': JsonSchema.string(),
+      'crew_members_name': JsonSchema.string(),
+      'departure_icao': JsonSchema.string(),
+      'arrival_icao': JsonSchema.string(),
     };
 
 /// ` WHERE a AND b`, or nothing when [where] is empty.
@@ -1611,11 +1585,10 @@ Future<void> runServer(String dbPath, {bool readonly = true}) async {
     description:
         'List flights, newest first (date, then day_order, then id). Times are '
         'minutes and dates come back as local ISO-8601 strings; filters take '
-        'YYYY-MM-DD. departure_icao and arrival_icao match the direction the '
-        'route records, and the other filters match any case. Returns count '
-        '(rows on this page), total (all matching rows), has_more, offset and '
-        'the applied range. Each flight is a summary unless full is true. Local '
-        'rows only unless include_shared is true.',
+        'YYYY-MM-DD. Returns count (rows on this page), total (all matching '
+        'rows), has_more, offset and the applied range. Each flight is a '
+        'twelve-field summary unless full is true. Local rows only unless '
+        'include_shared is true.',
     inputSchema: JsonSchema.object(properties: {
       'limit': _flightLimitSchema,
       'offset': JsonSchema.integer(minimum: 0),
@@ -1712,12 +1685,11 @@ Future<void> runServer(String dbPath, {bool readonly = true}) async {
     description:
         'Search flights by free text (route, flight number, crew name, '
         'registration). Times are minutes and dates come back as local ISO-8601 '
-        'strings; filters take YYYY-MM-DD. departure_icao and arrival_icao '
-        'match the direction the route records, and the other filters match any '
-        'case. Returns count (rows on this page), total (all matching rows), '
-        'has_more, offset and the applied range. Ordered newest first (date, '
-        'then day_order, then id). Each flight is a summary unless full is true. '
-        'Local rows only unless include_shared is true.',
+        'strings; filters take YYYY-MM-DD. Returns count (rows on this page), '
+        'total (all matching rows), has_more, offset and the applied range. '
+        'Ordered newest first (date, then day_order, then id). Each flight is '
+        'a twelve-field summary unless full is true. Local rows only unless '
+        'include_shared is true.',
     inputSchema: JsonSchema.object(properties: {
       'query': JsonSchema.string(),
       'limit': _flightLimitSchema,
@@ -1794,16 +1766,14 @@ Future<void> runServer(String dbPath, {bool readonly = true}) async {
   server.registerTool(
     'list_aircraft',
     description:
-        'List aircraft, optionally including archived ones, ordered by '
-        'registration. Returns count (rows on this page), total (all matching '
-        'rows) and has_more. Local rows only unless include_shared is true.',
+        'List aircraft, optionally including archived ones. Local rows only '
+        'unless include_shared is true.',
     inputSchema: JsonSchema.object(properties: {
-      'include_archived': JsonSchema.boolean(
-          description: 'Include archived aircraft. Default false.'),
+      'include_archived': JsonSchema.boolean(),
       _includeSharedKey: JsonSchema.boolean(
           description:
               'Include rows owned by another device or account. Default false.'),
-      'limit': _listLimitSchema(200, 1000),
+      'limit': JsonSchema.integer(minimum: 1, maximum: 1000),
     }),
     annotations: readOnlyAnnotations,
     callback: (args, extra) async {
@@ -1877,20 +1847,14 @@ Future<void> runServer(String dbPath, {bool readonly = true}) async {
   server.registerTool(
     'list_airports',
     description:
-        'Search the built-in airport list. query is required and matched '
-        'without case; results are ranked exact ICAO, exact IATA, ICAO prefix, '
-        'IATA prefix, then name or city contains, and ties break on ICAO. '
-        'country narrows to one country code. Returns count (rows on this '
-        'page), total (all matching rows) and has_more.',
+        'Search the built-in airports by ICAO, IATA, name or city, any case. '
+        'Best match first; ties break on ICAO. query is required; country '
+        'narrows to one code.',
     inputSchema: JsonSchema.object(properties: {
-      'query': JsonSchema.string(
-          description: 'ICAO, IATA, name or city text, any case.'),
-      'country':
-          JsonSchema.string(description: 'Country code, e.g. AU, any case.'),
-      'limit': _listLimitSchema(50, 1000),
-    }, required: [
-      'query'
-    ]),
+      'query': JsonSchema.string(description: 'Required.'),
+      'country': JsonSchema.string(),
+      'limit': JsonSchema.integer(minimum: 1, maximum: 1000),
+    }),
     annotations: readOnlyAnnotations,
     callback: (args, extra) async {
       try {
@@ -1933,14 +1897,13 @@ Future<void> runServer(String dbPath, {bool readonly = true}) async {
 
   server.registerTool(
     'list_custom_airports',
-    description: 'List user-defined custom airports, ordered by name. Returns '
-        'count (rows on this page), total (all matching rows) and has_more. '
-        'Local rows only unless include_shared is true.',
+    description: 'List user-defined custom airports. Local rows only '
+        'unless include_shared is true.',
     inputSchema: JsonSchema.object(properties: {
       _includeSharedKey: JsonSchema.boolean(
           description:
               'Include rows owned by another device or account. Default false.'),
-      'limit': _listLimitSchema(200, 1000),
+      'limit': JsonSchema.integer(minimum: 1, maximum: 1000),
     }),
     annotations: readOnlyAnnotations,
     callback: (args, extra) async {
@@ -1973,16 +1936,14 @@ Future<void> runServer(String dbPath, {bool readonly = true}) async {
   server.registerTool(
     'list_crew',
     description:
-        'List crew members, optionally including archived ones, ordered by '
-        'name. Returns count (rows on this page), total (all matching rows) and '
-        'has_more. Local rows only unless include_shared is true.',
+        'List crew members, optionally including archived ones. Local rows '
+        'only unless include_shared is true.',
     inputSchema: JsonSchema.object(properties: {
-      'include_archived': JsonSchema.boolean(
-          description: 'Include archived crew. Default false.'),
+      'include_archived': JsonSchema.boolean(),
       _includeSharedKey: JsonSchema.boolean(
           description:
               'Include rows owned by another device or account. Default false.'),
-      'limit': _listLimitSchema(200, 1000),
+      'limit': JsonSchema.integer(minimum: 1, maximum: 1000),
     }),
     annotations: readOnlyAnnotations,
     callback: (args, extra) async {
@@ -2018,14 +1979,13 @@ Future<void> runServer(String dbPath, {bool readonly = true}) async {
 
   server.registerTool(
     'list_saved_routes',
-    description: 'List saved routes, ordered by flight number. Returns count '
-        '(rows on this page), total (all matching rows) and has_more. Local rows '
-        'only unless include_shared is true.',
+    description: 'List saved routes. Local rows only unless include_shared '
+        'is true.',
     inputSchema: JsonSchema.object(properties: {
       _includeSharedKey: JsonSchema.boolean(
           description:
               'Include rows owned by another device or account. Default false.'),
-      'limit': _listLimitSchema(200, 1000),
+      'limit': JsonSchema.integer(minimum: 1, maximum: 1000),
     }),
     annotations: readOnlyAnnotations,
     callback: (args, extra) async {
@@ -2159,19 +2119,16 @@ Future<void> runServer(String dbPath, {bool readonly = true}) async {
     'logbook_stats',
     description:
         'Aggregate logbook statistics. All times are minutes. flights counts '
-        'every matching row including drafts, flights_complete counts rows with '
-        'a total time (the app\'s own flight count), zero_time counts complete '
-        'rows whose total_time is 0, and drafts counts the rest. Time and '
-        'movement sums skip drafts, so they match the app. sim_flights and '
-        'sim_minutes always report the simulator part; include_simulator: false '
-        '(default true, like the app) leaves those rows out of every other '
-        'number. Filters (date_from/date_to as YYYY-MM-DD, or period) apply to '
-        'every number, and the applied range is echoed back.',
+        'every matching row including drafts, flights_complete counts rows '
+        'with a total time, zero_time counts total_time = 0 rows, drafts '
+        'counts the rest. Sums skip drafts; include_simulator: false (default true) leaves '
+        'simulators out of every other number while sim_flights and '
+        'sim_minutes still report that part. Filters (date_from/date_to as '
+        'YYYY-MM-DD, or period) apply to every number and the applied range is '
+        'echoed back.',
     inputSchema: JsonSchema.object(properties: {
       ..._dateFilterProperties(),
-      'include_simulator': JsonSchema.boolean(
-          description: 'Count simulator rows in the sums. Default true; the '
-              'simulator split is reported either way.'),
+      'include_simulator': JsonSchema.boolean(),
       _includeSharedKey: JsonSchema.boolean(
           description:
               'Include rows owned by another device or account. Default false.'),
@@ -2423,19 +2380,12 @@ Future<void> runServer(String dbPath, {bool readonly = true}) async {
     description:
         'Find flights whose times need attention: no total_time (a draft), a '
         'null day_time or night_time, or a day plus night that does not equal '
-        'the total. Times are minutes and dates are local ISO-8601 strings. '
-        'Each row is id, date, route, total_time, day_time, night_time, '
-        'is_simulator and reason (draft, missing_split, half_split, '
-        'split_mismatch, simulator_no_duration). Simulator sessions are left '
-        'out unless include_simulator is true, because the app expects them to '
-        'carry a total and no split. Returns count (rows on this page), total '
-        '(all matches), has_more and the applied range. Local rows only unless '
-        'include_shared is true.',
+        'the total. Each row carries id, date, route, the three times, '
+        'is_simulator and a reason. Simulators are excluded by default. '
+        'Local rows only unless include_shared is true.',
     inputSchema: JsonSchema.object(properties: {
       'limit': _missingTimesLimitSchema,
-      'include_simulator': JsonSchema.boolean(
-          description: 'Include simulator sessions. Default false.'),
-      ..._dateFilterProperties(),
+      'include_simulator': JsonSchema.boolean(),
       _includeSharedKey: JsonSchema.boolean(
           description:
               'Include rows owned by another device or account. Default false.'),
@@ -2443,35 +2393,31 @@ Future<void> runServer(String dbPath, {bool readonly = true}) async {
     annotations: readOnlyAnnotations,
     callback: (args, extra) async {
       try {
-        _rejectUnknown(
-            args, {'limit', 'include_simulator', ..._flightFilterKeys},
+        _rejectUnknown(args, {'limit', 'include_simulator', _includeSharedKey},
             tool: 'find_missing_times');
         final limit = asInt(args['limit']) ?? 200;
         if (limit < 1) return _fail('limit must be >= 1', field: 'limit');
         final includeSimulator = asBool(args['include_simulator']) ?? false;
-        final window = _flightDateFilter(args, now: DateTime.now());
         final owner = _ownerClause(db, 'flights',
             includeShared: asBool(args[_includeSharedKey]) ?? false);
         final where = <String>[
           _missingTimePredicate,
           if (!includeSimulator) 'is_simulator = 0',
-          ...window.where,
           if (owner.isNotEmpty) owner,
         ];
-        final params = [...window.params];
+        const params = <Object?>[];
         final fromWhere = 'flights${_whereSql(where)}';
         final rows = db.query(
             'SELECT id, date, route, total_time, day_time, night_time, '
             'is_simulator FROM $fromWhere '
             'ORDER BY date DESC, day_order DESC, id LIMIT ?',
-            [...params, limit]);
+            [limit]);
         final page =
             _pageInfo(db, fromWhere, params, offset: 0, count: rows.length);
         return _ok({
           'count': rows.length,
           'total': page.total,
           'has_more': page.hasMore,
-          'range': _rangeOf(window),
           'units': _units,
           'flights': [
             for (final row in rows) {...row, 'reason': _missingTimeReason(row)},
@@ -2489,21 +2435,17 @@ Future<void> runServer(String dbPath, {bool readonly = true}) async {
     'dedupe_crew',
     description:
         'Find crew members whose names normalise to the same key, so the same '
-        'pilot saved twice. Ordered by name; each member is id, name and '
-        'archived. Returns count (groups on this page), total (all duplicate '
-        'groups) and has_more. Local rows only unless include_shared is true.',
+        'pilot is saved twice. Each member is id, name and archived. Returns '
+        'every duplicate group. Local rows only unless include_shared.',
     inputSchema: JsonSchema.object(properties: {
       _includeSharedKey: JsonSchema.boolean(
           description:
               'Include rows owned by another device or account. Default false.'),
-      'limit': _listLimitSchema(50, 200),
     }),
     annotations: readOnlyAnnotations,
     callback: (args, extra) async {
       try {
-        _rejectUnknown(args, {_includeSharedKey, 'limit'}, tool: 'dedupe_crew');
-        final limit = asInt(args['limit']) ?? 50;
-        if (limit < 1) return _fail('limit must be >= 1', field: 'limit');
+        _rejectUnknown(args, {_includeSharedKey}, tool: 'dedupe_crew');
         final owner = _ownerClause(db, 'crew_members',
             includeShared: asBool(args[_includeSharedKey]) ?? false);
         final rows = db.query('SELECT id, name, archived FROM crew_members'
@@ -2521,10 +2463,8 @@ Future<void> runServer(String dbPath, {bool readonly = true}) async {
               {'name': entry.key, 'members': entry.value},
         ];
         return _ok({
-          'count': duplicates.take(limit).length,
-          'total': duplicates.length,
-          'has_more': duplicates.length > limit,
-          'duplicates': duplicates.take(limit).toList(),
+          'count': duplicates.length,
+          'duplicates': duplicates,
         });
       } on _ToolError catch (error) {
         return _failWith(error);
@@ -2543,14 +2483,13 @@ Future<void> runServer(String dbPath, {bool readonly = true}) async {
     server.registerTool(
       'create_flight',
       description:
-          'Create a flight. Times are minutes; any minute field also accepts an '
-          '_hours form (total_time_hours, day_time_hours, and so on). Sets '
-          'aircraft_id and crew_member_id automatically when the registration or '
-          'crew name matches, and names the candidates instead of guessing when '
-          'more than one does. day_order is computed for the date. Returns the '
-          'row as written as flight, with draft telling you whether it counts as '
-          'a draft, and warnings for anything odd but legal, including a route '
-          'the app would show as a description.',
+          'Create a flight. Times are minutes; total_time_hours, day_time_hours '
+          'and night_time_hours are accepted instead. Sets aircraft_id and '
+          'crew_member_id automatically when the registration or crew name '
+          'matches, and names the candidates when a match is ambiguous. '
+          'day_order is computed for the date. Returns the row as written as '
+          'flight, with draft telling you whether it counts as a draft, and '
+          'warnings for anything odd but legal.',
       inputSchema: JsonSchema.object(
         properties: {
           'id': _createIdSchema,
@@ -2600,11 +2539,12 @@ Future<void> runServer(String dbPath, {bool readonly = true}) async {
       'update_flight',
       description:
           'Update a flight by id. Only the fields provided are changed. Times '
-          'are minutes; any minute field also accepts an _hours form. '
-          'draft: true clears total_time, because a null total_time cannot be '
-          'sent. Recomputes day_order when date moves the flight to another day. '
-          'Returns the row as written as flight. The field notes and limits are '
-          'on create_flight, and field meaning is in falcon://conventions.',
+          'are minutes; total_time_hours, day_time_hours and night_time_hours '
+          'are accepted instead. draft: true clears total_time, because a null '
+          'total_time cannot be sent. Recomputes day_order when date moves the '
+          'flight to another day. Returns the row as written as flight. The '
+          'field notes and limits are on create_flight, and field meaning is '
+          'in falcon://conventions.',
       inputSchema: JsonSchema.object(
         properties: {
           'id': JsonSchema.string(),
@@ -3292,10 +3232,12 @@ Future<void> runServer(String dbPath, {bool readonly = true}) async {
                 '- day_order is the order of a flight within its date: a create takes the next free order for that day, and an update recomputes it when the date moves the flight to another day. updated_at records the last write.\n'
                 '- Flights are ordered date DESC, day_order DESC, id, the same as the app. Flights on the same date are newest-first within the day.\n'
                 '- Reads return local rows only (owner_id NULL or "local") unless include_shared is true. Paged reads return count (rows on this page), total (all matching rows), has_more and offset, and default to 20 rows with a maximum of 200; the list reads state in their own limit description how many they return and report total and has_more. A listed flight is a summary, with departure_icao and arrival_icao derived from route, unless full: true.\n'
-                '- flights.route is free text. It is a route pair only when it is exactly "AAA - BBB": two segments split on " - ", each 3 or 4 characters and equal in length, the same rule the app applies. Anything else is a description and has no direction, so departure_icao and arrival_icao are null and the route filters cannot match it. Write tools warn when a route will be stored as a description.\n'
+                '- flights.route is free text. It is a route pair only when it is exactly "AAA - BBB": two segments split on " - ", each 3 or 4 characters and equal in length, the same rule the app applies. Anything else is a description and has no direction, so departure_icao and arrival_icao are null and the route filters cannot match it. The two codes are derived, not stored: full rows and get_flight carry them, the twelve-field summary does not. Write tools warn when a route will be stored as a description.\n'
                 '- aircraft.registration is the BARE registration (e.g. country_code=VH, registration=XZO). The app displays country_code + "-" + registration.\n'
-                '- flights.aircraft_registration is the display registration (e.g. VH-XZO). Write tools accept either form and set aircraft_id from the matching aircraft row; flights.crew_members_name is matched the same way to set crew_member_id. When more than one active row matches a name or registration, the link is left unset and the warning lists the candidates, so pass aircraft_id or crew_member_id to choose. Read filters match aircraft_registration, flight_type and crew_members_name without case, and a crew filter also matches flights linked to that crew row.\n'
+                '- flights.aircraft_registration is the display registration (e.g. VH-XZO). Write tools accept either form and set aircraft_id from the matching aircraft row; flights.crew_members_name is matched the same way to set crew_member_id. When more than one active row matches a name or registration, the link is left unset and the warning lists the candidates, so pass aircraft_id or crew_member_id to choose.\n'
+                '- Read filters on flights match without case: aircraft_registration takes bare (XZO) or display (VH-XZO), flight_type takes route or details, and a crew_members_name filter also matches flights linked to that crew row. departure_icao and arrival_icao match one direction only and never a description. Airport search ranks an exact code first, then a prefix, then name or city, and ties break on ICAO.\n'
                 '- flight_type values: route, details. crew_role values: pilotInCommand, copilot, student.\n'
+                '- find_missing_times lists every row the app cannot show complete, with a reason per row: draft (no total), missing_split (both sides null), half_split (one side null), split_mismatch (the sides do not add up), or simulator_no_duration. Simulator sessions are excluded unless include_simulator is true, because the app expects them to carry a total and no split.\n'
                 '- calculate_time_mode values: utc, local, time, hobbsTacho. flight_time_format values: hhmm, decimal1, decimal2.\n'
                 '- logbook_country is "AU", "NZ", or null.\n'
                 '- total_time is the authoritative flight duration; takeoffs/landings are counts per flight row.\n'
