@@ -274,13 +274,15 @@ void main() {
 
       // #8's expiry and currency reads add 2,702 B (`list_expiries` 1,295 and
       // `currency_status` 1,405, schemas included), taking this from 11,713 B
-      // to 14,415 B. The bound is 15 KiB (15,360 B), 945 B of room, the same
-      // figure response_shaping_test uses.
+      // to 14,415 B. The bound was 15 KiB (15,360 B), 945 B of room, the same
+      // figure response_shaping_test uses. #6 adds `ask_user` at 973 B for
+      // 15,389 B, so the bound moves with it to 16 KiB (16,384 B): 995 B of
+      // room, which is that same ~1 KB.
       final readOnly =
           bytesOf(jsonEncode((await reader.send('tools/list', {}))['result']));
-      expect(readOnly, lessThan(15360),
+      expect(readOnly, lessThan(16384),
           reason: 'the read-only catalog costs $readOnly B, '
-              'and 15 KiB is 15,360 B');
+              'and 16 KiB is 16,384 B');
 
       // Issue #11 sets 22 KiB here, measured when the two flight write schemas
       // were 5.9 KB together. Validation in #15 grew them to 7.3 KB by adding
@@ -288,12 +290,14 @@ void main() {
       // figure is out of reach without deleting typed properties or that text.
       // This is the reachable number: 27,254 B before the bound, about 800 B
       // under the pre-slice 28,063 B. #8's two read tools add the same 2,702 B
-      // for 29,956 B, so the bound is 30 KiB (30,720 B): 764 B of room.
+      // for 29,956 B, so the bound was 30 KiB (30,720 B): 764 B of room. #6's
+      // `ask_user` adds its 973 B again, to 30,930 B, so the bound is 31 KiB
+      // (31,744 B): 814 B of room, the same guard at 800 B instead of 764.
       final writeMode =
           bytesOf(jsonEncode((await writer.send('tools/list', {}))['result']));
-      expect(writeMode, lessThan(30720),
+      expect(writeMode, lessThan(31744),
           reason: 'the write-mode catalog costs $writeMode B, '
-              'and 30 KiB is 30,720 B');
+              'and 31 KiB is 31,744 B');
     });
   });
 

@@ -1,7 +1,9 @@
+export 'src/ask_user.dart';
 export 'src/config.dart';
 export 'src/currency.dart';
 export 'src/db.dart';
 export 'src/expiry.dart';
+export 'src/questions.dart';
 export 'src/route.dart';
 export 'src/server.dart';
 export 'src/sqlite_loader.dart';
