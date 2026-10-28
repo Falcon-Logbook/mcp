@@ -274,26 +274,29 @@ void main() {
 
       // #8's expiry and currency reads add 2,702 B (`list_expiries` 1,295 and
       // `currency_status` 1,405, schemas included), taking this from 11,713 B
-      // to 14,415 B. The bound is 15 KiB (15,360 B), 945 B of room, the same
-      // figure response_shaping_test uses.
+      // to 14,415 B. Slice 2 adds 2,344 B (`entity_totals` 1,573, `get_settings`
+      // 769, plus the two list separators), for 16,759 B. The bound is that
+      // measurement and nothing more: a description that grows fails here, so
+      // the figure has to be re-measured and raised on purpose rather than sit
+      // inside slack nobody argued for.
       final readOnly =
           bytesOf(jsonEncode((await reader.send('tools/list', {}))['result']));
-      expect(readOnly, lessThan(15360),
+      expect(readOnly, lessThanOrEqualTo(16759),
           reason: 'the read-only catalog costs $readOnly B, '
-              'and 15 KiB is 15,360 B');
+              'and 16,759 B is the measured figure');
 
       // Issue #11 sets 22 KiB here, measured when the two flight write schemas
       // were 5.9 KB together. Validation in #15 grew them to 7.3 KB by adding
       // the bounds, formats and draft rule that the write tests pin, so the
       // figure is out of reach without deleting typed properties or that text.
-      // This is the reachable number: 27,254 B before the bound, about 800 B
-      // under the pre-slice 28,063 B. #8's two read tools add the same 2,702 B
-      // for 29,956 B, so the bound is 30 KiB (30,720 B): 764 B of room.
+      // This is the reachable number: the read tools are in both catalogs, so
+      // slice 2's 2,344 B take this from 29,956 B to 32,300 B, and the bound is
+      // again the measurement itself.
       final writeMode =
           bytesOf(jsonEncode((await writer.send('tools/list', {}))['result']));
-      expect(writeMode, lessThan(30720),
+      expect(writeMode, lessThanOrEqualTo(32300),
           reason: 'the write-mode catalog costs $writeMode B, '
-              'and 30 KiB is 30,720 B');
+              'and 32,300 B is the measured figure');
     });
   });
 
@@ -567,6 +570,8 @@ void main() {
           ('list_aircraft', <String, dynamic>{}),
           ('list_expiries', <String, dynamic>{}),
           ('currency_status', <String, dynamic>{}),
+          ('entity_totals', {'type': 'aircraft'}),
+          ('get_settings', {'table': 'app_settings'}),
           ('get_schema', <String, dynamic>{}),
           ('db_info', <String, dynamic>{}),
         ]) {

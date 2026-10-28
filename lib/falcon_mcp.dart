@@ -4,4 +4,5 @@ export 'src/db.dart';
 export 'src/expiry.dart';
 export 'src/server.dart';
 export 'src/sqlite_loader.dart';
+export 'src/totals.dart';
 export 'src/util.dart';
