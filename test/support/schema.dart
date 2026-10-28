@@ -15,6 +15,10 @@ const List<String> fixtureStatements = [
   'CREATE TABLE "crew_members" ("id" TEXT NOT NULL, "name" TEXT NOT NULL, "first_name" TEXT NOT NULL, "last_name" TEXT NOT NULL, "note" TEXT NULL, "archived" INTEGER NOT NULL DEFAULT 0 CHECK ("archived" IN (0, 1)), "created_at" INTEGER NOT NULL DEFAULT (CAST(strftime(\'%s\', CURRENT_TIMESTAMP) AS INTEGER)), "owner_id" TEXT NULL, "updated_at" INTEGER NULL, PRIMARY KEY ("id"))',
   // custom_airports
   'CREATE TABLE "custom_airports" ("id" TEXT NOT NULL, "icao" TEXT NULL, "iata" TEXT NULL, "name" TEXT NOT NULL, "city" TEXT NULL, "subd" TEXT NULL, "country" TEXT NULL, "lat" REAL NULL, "lon" REAL NULL, "elevation" INTEGER NULL, "tz" TEXT NULL, "owner_id" TEXT NULL, "created_at" INTEGER NULL, "updated_at" INTEGER NULL, PRIMARY KEY ("id"))',
+  // expiries
+  'CREATE TABLE "expiries" ("id" TEXT NOT NULL, "name" TEXT NOT NULL, "due_date" INTEGER NOT NULL, "created_at" INTEGER NOT NULL DEFAULT (CAST(strftime(\'%s\', CURRENT_TIMESTAMP) AS INTEGER)), "owner_id" TEXT NULL, "updated_at" INTEGER NULL, PRIMARY KEY ("id"))',
+  // expiry_settings
+  'CREATE TABLE "expiry_settings" ("id" TEXT NOT NULL, "green_threshold" INTEGER NOT NULL DEFAULT 90, "orange_threshold" INTEGER NOT NULL DEFAULT 30, "show_sidebar_badge" INTEGER NOT NULL DEFAULT 1 CHECK ("show_sidebar_badge" IN (0, 1)), "owner_id" TEXT NULL, "created_at" INTEGER NULL, "updated_at" INTEGER NULL, PRIMARY KEY ("id"))',
   // flights
   'CREATE TABLE "flights" ("id" TEXT NOT NULL, "date" INTEGER NOT NULL, "day_order" INTEGER NOT NULL DEFAULT 0, "aircraft_id" TEXT NULL REFERENCES aircraft (id) ON DELETE SET NULL, "flight_type" TEXT NULL, "crew_role" TEXT NULL, "crew_member_id" TEXT NULL REFERENCES crew_members (id) ON DELETE SET NULL, "crew_members_name" TEXT NULL, "route" TEXT NULL, "route_id" INTEGER NULL, "flight_number" TEXT NULL, "aircraft_registration" TEXT NULL, "total_time" INTEGER NULL, "day_time" INTEGER NULL, "night_time" INTEGER NULL, "calc_time_mode" TEXT NULL, "time_start" TEXT NULL, "time_stop" TEXT NULL, "hobbs_start" REAL NULL, "hobbs_stop" REAL NULL, "actual_instrument" INTEGER NULL, "simulated_instrument" INTEGER NULL, "ground_instrument" INTEGER NULL, "approaches2d" TEXT NULL, "approaches3d" TEXT NULL, "approach_details" TEXT NULL, "takeoffs" INTEGER NULL, "landings" INTEGER NULL, "takeoff_day" INTEGER NULL, "takeoff_night" INTEGER NULL, "landing_day" INTEGER NULL, "landing_night" INTEGER NULL, "water_takeoffs" INTEGER NULL, "water_landings" INTEGER NULL, "custom_columns" TEXT NULL, "is_simulator" INTEGER NOT NULL DEFAULT 0 CHECK ("is_simulator" IN (0, 1)), "is_ifr" INTEGER NULL CHECK ("is_ifr" IN (0, 1)), "icus_day_time" INTEGER NULL, "icus_night_time" INTEGER NULL, "created_at" INTEGER NOT NULL DEFAULT (CAST(strftime(\'%s\', CURRENT_TIMESTAMP) AS INTEGER)), "owner_id" TEXT NULL, "updated_at" INTEGER NULL, PRIMARY KEY ("id"))',
   // flights_settings
@@ -29,6 +33,8 @@ const List<String> fixtureStatements = [
   'CREATE TABLE "sync_deletions" ("id" INTEGER NOT NULL PRIMARY KEY AUTOINCREMENT, "sync_table" TEXT NOT NULL, "row_id" TEXT NOT NULL, "provider" TEXT NOT NULL, "created_at" INTEGER NOT NULL)',
   // sync_state
   'CREATE TABLE "sync_state" ("sync_table" TEXT NOT NULL, "provider" TEXT NOT NULL, "last_push_at" TEXT NULL, "last_pull_at" TEXT NULL, "last_push_count" INTEGER NOT NULL DEFAULT 0, "last_pull_count" INTEGER NOT NULL DEFAULT 0, PRIMARY KEY ("sync_table", "provider"))',
+  // user_currency
+  'CREATE TABLE "user_currency" ("id" TEXT NOT NULL, "title" TEXT NOT NULL, "metric" TEXT NOT NULL, "period" TEXT NOT NULL, "threshold" REAL NOT NULL, "sort_order" INTEGER NOT NULL, "is_active" INTEGER NOT NULL DEFAULT 1 CHECK ("is_active" IN (0, 1)), "type" TEXT NOT NULL DEFAULT \'limit\', "owner_id" TEXT NULL, "created_at" INTEGER NULL, "updated_at" INTEGER NULL, PRIMARY KEY ("id"))',
   'CREATE INDEX idx_crew_name ON crew_members (name)',
   'CREATE INDEX idx_crew_first_name ON crew_members (first_name)',
   'CREATE INDEX idx_crew_last_name ON crew_members (last_name)',
@@ -46,6 +52,7 @@ const List<String> fixtureStatements = [
   'CREATE INDEX idx_flights_date_aircraft ON flights (date, aircraft_id)',
   'CREATE INDEX idx_flights_owner_updated ON flights (owner_id, updated_at)',
   'CREATE INDEX idx_flights_route ON flights (route_id)',
+  'CREATE INDEX idx_expiries_due_date ON expiries (due_date)',
   'CREATE INDEX airports_name_idx ON airports (name)',
   'CREATE INDEX airports_country_idx ON airports (country)',
   'CREATE INDEX airports_iata_idx ON airports (iata)',
