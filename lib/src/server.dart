@@ -1861,15 +1861,16 @@ Future<void> runServer(String dbPath, {bool readonly = true}) async {
   server.registerTool(
     'entity_totals',
     description:
-        'Per-entity totals: minutes and the number of flights per aircraft, crew '
-        'member, aircraft type or registration, rather than the flight rows '
-        'behind them. Grouping follows the app: aircraft and crew group on the '
-        'link, type on the linked aircraft\'s type, registration on the flight\'s '
-        'registration text, so a flight with no aircraft link counts under '
-        'registration only. Drafts have no total time, so they are in neither '
-        'number, and an entity with no complete flight is not listed: flights '
-        'here counts complete flights, unlike logbook_stats where it counts every '
-        'row. Simulator flights are included unless include_simulator is false. '
+        'Per-entity totals: minutes and the number of complete flights per '
+        'aircraft, crew member, aircraft type or registration, rather than the '
+        'flight rows behind them. Grouping follows the app: aircraft and crew '
+        'group on the link, type on the linked aircraft\'s type, registration on '
+        'the flight\'s registration text, so a flight with no aircraft link '
+        'counts under registration only. Drafts have no total time, so they are '
+        'in neither number, and an entity with no complete flight is not listed: '
+        'flights_complete is the same number logbook_stats calls by that name, '
+        'where its flights counts every row including drafts. Simulator flights '
+        'are included unless include_simulator is false. '
         'Sorted by minutes unless sort says otherwise, and total is the number of '
         'groups before limit. Local rows only unless include_shared is true.',
     inputSchema: JsonSchema.object(properties: {
@@ -1877,7 +1878,7 @@ Future<void> runServer(String dbPath, {bool readonly = true}) async {
           description:
               'What to group by: ${entityTotalDimensions.join(', ')}.'),
       'sort': JsonSchema.string(
-          description: 'minutes and flights order descending, label '
+          description: 'minutes and flights_complete order descending, label '
               'alphabetically. Default $defaultEntityTotalSort.'),
       'limit': _entityTotalLimitSchema,
       'include_simulator': JsonSchema.boolean(
@@ -3022,7 +3023,7 @@ Future<void> runServer(String dbPath, {bool readonly = true}) async {
                 '- is_simulator and is_ifr are stored as 0/1.\n'
                 '- Expiry status is computed at read time, never stored: whole local days from today to due_date, below the orange threshold is red (which includes today and every overdue day), below the green threshold is orange, green above it. Thresholds come from expiry_settings (a local row first, then the newest), or 90 and 30 days when that table has no row. list_expiries includes overdue rows by default.\n'
                 '- Currency thresholds are HOURS for the four time metrics, because the app divides those values by 60, and counts for the other four. is_exceeded means the rule needs attention: for a requirement that is being below the threshold, for a limit it is reaching it. currency_status reproduces the app\'s currency page, which applies no owner filter and counts drafts as flights, so its numbers can mix owners on a synced logbook.\n'
-                '- entity_totals.flights counts COMPLETE flights, because it counts the rows its minutes come from; logbook_stats.flights counts every row including drafts. Aircraft and type group on flights.aircraft_id and crew groups on flights.crew_member_id, so a flight that only carries registration text is in the registration group alone.\n'
+                '- entity_totals.flights_complete counts COMPLETE flights, because it counts the rows its minutes come from; logbook_stats.flights counts every row including drafts, and its flights_complete is the same number. Aircraft and type group on flights.aircraft_id and crew groups on flights.crew_member_id, so a flight that only carries registration text is in the registration group alone.\n'
                 '- Deleting a flight, aircraft, crew member or custom airport also records a sync tombstone when a Postgres sync provider has been used, so the deletion propagates.\n'
                 '- A field means the same thing wherever it appears: create_flight and update_flight take the same flight fields with the same types and limits, the per-field notes are written once on create_flight, and what a field means is written here.\n'
                 '- Use get_schema for table names and their column counts; pass table for one table\'s columns, and detail: "full" for its default and pk columns too.\n'

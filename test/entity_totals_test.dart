@@ -49,8 +49,8 @@ void main() {
   List<Map<String, dynamic>> entitiesOf(Map<String, dynamic> payload) =>
       (payload['entities'] as List).cast<Map<String, dynamic>>();
 
-  /// The totals as `label -> (minutes, flights)`, in the order returned, so a
-  /// test can assert both the numbers and the ordering.
+  /// The totals as `label -> (minutes, flights_complete)`, in the order
+  /// returned, so a test can assert both the numbers and the ordering.
   List<(String, int, int)> totals(
     Map<String, dynamic> payload,
     String key,
@@ -60,7 +60,7 @@ void main() {
           (
             '${entity[key]}',
             entity['minutes'] as int,
-            entity['flights'] as int,
+            entity['flights_complete'] as int,
           ),
       ];
 
@@ -90,6 +90,9 @@ void main() {
     expect(first['registration'], 'VH-DEF',
         reason: 'the display registration, country code and tail joined');
     expect(first['aircraft_type'], 'B738');
+    expect(first.containsKey('flights'), isFalse,
+        reason: 'flights means every row in logbook_stats, so the complete '
+            'count is named flights_complete here too');
   });
 
   test('crew totals count only flights with a crew link', () async {
@@ -138,8 +141,8 @@ void main() {
   test('sort orders by the other number or by label', () async {
     final server = await start();
 
-    final byFlights = payloadOf(await server
-        .call('entity_totals', {'type': 'registration', 'sort': 'flights'}));
+    final byFlights = payloadOf(await server.call(
+        'entity_totals', {'type': 'registration', 'sort': 'flights_complete'}));
     expect(totals(byFlights, 'aircraft_registration'), [
       // Two flights each, then the key breaks the tie alphabetically.
       ('VH-ABC', 75, 2),
@@ -226,8 +229,7 @@ void main() {
     ]);
   });
 
-  test('flights counts complete flights, unlike logbook_stats.flights',
-      () async {
+  test('flights_complete is the same number logbook_stats reports', () async {
     final server = await start();
     final stats = payloadOf(await server.call('logbook_stats', {}));
 
@@ -239,10 +241,10 @@ void main() {
     final aircraft =
         payloadOf(await server.call('entity_totals', {'type': 'aircraft'}));
     final complete = entitiesOf(aircraft)
-        .fold<int>(0, (sum, e) => sum + (e['flights'] as int));
+        .fold<int>(0, (sum, e) => sum + (e['flights_complete'] as int));
     expect(complete, 6,
         reason: 'the two drafts and the unlinked flight are in no aircraft '
-            'group, so the sum is lower than flights_complete');
+            'group, so the sum is lower than the logbook total');
   });
 
   test('an empty logbook is an empty list, not an error', () async {

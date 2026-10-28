@@ -15,7 +15,7 @@ const List<String> entityTotalDimensions = [
 /// The orderings `entity_totals` accepts: the two numbers it reports, or the
 /// label. Both numbers order descending and the label alphabetically, so the
 /// same logbook always answers in the same order.
-const List<String> entityTotalSorts = ['minutes', 'flights', 'label'];
+const List<String> entityTotalSorts = ['minutes', 'flights_complete', 'label'];
 
 /// The default ordering: the minutes sum, the unit every other duration in this
 /// server is reported in.
@@ -115,6 +115,9 @@ final Map<String, _Dimension> _dimensions = {
 /// has a total time, which is the filter `getFlightTimeTotalsForAircraft`,
 /// `getFlightCountForAircraft` and `_getGroupedFlightCounts` all apply, so a
 /// draft appears in neither and an entity with no complete flight is not listed.
+/// The count is named `flights_complete` because that is what it is, the same
+/// key `logbook_stats` uses for the same number; a bare `flights` there counts
+/// every row including drafts.
 ///
 /// [ownerClause] is the caller's local-rows clause, written against the `flights`
 /// table and empty when shared rows are wanted. The app applies it to every one
@@ -149,7 +152,7 @@ final Map<String, _Dimension> _dimensions = {
       'GROUP BY ${spec.groupBy}';
 
   final order = switch (sort) {
-    'flights' => 'flight_count DESC, ${spec.key}',
+    'flights_complete' => 'flight_count DESC, ${spec.key}',
     'label' => spec.key,
     _ => 'minutes DESC, ${spec.key}',
   };
@@ -166,7 +169,7 @@ final Map<String, _Dimension> _dimensions = {
         {
           ...spec.row(row),
           'minutes': row['minutes'],
-          'flights': row['flight_count'],
+          'flights_complete': row['flight_count'],
         },
     ],
     total: total,
