@@ -10,6 +10,11 @@ final RegExp _dateOnly = RegExp(r'^(\d{4})-(\d{1,2})-(\d{1,2})$');
 /// stores. Dates are interpreted in local time, matching the app: the `date`
 /// column holds local midnight of the flight date.
 ///
+/// Timezone independence is deliberately not handled here: mapping a stored
+/// local midnight back to the calendar date it represents needs the zone the
+/// app wrote in, so the follow-up slice tracked in issue #9 (#4) adds a declared
+/// logbook zone (FALCON_TZ or a stored setting) before this changes.
+///
 /// [endOfDay] returns 23:59:59 of the same local day, useful for inclusive
 /// upper bounds.
 int? dateToEpoch(Object? value, {bool endOfDay = false}) {
@@ -140,6 +145,19 @@ String epochToIso(int seconds) =>
 /// Current time as unix epoch seconds, matching the app's `created_at`/
 /// `updated_at` columns.
 int nowEpochSeconds() => DateTime.now().millisecondsSinceEpoch ~/ 1000;
+
+/// Sync provider name the app's sync engine used before it was renamed.
+const String legacyPgSyncProvider = 'selfHostPg';
+
+/// The one provider name sync state and tombstones are written under now.
+const String canonicalPgSyncProvider = 'postgres';
+
+/// Maps a legacy sync provider name to its canonical form, mirroring the
+/// app's `normalizeSyncProvider`. The app's push reads tombstones with
+/// `WHERE provider = ?`, so a tombstone stored under the legacy name would be
+/// invisible to a push running as the canonical one.
+String normalizeSyncProvider(String provider) =>
+    provider == legacyPgSyncProvider ? canonicalPgSyncProvider : provider;
 
 /// The app's ceiling for a flight time column, in minutes (8760 hours), and for
 /// a takeoff/landing count. Mirrors `AppConstants.maxFlightTimeMinutes` and

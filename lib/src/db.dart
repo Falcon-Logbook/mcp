@@ -19,8 +19,22 @@ const Set<String> _dateColumns = {
 };
 
 /// Integer 0/1 columns whose name is not caught by the prefix rules below.
+///
+/// `archived` and the aircraft flags are booleans in the app's schema and in
+/// every question asked of them, so returning 0/1 next to `is_ifr: false` makes
+/// an agent compare two types. The whole column name is the flag, so this is a
+/// list rather than a heuristic.
 const Set<String> _boolColumns = {
   'minimum_supported',
+  'archived',
+  'multi_engine',
+  'ifr',
+  'complex',
+  'pressurised',
+  'tailwheel',
+  'simulator',
+  'helicopter',
+  'float_plane',
 };
 
 /// Thrown for problems the caller can fix (missing file, wrong schema

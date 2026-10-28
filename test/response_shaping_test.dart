@@ -200,8 +200,14 @@ void main() {
             as List;
     final row = (full['flights'] as List).single as Map;
 
-    expect(row, hasLength(columnCount),
-        reason: 'full is the whole row, not the summary plus a few fields');
+    // #9 derives departure_icao and arrival_icao from route on full rows and
+    // get_flight, so they are two keys past the stored columns. The summary
+    // stays the twelve stored fields.
+    expect(row, hasLength(columnCount + 2),
+        reason: 'full is the whole row plus the two derived route codes');
+    expect(row.keys, containsAll(['departure_icao', 'arrival_icao']));
+    expect(row['departure_icao'], 'YSBK',
+        reason: 'the route parses as a pair, so the codes are filled');
     expect(row['id'], (rows.single as Map)['id']);
     for (final key in ['created_at', 'custom_columns', 'hobbs_start']) {
       expect(row.keys, contains(key));
@@ -213,7 +219,8 @@ void main() {
     expect(row, detail, reason: 'full and get_flight agree on the row');
   });
 
-  test('search_flights and find_missing_times are slim unless full', () async {
+  test('search_flights is slim unless full, find_missing_times always lean',
+      () async {
     seedLogbook();
     final server = await start();
     final columnCount = withFixtureDb(
@@ -230,18 +237,23 @@ void main() {
     final searchedFull = payloadOf(await server
         .call('search_flights', {'query': 'NZQN', 'limit': 2, 'full': true}));
     for (final row in searchedFull['flights'] as List) {
-      expect(row as Map, hasLength(columnCount));
+      // Two keys past the stored columns: the derived route codes (#9).
+      expect(row as Map, hasLength(columnCount + 2));
     }
 
+    // #9 turns find_missing_times into a fixed lean projection with a reason
+    // per row, so there is no full form to ask for: the row is only the fields
+    // the reason needs.
     final missing = payloadOf(await server.call('find_missing_times', {}));
     expect(missing['count'], 1);
-    expect(((missing['flights'] as List).single as Map).keys.toSet(), slimKeys);
-    expect((missing['flights'] as List).single, containsPair('id', 'fl-draft'));
-
-    final missingFull =
-        payloadOf(await server.call('find_missing_times', {'full': true}));
-    expect(
-        (missingFull['flights'] as List).single as Map, hasLength(columnCount));
+    final missingRow = (missing['flights'] as List).single as Map;
+    expect(missingRow.keys.toSet(), {
+      'id', 'date', 'route', 'total_time', 'day_time', 'night_time',
+      'is_simulator', 'reason',
+    });
+    expect(missingRow, containsPair('id', 'fl-draft'));
+    expect(missingRow, containsPair('reason', 'draft'),
+        reason: 'a null total is a draft, said in words');
   });
 
   test('pages default to 20 rows and refuse more than 200', () async {

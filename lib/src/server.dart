@@ -8,6 +8,7 @@ import 'config.dart';
 import 'currency.dart';
 import 'db.dart';
 import 'expiry.dart';
+import 'route.dart';
 import 'totals.dart';
 import 'util.dart';
 
@@ -212,7 +213,9 @@ const Set<String> _minuteColumns = {
 };
 
 /// Time fields that also accept an `_hours` argument, converted once at the
-/// boundary. The column itself keeps its minutes name.
+/// boundary. The column itself keeps its minutes name, so a caller can pass
+/// `1.5` hours without doing the arithmetic that turns a 1.5 hour flight into
+/// 1 minute.
 const Map<String, String> _hoursAliases = {
   'total_time': 'total_time_hours',
   'day_time': 'day_time_hours',
@@ -231,7 +234,8 @@ const Map<String, String> _units = {
 /// The columns a flight summary carries: what was flown, when, in what, with
 /// whom and how long. Every key is present even when the value is null, so a
 /// missing reading reads as "not recorded" rather than as a key the caller has
-/// to know about.
+/// to know about. Exactly these twelve: the summary is a cost contract, and
+/// `route` already carries the direction a summary answers.
 const List<String> _slimFlightKeys = [
   'id',
   'date',
@@ -248,17 +252,35 @@ const List<String> _slimFlightKeys = [
 ];
 
 /// [row] as a flight read returns it: the twelve-field summary, or every column
-/// when [full]. A column the live database does not have stays null rather than
-/// disappearing from the row.
+/// plus the two derived route codes when [full].
+///
+/// `departure_icao` and `arrival_icao` are parsed from `route`, never stored:
+/// they say which way the flight went and stay null when the route is a
+/// description, the same call the app makes. They are on `full` rows and
+/// `get_flight` only, not the summary, because two mostly-null keys on every
+/// listed row cost more than the raw route text they restate.
 Map<String, dynamic> _flightView(Map<String, dynamic> row,
-        {bool full = false}) =>
-    full ? row : {for (final key in _slimFlightKeys) key: row[key]};
+    {bool full = false}) {
+  if (full) return {...row, ..._routeCodes(asText(row['route']))};
+  return {for (final key in _slimFlightKeys) key: row[key]};
+}
+
+/// The direction a flight's free-text route describes, as the two read keys.
+/// Both are null when the route is a description, which is what the app shows
+/// as text.
+Map<String, dynamic> _routeCodes(String? route) {
+  final parsed = parseRoute(route);
+  return {
+    'departure_icao': parsed?.departure,
+    'arrival_icao': parsed?.arrival,
+  };
+}
 
 /// The `full` argument on the paged flight reads. The cost is stated here
 /// because this is the argument a caller weighs.
 JsonSchema get _fullFlightSchema => JsonSchema.boolean(
-    description: 'Every column instead of the twelve-field summary, at about '
-        'four times the tokens.');
+    description: 'Every column instead of the summary, at about four times the '
+        'tokens.');
 
 /// The `limit` argument on the two paged flight reads, `list_flights` and
 /// `search_flights`: 20 rows by default, 200 at most, so the page size is honest
@@ -305,6 +327,24 @@ const String _includeSharedKey = 'include_shared';
 const Set<String> _flightFilterKeys = {
   ..._dateFilterKeys,
   _includeSharedKey,
+};
+
+/// The arguments that narrow a flight read by what or who was on it, shared by
+/// `list_flights` and `search_flights` so the two accept the same filters.
+const Set<String> _flightNarrowingKeys = {
+  'aircraft_registration',
+  'flight_type',
+  'crew_members_name',
+  'departure_icao',
+  'arrival_icao',
+};
+
+/// Every argument `list_flights` and `search_flights` accept as a filter: the
+/// shared window and owner arguments plus the ones that narrow by aircraft,
+/// type, crew or route direction.
+const Set<String> _flightPageFilterKeys = {
+  ..._flightFilterKeys,
+  ..._flightNarrowingKeys,
 };
 
 // ============================================================
@@ -668,6 +708,19 @@ _DateWindow _flightDateFilter(Map<String, dynamic> args,
 Map<String, dynamic> _rangeOf(_DateWindow window) =>
     {'from': window.from, 'to': window.to};
 
+/// Schema properties for the narrowing filters, shared by `list_flights` and
+/// `search_flights`. Each one matches how the pilot writes it rather than how it
+/// happens to be stored, because a filter that returns nothing teaches a caller
+/// that there is no such flight.
+Map<String, JsonSchema> _flightNarrowingProperties() => {
+      'aircraft_registration': JsonSchema.string(
+          description: 'Bare (XZO) or display (VH-XZO).'),
+      'flight_type': JsonSchema.string(),
+      'crew_members_name': JsonSchema.string(),
+      'departure_icao': JsonSchema.string(),
+      'arrival_icao': JsonSchema.string(),
+    };
+
 /// ` WHERE a AND b`, or nothing when [where] is empty.
 String _whereSql(List<String> where) =>
     where.isEmpty ? '' : ' WHERE ${where.join(' AND ')}';
@@ -695,6 +748,127 @@ String _ownerClause(FalconDb db, String table,
       db.query('SELECT COUNT(*) AS total FROM $fromWhere', List.of(params));
   final total = rows.isEmpty ? 0 : asInt(rows.first['total']) ?? 0;
   return (total: total, hasMore: offset + count < total);
+}
+
+/// `?, ?, ?` for [count] parameters, for the `IN` lists an alias filter builds.
+String _marks(int count) => List.filled(count, '?').join(', ');
+
+/// The WHERE terms for the narrowing filters on a flight read, normalised so a
+/// near miss matches instead of quietly returning nothing.
+///
+/// `aircraft_registration` accepts either form the pilot writes, `XZO` or
+/// `VH-XZO`, in any case, and additionally matches a flight linked to the same
+/// aircraft when its stored text has drifted. `flight_type` compares without
+/// case. `crew_members_name` compares without case and also matches a flight
+/// whose `crew_member_id` resolves to a crew row of that name, because the
+/// denormalised name can be null while the link is right. `departure_icao` and
+/// `arrival_icao` match direction, never the whole string.
+({List<String> where, List<Object?> params}) _flightNarrowing(
+    FalconDb db, Map<String, dynamic> args) {
+  final where = <String>[];
+  final params = <Object?>[];
+
+  final registration = asText(args['aircraft_registration']);
+  if (registration != null) {
+    final matches = _aircraftCandidates(db, registration);
+    final displays = {
+      _normalizeKey(registration),
+      for (final match in matches) _normalizeKey(match.display),
+    };
+    final ids = [for (final match in matches) match.id];
+    final terms = <String>[
+      "upper(replace(replace(coalesce(aircraft_registration, ''), '-', ''), "
+          "' ', '')) IN (${_marks(displays.length)})",
+      if (ids.isNotEmpty) 'aircraft_id IN (${_marks(ids.length)})',
+    ];
+    where.add('(${terms.join(' OR ')})');
+    params.addAll(displays);
+    params.addAll(ids);
+  }
+
+  final type = asText(args['flight_type']);
+  if (type != null) {
+    where.add("lower(coalesce(flight_type, '')) = lower(?)");
+    params.add(type);
+  }
+
+  final crew = asText(args['crew_members_name']);
+  if (crew != null) {
+    final ids = _crewIdsNamed(db, crew);
+    final terms = <String>[
+      "lower(coalesce(crew_members_name, '')) = lower(?)",
+      if (ids.isNotEmpty) 'crew_member_id IN (${_marks(ids.length)})',
+    ];
+    where.add('(${terms.join(' OR ')})');
+    params.add(crew);
+    params.addAll(ids);
+  }
+
+  for (final direction in const ['departure_icao', 'arrival_icao']) {
+    final code = asText(args[direction]);
+    if (code == null) continue;
+    where.add(_routeFilterSql(direction));
+    params.add(code.toUpperCase());
+  }
+  return (where: where, params: params);
+}
+
+/// The departure or arrival segment of a route, as SQL: `parseRoute`'s rule in
+/// a form the database can apply, so a filter and the derived read key agree
+/// and `total`/`has_more` count the same rows the page holds.
+const String _routeDepartureSql =
+    "trim(substr(route, 1, instr(route, ' - ') - 1))";
+const String _routeArrivalSql = "trim(substr(route, instr(route, ' - ') + 3))";
+
+/// A WHERE term selecting rows whose route parses as an `AAA - BBB` pair and
+/// whose [direction] segment equals the next parameter, compared without case.
+///
+/// The guards are the parser: one separator, a departure of 3 or 4 characters,
+/// and an arrival the same length. A description, a bare code or a route with
+/// two separators matches neither direction.
+String _routeFilterSql(String direction) {
+  final segment =
+      direction == 'departure_icao' ? _routeDepartureSql : _routeArrivalSql;
+  return "route IS NOT NULL "
+      "AND instr(substr(route, instr(route, ' - ') + 3), ' - ') = 0 "
+      'AND length($_routeDepartureSql) BETWEEN 3 AND 4 '
+      'AND length($_routeDepartureSql) = length($_routeArrivalSql) '
+      'AND UPPER($segment) = ?';
+}
+
+/// The match and rank SQL for one airport search.
+///
+/// The WHERE keeps every airport the text touches. The ORDER BY puts the one
+/// the caller most likely means first: an exact code, then a prefix of one, then
+/// a name or city that contains the text. ICAO breaks every tie, so the same
+/// query returns the same order every time.
+///
+/// Both parameter lists are separate because the WHERE terms bind before the
+/// ORDER BY terms; the caller appends them in that order.
+({
+  String where,
+  List<Object?> whereParams,
+  String order,
+  List<Object?> orderParams,
+}) _airportRank(String query) {
+  final escaped = escapeLike(query.toUpperCase());
+  final prefix = '$escaped%';
+  final contains = '%$escaped%';
+  return (
+    where: "(upper(icao) LIKE ? ESCAPE '\\' "
+        "OR upper(coalesce(iata, '')) LIKE ? ESCAPE '\\' "
+        "OR upper(name) LIKE ? ESCAPE '\\' "
+        "OR upper(coalesce(city, '')) LIKE ? ESCAPE '\\')",
+    whereParams: [contains, contains, contains, contains],
+    order: 'CASE '
+        'WHEN upper(icao) = ? THEN 0 '
+        "WHEN upper(coalesce(iata, '')) = ? THEN 1 "
+        "WHEN upper(icao) LIKE ? ESCAPE '\\' THEN 2 "
+        "WHEN upper(coalesce(iata, '')) LIKE ? ESCAPE '\\' THEN 3 "
+        "WHEN upper(name) LIKE ? ESCAPE '\\' THEN 4 "
+        'ELSE 5 END',
+    orderParams: [escaped, escaped, prefix, prefix, contains],
+  );
 }
 
 // ============================================================
@@ -759,6 +933,23 @@ CallToolResult _runWrite(
 String _normalizeKey(String value) =>
     value.toUpperCase().replaceAll(RegExp(r'[^A-Z0-9]'), '');
 
+/// The rows that tie for a name or registration, as one short line for a
+/// warning: id, display text, and for aircraft the country and archived flag.
+/// Capped at four, because a warning must not become the response.
+String _candidatesText(List<Map<String, dynamic>> candidates) {
+  final shown = [
+    for (final candidate in candidates.take(4))
+      [
+        candidate['id'],
+        candidate['registration'] ?? candidate['name'],
+        if (candidate['country_code'] != null) candidate['country_code'],
+        if (candidate['archived'] == true) 'archived',
+      ].join(' '),
+  ];
+  final rest = candidates.length - shown.length;
+  return '${shown.join('; ')}${rest > 0 ? '; and $rest more' : ''}';
+}
+
 /// A `*_date` column's value as a local [DateTime]. [FalconDb] renders an epoch
 /// `*_date` column as a local ISO string, so that is what a read sees; an
 /// integer is accepted too, for a query that bypasses the mapper.
@@ -774,47 +965,126 @@ DateTime? _localDate(Object? value) => switch (value) {
 String _displayRegistration(String? countryCode, String registration) =>
     displayRegistration(countryCode, registration) ?? registration;
 
-/// Finds the aircraft matching a registration written either bare (`XZO`) or
-/// in display form (`VH-XZO`).
-({String id, String display})? _matchAircraft(
-    FalconDb db, String registration) {
+/// Every aircraft whose stored registration or display form normalises to the
+/// same key as [registration], active rows only when any are active.
+///
+/// [registration] may be written bare (`XZO`) or in display form (`VH-XZO`), in
+/// any case.
+List<({String id, String display, String countryCode, bool archived})>
+    _aircraftCandidates(FalconDb db, String registration) {
   final wanted = _normalizeKey(registration);
-  if (wanted.isEmpty) return null;
+  if (wanted.isEmpty) return const [];
   final rows = db.query(
-    'SELECT id, country_code, registration, archived FROM aircraft ORDER BY archived ASC',
+    'SELECT id, country_code, registration, archived FROM aircraft '
+    'ORDER BY archived ASC, registration',
   );
+  final matches =
+      <({String id, String display, String countryCode, bool archived})>[];
   for (final row in rows) {
-    final reg = row['registration'] as String? ?? '';
-    if (reg.isEmpty) continue;
-    final display = _displayRegistration(row['country_code'] as String?, reg);
+    final reg = asText(row['registration']);
+    if (reg == null) continue;
+    final countryCode = asText(row['country_code']) ?? '';
+    final display = _displayRegistration(countryCode, reg);
     if (_normalizeKey(reg) == wanted || _normalizeKey(display) == wanted) {
-      return (id: row['id'] as String, display: display);
+      matches.add((
+        id: row['id'] as String,
+        display: display,
+        countryCode: countryCode,
+        archived: asBool(row['archived']) ?? false,
+      ));
     }
   }
-  return null;
+  return _activeOr(matches, (match) => match.archived);
 }
 
-/// Finds the crew member row matching a display name, preferring active ones.
-String? _matchCrewMemberId(FalconDb db, String name) {
+/// Every crew member whose name, first-last or last-first form normalises to the
+/// same key as [name], active rows only when any are active.
+List<({String id, String name, bool archived})> _crewCandidates(
+    FalconDb db, String name) {
   final wanted = _normalizeKey(name);
-  if (wanted.isEmpty) return null;
+  if (wanted.isEmpty) return const [];
   final rows = db.query(
-    'SELECT id, name, first_name, last_name, archived FROM crew_members ORDER BY archived ASC',
+    'SELECT id, name, first_name, last_name, archived FROM crew_members '
+    'ORDER BY archived ASC, name',
   );
+  final matches = <({String id, String name, bool archived})>[];
   for (final row in rows) {
-    final candidates = <String>[
+    final forms = <String>[
       row['name'] as String? ?? '',
       '${row['first_name'] ?? ''} ${row['last_name'] ?? ''}',
       '${row['last_name'] ?? ''} ${row['first_name'] ?? ''}',
     ];
-    for (final candidate in candidates) {
-      if (candidate.trim().isNotEmpty && _normalizeKey(candidate) == wanted) {
-        return row['id'] as String;
-      }
-    }
+    final trimmed = forms.map(asText).whereType<String>();
+    if (!trimmed.any((form) => _normalizeKey(form) == wanted)) continue;
+    matches.add((
+      id: row['id'] as String,
+      name: asText(row['name']) ?? '',
+      archived: asBool(row['archived']) ?? false,
+    ));
   }
-  return null;
+  return _activeOr(matches, (match) => match.archived);
 }
+
+/// The rows to match against: the active ones when there are any, all of them
+/// otherwise. An archived row is the fallback because the pilot may have retired
+/// the only tail that matches.
+List<T> _activeOr<T>(List<T> rows, bool Function(T row) archived) {
+  final active = [
+    for (final row in rows)
+      if (!archived(row)) row,
+  ];
+  return active.isEmpty ? rows : active;
+}
+
+/// The aircraft a write should link to, or the rows that tie when the
+/// registration names more than one.
+///
+/// Picking the first of two tails with the same registration would link the
+/// flight to whichever row happens to sort first, so an ambiguous key leaves
+/// the link unset and the candidates are reported instead.
+({String? id, String? display, List<Map<String, dynamic>> candidates})
+    _matchAircraft(FalconDb db, String registration) {
+  final matches = _aircraftCandidates(db, registration);
+  if (matches.length == 1) {
+    final only = matches.single;
+    return (id: only.id, display: only.display, candidates: const []);
+  }
+  return (
+    id: null,
+    display: null,
+    candidates: [
+      for (final match in matches)
+        {
+          'id': match.id,
+          'registration': match.display,
+          'country_code': match.countryCode,
+          'archived': match.archived,
+        },
+    ],
+  );
+}
+
+/// The crew member a write should link to, or the rows that tie. See
+/// [_matchAircraft] for why a tie is not guessed.
+({String? id, List<Map<String, dynamic>> candidates}) _matchCrewMemberId(
+    FalconDb db, String name) {
+  final matches = _crewCandidates(db, name);
+  if (matches.length == 1) {
+    return (id: matches.single.id, candidates: const []);
+  }
+  return (
+    id: null,
+    candidates: [
+      for (final match in matches)
+        {'id': match.id, 'name': match.name, 'archived': match.archived},
+    ],
+  );
+}
+
+/// The ids of every crew row a name filter could mean, so a flight linked by
+/// `crew_member_id` matches a name filter even when its stored name is null.
+List<String> _crewIdsNamed(FalconDb db, String name) =>
+    [for (final match in _crewCandidates(db, name)) match.id];
 
 /// Converts every `*_hours` argument to the minutes the column stores, so the
 /// conversion happens once. Supplying both forms of one field is an error.
@@ -936,14 +1206,16 @@ const Set<String> _splitFields = {'total_time', 'day_time', 'night_time'};
       values['aircraft_id'] = null;
     } else {
       final match = _matchAircraft(db, text);
-      if (match == null) {
+      values['aircraft_registration'] = match.display ?? text;
+      values['aircraft_id'] = match.id;
+      if (match.candidates.length > 1) {
+        warnings.add(
+            '${match.candidates.length} aircraft match "$text", so the flight '
+            'is not linked: ${_candidatesText(match.candidates)}. Pass '
+            'aircraft_id to choose one.');
+      } else if (match.id == null) {
         warnings.add(
             'No aircraft matched "$text"; the flight is not linked to an aircraft.');
-        values['aircraft_registration'] = text;
-        values['aircraft_id'] = null;
-      } else {
-        values['aircraft_registration'] = match.display;
-        values['aircraft_id'] = match.id;
       }
     }
   } else if (fields.containsKey('aircraft_id')) {
@@ -963,8 +1235,15 @@ const Set<String> _splitFields = {'total_time', 'day_time', 'night_time'};
       values['crew_members_name'] = null;
       values['crew_member_id'] = null;
     } else {
+      final match = _matchCrewMemberId(db, name);
       values['crew_members_name'] = name;
-      values['crew_member_id'] = _matchCrewMemberId(db, name);
+      values['crew_member_id'] = match.id;
+      if (match.candidates.length > 1) {
+        warnings.add(
+            '${match.candidates.length} crew members match "$name", so the '
+            'flight is not linked: ${_candidatesText(match.candidates)}. Pass '
+            'crew_member_id to choose one.');
+      }
     }
   } else if (fields.containsKey('crew_member_id')) {
     final crewId = asText(fields['crew_member_id']);
@@ -990,7 +1269,43 @@ const Set<String> _splitFields = {'total_time', 'day_time', 'night_time'};
       );
     }
   }
+
+  // A route that does not parse is legal: the app stores it as a description.
+  // It is worth saying, though, because it has no direction, so every
+  // departure_icao/arrival_icao filter will miss it.
+  final route = asText(values['route']);
+  if (route != null && parseRoute(route) == null) {
+    warnings.add(
+        'route "$route" is not a two-airport route, so the app shows it as a '
+        'description and it has no departure_icao or arrival_icao. Write it as '
+        '"YSSY - NZQN" for a route.');
+  }
   return (values: values, warnings: warnings);
+}
+
+/// What `find_missing_times` looks for: a flight whose times are not complete.
+///
+/// A draft has no total. A complete flight needs both sides of the split, and
+/// the two sides must add up to the total, which is the rule the app's wizard
+/// enforces on save. `day_time + night_time != total_time` is null when the
+/// total is null, so the draft case is named first.
+const String _missingTimePredicate =
+    '(total_time IS NULL OR day_time IS NULL OR night_time IS NULL '
+    'OR day_time + night_time != total_time)';
+
+/// Why [row] is in that list, so a caller does not have to read three nulls.
+String _missingTimeReason(Map<String, dynamic> row) {
+  final total = asInt(row['total_time']);
+  final day = asInt(row['day_time']);
+  final night = asInt(row['night_time']);
+  if (total == null) {
+    return (asBool(row['is_simulator']) ?? false)
+        ? 'simulator_no_duration'
+        : 'draft';
+  }
+  if (day == null && night == null) return 'missing_split';
+  if (day == null || night == null) return 'half_split';
+  return 'split_mismatch';
 }
 
 /// What is wrong with a day/night split, as the app understands it: `total_time`
@@ -1081,21 +1396,54 @@ bool _sameLocalDay(Object? storedDate, int date) =>
     storedDate == epochToIso(date);
 
 /// Records a sync tombstone so a deleted row is not resurrected by Postgres
-/// sync, mirroring the app's delete path. No-op when no provider has synced.
+/// sync, mirroring the app's `recordDeletion`. No-op when no provider has
+/// synced.
+///
+/// One tombstone per provider, deduplicated: `sync_deletions` has no unique
+/// index on `(sync_table, row_id, provider)`, so an existence check is what
+/// keeps a repeated delete from stacking identical tombstone rows. Provider
+/// names are normalised like the app's `normalizeSyncProvider`, because the
+/// push reads tombstones `WHERE provider = ?` and a tombstone stored under a
+/// legacy provider name would be invisible to it.
 void _recordTombstones(FalconDb db, String table, Object id) {
   if (!db.hasTable('sync_state') || !db.hasTable('sync_deletions')) return;
   final providers = db
       .query('SELECT DISTINCT provider FROM sync_state')
       .map((row) => row['provider'])
       .whereType<String>()
+      .map(normalizeSyncProvider)
       .toSet();
   final now = nowEpochSeconds();
   for (final provider in providers) {
+    final known = db.query(
+      'SELECT 1 FROM sync_deletions '
+      'WHERE sync_table = ? AND row_id = ? AND provider = ? LIMIT 1',
+      [table, id.toString(), provider],
+    );
+    if (known.isNotEmpty) continue;
     db.execute(
       'INSERT INTO sync_deletions (sync_table, row_id, provider, created_at) VALUES (?, ?, ?, ?)',
       [table, id.toString(), provider, now],
     );
   }
+}
+
+/// Deletes [id] from [table] and records its sync tombstones in one
+/// transaction, for the four synced tables' delete tools.
+///
+/// The delete's affected-row count decides whether anything happened at all:
+/// a row that a concurrent writer removed after the caller's existence check
+/// ends in a [notFoundLabel] error instead of a deleted result that never
+/// deleted anything, and no tombstone is written for a row that was already
+/// gone.
+void _deleteSyncedRow(FalconDb db, String table, Object id, String label) {
+  db.transaction(() {
+    final deleted = db.execute('DELETE FROM $table WHERE id = ?', [id]);
+    if (deleted == 0) {
+      throw _ToolError('$label not found: $id', code: 'not_found', field: 'id');
+    }
+    _recordTombstones(db, table, id);
+  });
 }
 
 Map<String, dynamic> _deleted(String table, Object id) => {
@@ -1344,9 +1692,7 @@ Future<void> runServer(String dbPath, {bool readonly = true}) async {
       'offset': JsonSchema.integer(minimum: 0),
       'full': _fullFlightSchema,
       ..._dateFilterProperties(),
-      'aircraft_registration': JsonSchema.string(),
-      'flight_type': JsonSchema.string(),
-      'crew_members_name': JsonSchema.string(),
+      ..._flightNarrowingProperties(),
       _includeSharedKey: JsonSchema.boolean(
           description:
               'Include rows owned by another device or account. Default false.'),
@@ -1355,16 +1701,7 @@ Future<void> runServer(String dbPath, {bool readonly = true}) async {
     callback: (args, extra) async {
       try {
         _rejectUnknown(
-            args,
-            {
-              'limit',
-              'offset',
-              'full',
-              'aircraft_registration',
-              'flight_type',
-              'crew_members_name',
-              ..._flightFilterKeys,
-            },
+            args, {'limit', 'offset', 'full', ..._flightPageFilterKeys},
             tool: 'list_flights');
         final limit = asInt(args['limit']) ?? 20;
         if (limit < 1) return _fail('limit must be >= 1', field: 'limit');
@@ -1372,19 +1709,9 @@ Future<void> runServer(String dbPath, {bool readonly = true}) async {
         if (offset < 0) return _fail('offset must be >= 0', field: 'offset');
         final full = asBool(args['full']) ?? false;
         final window = _flightDateFilter(args, now: DateTime.now());
-        final where = [...window.where];
-        final params = [...window.params];
-        for (final filter in const [
-          'aircraft_registration',
-          'flight_type',
-          'crew_members_name'
-        ]) {
-          final value = asText(args[filter]);
-          if (value != null) {
-            where.add('$filter = ?');
-            params.add(value);
-          }
-        }
+        final narrowing = _flightNarrowing(db, args);
+        final where = [...window.where, ...narrowing.where];
+        final params = [...window.params, ...narrowing.params];
         final owner = _ownerClause(db, 'flights',
             includeShared: asBool(args[_includeSharedKey]) ?? false);
         if (owner.isNotEmpty) where.add(owner);
@@ -1442,7 +1769,7 @@ Future<void> runServer(String dbPath, {bool readonly = true}) async {
         if (rows.isEmpty) {
           return _fail('Flight not found: $id', code: 'not_found', field: 'id');
         }
-        return _ok({...rows.first, 'units': _units});
+        return _ok({..._flightView(rows.first, full: true), 'units': _units});
       } on _ToolError catch (error) {
         return _failWith(error);
       } catch (error) {
@@ -1458,8 +1785,8 @@ Future<void> runServer(String dbPath, {bool readonly = true}) async {
         'registration). Times are minutes and dates come back as local ISO-8601 '
         'strings; filters take YYYY-MM-DD. Returns count (rows on this page), '
         'total (all matching rows), has_more, offset and the applied range. '
-        'Ordered newest first (date, then day_order, then id). Each flight is a '
-        'twelve-field summary unless full is true. Local rows only unless '
+        'Ordered newest first (date, then day_order, then id). Each flight is '
+        'a twelve-field summary unless full is true. Local rows only unless '
         'include_shared is true.',
     inputSchema: JsonSchema.object(properties: {
       'query': JsonSchema.string(),
@@ -1467,6 +1794,7 @@ Future<void> runServer(String dbPath, {bool readonly = true}) async {
       'offset': JsonSchema.integer(minimum: 0),
       'full': _fullFlightSchema,
       ..._dateFilterProperties(),
+      ..._flightNarrowingProperties(),
       _includeSharedKey: JsonSchema.boolean(
           description:
               'Include rows owned by another device or account. Default false.'),
@@ -1476,15 +1804,8 @@ Future<void> runServer(String dbPath, {bool readonly = true}) async {
     annotations: readOnlyAnnotations,
     callback: (args, extra) async {
       try {
-        _rejectUnknown(
-            args,
-            {
-              'query',
-              'limit',
-              'offset',
-              'full',
-              ..._flightFilterKeys,
-            },
+        _rejectUnknown(args,
+            {'query', 'limit', 'offset', 'full', ..._flightPageFilterKeys},
             tool: 'search_flights');
         final text = asText(args['query']);
         if (text == null) {
@@ -1497,11 +1818,13 @@ Future<void> runServer(String dbPath, {bool readonly = true}) async {
         final full = asBool(args['full']) ?? false;
         final like = '%${escapeLike(text)}%';
         final window = _flightDateFilter(args, now: DateTime.now());
+        final narrowing = _flightNarrowing(db, args);
         final where = <String>[
           "(route LIKE ? ESCAPE '\\' OR flight_number LIKE ? ESCAPE '\\' "
               "OR crew_members_name LIKE ? ESCAPE '\\' "
               "OR aircraft_registration LIKE ? ESCAPE '\\')",
           ...window.where,
+          ...narrowing.where,
         ];
         final params = <Object?>[
           like,
@@ -1509,6 +1832,7 @@ Future<void> runServer(String dbPath, {bool readonly = true}) async {
           like,
           like,
           ...window.params,
+          ...narrowing.params,
         ];
         final owner = _ownerClause(db, 'flights',
             includeShared: asBool(args[_includeSharedKey]) ?? false);
@@ -1562,11 +1886,17 @@ Future<void> runServer(String dbPath, {bool readonly = true}) async {
           if (!include) 'archived = 0',
           if (owner.isNotEmpty) owner,
         ];
+        final fromWhere = 'aircraft${_whereSql(where)}';
         final rows = db.query(
-            'SELECT * FROM aircraft${_whereSql(where)} '
-            'ORDER BY registration LIMIT ?',
-            [limit]);
-        return _ok({'count': rows.length, 'aircraft': rows});
+            'SELECT * FROM $fromWhere ORDER BY registration LIMIT ?', [limit]);
+        final page =
+            _pageInfo(db, fromWhere, const [], offset: 0, count: rows.length);
+        return _ok({
+          'count': rows.length,
+          'total': page.total,
+          'has_more': page.hasMore,
+          'aircraft': rows,
+        });
       } on _ToolError catch (error) {
         return _failWith(error);
       } catch (error) {
@@ -1614,28 +1944,47 @@ Future<void> runServer(String dbPath, {bool readonly = true}) async {
 
   server.registerTool(
     'list_airports',
-    description: 'Search airports (built-in) by ICAO/IATA/name/city.',
+    description:
+        'Search the built-in airports by ICAO, IATA, name or city, any case. '
+        'Best match first; ties break on ICAO. query is required; country '
+        'narrows to one code.',
     inputSchema: JsonSchema.object(properties: {
-      'query': JsonSchema.string(),
+      'query': JsonSchema.string(description: 'Required.'),
+      'country': JsonSchema.string(),
       'limit': JsonSchema.integer(minimum: 1, maximum: 1000),
     }),
     annotations: readOnlyAnnotations,
     callback: (args, extra) async {
       try {
-        _rejectUnknown(args, {'query', 'limit'}, tool: 'list_airports');
+        _rejectUnknown(args, {'query', 'country', 'limit'},
+            tool: 'list_airports');
         final limit = asInt(args['limit']) ?? 50;
+        if (limit < 1) return _fail('limit must be >= 1', field: 'limit');
         final text = asText(args['query']);
-        if (text != null) {
-          final like = '%${escapeLike(text)}%';
-          final rows = db.query(
-            "SELECT * FROM airports WHERE icao LIKE ? ESCAPE '\\' OR iata LIKE ? ESCAPE '\\' "
-            "OR name LIKE ? ESCAPE '\\' OR city LIKE ? ESCAPE '\\' LIMIT ?",
-            [like, like, like, like, limit],
-          );
-          return _ok({'count': rows.length, 'airports': rows});
+        if (text == null) {
+          return _fail('query is required: an ICAO, IATA, name or city',
+              field: 'query');
         }
-        final rows = db.query('SELECT * FROM airports LIMIT ?', [limit]);
-        return _ok({'count': rows.length, 'airports': rows});
+        final rank = _airportRank(text);
+        final where = <String>[rank.where];
+        final params = <Object?>[...rank.whereParams];
+        final country = asText(args['country']);
+        if (country != null) {
+          where.add("upper(coalesce(country, '')) = ?");
+          params.add(country.toUpperCase());
+        }
+        final fromWhere = 'airports${_whereSql(where)}';
+        final rows = db.query(
+            'SELECT * FROM $fromWhere ORDER BY ${rank.order}, icao LIMIT ?',
+            [...params, ...rank.orderParams, limit]);
+        final page =
+            _pageInfo(db, fromWhere, params, offset: 0, count: rows.length);
+        return _ok({
+          'count': rows.length,
+          'total': page.total,
+          'has_more': page.hasMore,
+          'airports': rows,
+        });
       } on _ToolError catch (error) {
         return _failWith(error);
       } catch (error) {
@@ -1646,8 +1995,8 @@ Future<void> runServer(String dbPath, {bool readonly = true}) async {
 
   server.registerTool(
     'list_custom_airports',
-    description: 'List user-defined custom airports. Local rows only unless '
-        'include_shared is true.',
+    description: 'List user-defined custom airports. Local rows only '
+        'unless include_shared is true.',
     inputSchema: JsonSchema.object(properties: {
       _includeSharedKey: JsonSchema.boolean(
           description:
@@ -1662,12 +2011,18 @@ Future<void> runServer(String dbPath, {bool readonly = true}) async {
         final limit = asInt(args['limit']) ?? 200;
         final owner = _ownerClause(db, 'custom_airports',
             includeShared: asBool(args[_includeSharedKey]) ?? false);
-        final rows = db.query(
-            'SELECT * FROM custom_airports'
-            '${owner.isEmpty ? '' : ' WHERE $owner'} '
-            'ORDER BY name LIMIT ?',
-            [limit]);
-        return _ok({'count': rows.length, 'airports': rows});
+        final fromWhere =
+            'custom_airports${owner.isEmpty ? '' : ' WHERE $owner'}';
+        final rows =
+            db.query('SELECT * FROM $fromWhere ORDER BY name LIMIT ?', [limit]);
+        final page =
+            _pageInfo(db, fromWhere, const [], offset: 0, count: rows.length);
+        return _ok({
+          'count': rows.length,
+          'total': page.total,
+          'has_more': page.hasMore,
+          'airports': rows,
+        });
       } on _ToolError catch (error) {
         return _failWith(error);
       } catch (error) {
@@ -1701,11 +2056,17 @@ Future<void> runServer(String dbPath, {bool readonly = true}) async {
           if (!include) 'archived = 0',
           if (owner.isNotEmpty) owner,
         ];
-        final rows = db.query(
-            'SELECT * FROM crew_members${_whereSql(where)} '
-            'ORDER BY name LIMIT ?',
-            [limit]);
-        return _ok({'count': rows.length, 'crew': rows});
+        final fromWhere = 'crew_members${_whereSql(where)}';
+        final rows =
+            db.query('SELECT * FROM $fromWhere ORDER BY name LIMIT ?', [limit]);
+        final page =
+            _pageInfo(db, fromWhere, const [], offset: 0, count: rows.length);
+        return _ok({
+          'count': rows.length,
+          'total': page.total,
+          'has_more': page.hasMore,
+          'crew': rows,
+        });
       } on _ToolError catch (error) {
         return _failWith(error);
       } catch (error) {
@@ -1716,8 +2077,8 @@ Future<void> runServer(String dbPath, {bool readonly = true}) async {
 
   server.registerTool(
     'list_saved_routes',
-    description:
-        'List saved routes. Local rows only unless include_shared is true.',
+    description: 'List saved routes. Local rows only unless include_shared '
+        'is true.',
     inputSchema: JsonSchema.object(properties: {
       _includeSharedKey: JsonSchema.boolean(
           description:
@@ -1732,12 +2093,17 @@ Future<void> runServer(String dbPath, {bool readonly = true}) async {
         final limit = asInt(args['limit']) ?? 200;
         final owner = _ownerClause(db, 'saved_routes',
             includeShared: asBool(args[_includeSharedKey]) ?? false);
+        final fromWhere = 'saved_routes${owner.isEmpty ? '' : ' WHERE $owner'}';
         final rows = db.query(
-            'SELECT * FROM saved_routes'
-            '${owner.isEmpty ? '' : ' WHERE $owner'} '
-            'ORDER BY flight_number LIMIT ?',
-            [limit]);
-        return _ok({'count': rows.length, 'routes': rows});
+            'SELECT * FROM $fromWhere ORDER BY flight_number LIMIT ?', [limit]);
+        final page =
+            _pageInfo(db, fromWhere, const [], offset: 0, count: rows.length);
+        return _ok({
+          'count': rows.length,
+          'total': page.total,
+          'has_more': page.hasMore,
+          'routes': rows,
+        });
       } on _ToolError catch (error) {
         return _failWith(error);
       } catch (error) {
@@ -1851,14 +2217,16 @@ Future<void> runServer(String dbPath, {bool readonly = true}) async {
     'logbook_stats',
     description:
         'Aggregate logbook statistics. All times are minutes. flights counts '
-        'every local row including drafts, flights_complete counts rows with a '
-        'total time, and drafts counts the rest. Time and movement sums skip '
-        'empty values. sim_flights and sim_minutes report the simulator part, '
-        'which stays included in the other sums. Filters (date_from/date_to as '
-        'YYYY-MM-DD, or period) apply to every number in the response, and the '
-        'applied range is echoed back.',
+        'every matching row including drafts, flights_complete counts rows '
+        'with a total time, zero_time counts total_time = 0 rows, drafts '
+        'counts the rest. Sums skip drafts; include_simulator: false (default true) leaves '
+        'simulators out of every other number while sim_flights and '
+        'sim_minutes still report that part. Filters (date_from/date_to as '
+        'YYYY-MM-DD, or period) apply to every number and the applied range is '
+        'echoed back.',
     inputSchema: JsonSchema.object(properties: {
       ..._dateFilterProperties(),
+      'include_simulator': JsonSchema.boolean(),
       _includeSharedKey: JsonSchema.boolean(
           description:
               'Include rows owned by another device or account. Default false.'),
@@ -1866,9 +2234,14 @@ Future<void> runServer(String dbPath, {bool readonly = true}) async {
     annotations: readOnlyAnnotations,
     callback: (args, extra) async {
       try {
-        _rejectUnknown(args, _flightFilterKeys, tool: 'logbook_stats');
+        _rejectUnknown(args, {..._flightFilterKeys, 'include_simulator'},
+            tool: 'logbook_stats');
+        final includeSimulator = asBool(args['include_simulator']) ?? true;
         final window = _flightDateFilter(args, now: DateTime.now());
-        final where = [...window.where];
+        final where = [
+          ...window.where,
+          if (!includeSimulator) 'is_simulator = 0',
+        ];
         final params = [...window.params];
         final owner = _ownerClause(db, 'flights',
             includeShared: asBool(args[_includeSharedKey]) ?? false);
@@ -1876,18 +2249,31 @@ Future<void> runServer(String dbPath, {bool readonly = true}) async {
         final sql = 'SELECT COUNT(*) AS flights, '
             'COALESCE(SUM(CASE WHEN total_time IS NOT NULL THEN 1 ELSE 0 END), 0) AS flights_complete, '
             'COALESCE(SUM(CASE WHEN total_time IS NULL THEN 1 ELSE 0 END), 0) AS drafts, '
+            'COALESCE(SUM(CASE WHEN total_time = 0 THEN 1 ELSE 0 END), 0) AS zero_time, '
             'COALESCE(SUM(total_time), 0) AS total_minutes, '
             'COALESCE(SUM(night_time), 0) AS night_minutes, '
             'COALESCE(SUM(day_time), 0) AS day_minutes, '
             'COALESCE(SUM(landings), 0) AS landings, '
-            'COALESCE(SUM(takeoffs), 0) AS takeoffs, '
-            'COALESCE(SUM(CASE WHEN is_simulator = 1 THEN 1 ELSE 0 END), 0) AS sim_flights, '
-            'COALESCE(SUM(CASE WHEN is_simulator = 1 THEN total_time ELSE 0 END), 0) AS sim_minutes '
+            'COALESCE(SUM(takeoffs), 0) AS takeoffs '
             'FROM flights${_whereSql(where)}';
         final rows = db.query(sql, params);
         final stats = rows.isEmpty ? <String, dynamic>{} : rows.first;
+        // The simulator split is reported whether or not it is counted above,
+        // so a caller can always say how much of the logbook is in a device.
+        final simWhere = [...window.where, 'is_simulator = 1'];
+        if (owner.isNotEmpty) simWhere.add(owner);
+        final simRows = db.query(
+            'SELECT COUNT(*) AS sim_flights, '
+            'COALESCE(SUM(total_time), 0) AS sim_minutes '
+            'FROM flights${_whereSql(simWhere)}',
+            window.params);
         return _ok({
           ...stats,
+          'sim_flights':
+              simRows.isEmpty ? 0 : asInt(simRows.first['sim_flights']) ?? 0,
+          'sim_minutes':
+              simRows.isEmpty ? 0 : asInt(simRows.first['sim_minutes']) ?? 0,
+          'include_simulator': includeSimulator,
           'range': _rangeOf(window),
           'units': _units,
         });
@@ -2237,13 +2623,14 @@ Future<void> runServer(String dbPath, {bool readonly = true}) async {
   server.registerTool(
     'find_missing_times',
     description:
-        'Find flights with no total time (drafts) or no day/night split. Times '
-        'are minutes and dates come back as local ISO-8601 strings. Each flight '
-        'is a twelve-field summary unless full is true. Local rows only unless '
-        'include_shared is true.',
+        'Find flights whose times need attention: no total_time (a draft), a '
+        'null day_time or night_time, or a day plus night that does not equal '
+        'the total. Each row carries id, date, route, the three times, '
+        'is_simulator and a reason. Simulators are excluded by default. '
+        'Local rows only unless include_shared is true.',
     inputSchema: JsonSchema.object(properties: {
       'limit': _missingTimesLimitSchema,
-      'full': _fullFlightSchema,
+      'include_simulator': JsonSchema.boolean(),
       _includeSharedKey: JsonSchema.boolean(
           description:
               'Include rows owned by another device or account. Default false.'),
@@ -2251,23 +2638,35 @@ Future<void> runServer(String dbPath, {bool readonly = true}) async {
     annotations: readOnlyAnnotations,
     callback: (args, extra) async {
       try {
-        _rejectUnknown(args, {'limit', 'full', _includeSharedKey},
+        _rejectUnknown(args, {'limit', 'include_simulator', _includeSharedKey},
             tool: 'find_missing_times');
         final limit = asInt(args['limit']) ?? 200;
-        final full = asBool(args['full']) ?? false;
+        if (limit < 1) return _fail('limit must be >= 1', field: 'limit');
+        final includeSimulator = asBool(args['include_simulator']) ?? false;
         final owner = _ownerClause(db, 'flights',
             includeShared: asBool(args[_includeSharedKey]) ?? false);
+        final where = <String>[
+          _missingTimePredicate,
+          if (!includeSimulator) 'is_simulator = 0',
+          if (owner.isNotEmpty) owner,
+        ];
+        const params = <Object?>[];
+        final fromWhere = 'flights${_whereSql(where)}';
         final rows = db.query(
-          'SELECT * FROM flights '
-          'WHERE (total_time IS NULL OR (day_time IS NULL AND night_time IS NULL))'
-          '${owner.isEmpty ? '' : ' AND $owner'} '
-          'ORDER BY date DESC, day_order DESC, id LIMIT ?',
-          [limit],
-        );
+            'SELECT id, date, route, total_time, day_time, night_time, '
+            'is_simulator FROM $fromWhere '
+            'ORDER BY date DESC, day_order DESC, id LIMIT ?',
+            [limit]);
+        final page =
+            _pageInfo(db, fromWhere, params, offset: 0, count: rows.length);
         return _ok({
           'count': rows.length,
+          'total': page.total,
+          'has_more': page.hasMore,
           'units': _units,
-          'flights': [for (final row in rows) _flightView(row, full: full)],
+          'flights': [
+            for (final row in rows) {...row, 'reason': _missingTimeReason(row)},
+          ],
         });
       } on _ToolError catch (error) {
         return _failWith(error);
@@ -2279,8 +2678,10 @@ Future<void> runServer(String dbPath, {bool readonly = true}) async {
 
   server.registerTool(
     'dedupe_crew',
-    description: 'Find crew members with duplicate normalized names. Local '
-        'rows only unless include_shared is true.',
+    description:
+        'Find crew members whose names normalise to the same key, so the same '
+        'pilot is saved twice. Each member is id, name and archived. Returns '
+        'every duplicate group. Local rows only unless include_shared.',
     inputSchema: JsonSchema.object(properties: {
       _includeSharedKey: JsonSchema.boolean(
           description:
@@ -2292,11 +2693,12 @@ Future<void> runServer(String dbPath, {bool readonly = true}) async {
         _rejectUnknown(args, {_includeSharedKey}, tool: 'dedupe_crew');
         final owner = _ownerClause(db, 'crew_members',
             includeShared: asBool(args[_includeSharedKey]) ?? false);
-        final rows = db.query(
-            'SELECT * FROM crew_members${owner.isEmpty ? '' : ' WHERE $owner'}');
+        final rows = db.query('SELECT id, name, archived FROM crew_members'
+            '${owner.isEmpty ? '' : ' WHERE $owner'} '
+            'ORDER BY name, id');
         final groups = <String, List<Map<String, dynamic>>>{};
         for (final row in rows) {
-          final key = _normalizeKey(row['name'] as String? ?? '');
+          final key = _normalizeKey(asText(row['name']) ?? '');
           if (key.isEmpty) continue;
           groups.putIfAbsent(key, () => []).add(row);
         }
@@ -2305,7 +2707,10 @@ Future<void> runServer(String dbPath, {bool readonly = true}) async {
             if (entry.value.length > 1)
               {'name': entry.key, 'members': entry.value},
         ];
-        return _ok({'groups': duplicates.length, 'duplicates': duplicates});
+        return _ok({
+          'count': duplicates.length,
+          'duplicates': duplicates,
+        });
       } on _ToolError catch (error) {
         return _failWith(error);
       } catch (error) {
@@ -2326,9 +2731,10 @@ Future<void> runServer(String dbPath, {bool readonly = true}) async {
           'Create a flight. Times are minutes; total_time_hours, day_time_hours '
           'and night_time_hours are accepted instead. Sets aircraft_id and '
           'crew_member_id automatically when the registration or crew name '
-          'matches. day_order is computed for the date. Returns the row as '
-          'written as flight, with draft telling you whether it counts as a '
-          'draft, and warnings for anything odd but legal.',
+          'matches, and names the candidates when a match is ambiguous. '
+          'day_order is computed for the date. Returns the row as written as '
+          'flight, with draft telling you whether it counts as a draft, and '
+          'warnings for anything odd but legal.',
       inputSchema: JsonSchema.object(
         properties: {
           'id': _createIdSchema,
@@ -2449,10 +2855,7 @@ Future<void> runServer(String dbPath, {bool readonly = true}) async {
           throw _ToolError('Flight not found: $id',
               code: 'not_found', field: 'id');
         }
-        db.transaction(() {
-          db.execute('DELETE FROM flights WHERE id = ?', [id]);
-          _recordTombstones(db, 'flights', id);
-        });
+        _deleteSyncedRow(db, 'flights', id, 'Flight');
         return _deleted('flights', id);
       }),
     );
@@ -2600,10 +3003,7 @@ Future<void> runServer(String dbPath, {bool readonly = true}) async {
           throw _ToolError('Aircraft not found: $id',
               code: 'not_found', field: 'id');
         }
-        db.transaction(() {
-          db.execute('DELETE FROM aircraft WHERE id = ?', [id]);
-          _recordTombstones(db, 'aircraft', id);
-        });
+        _deleteSyncedRow(db, 'aircraft', id, 'Aircraft');
         return _deleted('aircraft', id);
       }),
     );
@@ -2703,10 +3103,7 @@ Future<void> runServer(String dbPath, {bool readonly = true}) async {
           throw _ToolError('Crew member not found: $id',
               code: 'not_found', field: 'id');
         }
-        db.transaction(() {
-          db.execute('DELETE FROM crew_members WHERE id = ?', [id]);
-          _recordTombstones(db, 'crew_members', id);
-        });
+        _deleteSyncedRow(db, 'crew_members', id, 'Crew member');
         return _deleted('crew_members', id);
       }),
     );
@@ -2804,10 +3201,7 @@ Future<void> runServer(String dbPath, {bool readonly = true}) async {
           throw _ToolError('Custom airport not found: $id',
               code: 'not_found', field: 'id');
         }
-        db.transaction(() {
-          db.execute('DELETE FROM custom_airports WHERE id = ?', [id]);
-          _recordTombstones(db, 'custom_airports', id);
-        });
+        _deleteSyncedRow(db, 'custom_airports', id, 'Custom airport');
         return _deleted('custom_airports', id);
       }),
     );
@@ -2904,10 +3298,18 @@ Future<void> runServer(String dbPath, {bool readonly = true}) async {
               code: 'not_found', field: 'id');
         }
         // The app clears route_id on linked flights when a route is deleted.
+        // The delete's affected-row count decides whether anything happened:
+        // a route a concurrent writer removed after the existence check ends
+        // in a not_found error instead of unlinking flights for nothing.
         db.transaction(() {
+          final deleted =
+              db.execute('DELETE FROM saved_routes WHERE id = ?', [id]);
+          if (deleted == 0) {
+            throw _ToolError('Saved route not found: $id',
+                code: 'not_found', field: 'id');
+          }
           db.execute(
               'UPDATE flights SET route_id = NULL WHERE route_id = ?', [id]);
-          db.execute('DELETE FROM saved_routes WHERE id = ?', [id]);
         });
         return _deleted('saved_routes', id);
       }),
@@ -2995,8 +3397,8 @@ Future<void> runServer(String dbPath, {bool readonly = true}) async {
     'falcon://flights',
     (
       description: 'The 20 most recent local flights as JSON: {rows, units}, '
-          'with each row a twelve-field summary. Use list_flights for filters, '
-          'paging and full rows.',
+          'with each row a summary and times in minutes. Use list_flights for '
+          'filters, paging and full rows.',
       mimeType: 'application/json',
     ),
     (uri, extra) async {
@@ -3062,22 +3464,25 @@ Future<void> runServer(String dbPath, {bool readonly = true}) async {
             text: 'FALCON DB CONVENTIONS\n\n'
                 '- Dates and timestamps are stored as unix epoch seconds and returned as local ISO-8601 strings, for example 2026-10-27T00:00:00.000. The flights.date column holds local midnight of the flight date; tool inputs accept YYYY-MM-DD and are converted the same way.\n'
                 '- Read filters accept only YYYY-MM-DD (or a named period) and reject anything else instead of ignoring it. Every filtered response echoes the applied window as range {from, to}.\n'
-                '- Flight time columns (total_time, day_time, night_time, actual_instrument, simulated_instrument, icus_day_time, icus_night_time) are integer MINUTES. Responses state this in a units object. Write tools also accept total_time_hours, day_time_hours and night_time_hours.\n'
+                '- Flight time columns (total_time, day_time, night_time, actual_instrument, simulated_instrument, ground_instrument, icus_day_time, icus_night_time) are integer MINUTES. Responses state this in a units object. Write tools also accept an _hours form of any of them, for example total_time_hours or icus_night_time_hours.\n'
                 '- Flight time is capped at 525600 minutes (8760 hours) and takeoff/landing counts at 10000, the same limits the app enforces. A value outside either is refused, and the error names the limit.\n'
-                '- day_time and night_time must add up to total_time when both are supplied: the app cannot display any other split, so it is refused. A one-sided split (for example day_time equal to total_time with no night_time) is stored as given and reported in warnings, because the app saves those itself.\n'
+                '- day_time and night_time must add up to total_time when both are supplied: the app cannot display any other split, so it is refused. A one-sided split (for example day_time equal to total_time with no night_time) is stored as given and reported in warnings, because the app saves those itself. find_missing_times lists every row the app cannot show complete, with a reason per row.\n'
                 '- time_start and time_stop are 24-hour clock times stored as HH:MM. Write tools accept 9, 930, 9:30, 09:30 or 0930 and refuse anything else, so 9am is rejected rather than stored. They pair with calc_time_mode (utc, local, time, hobbsTacho) and hobbs_start/hobbs_stop when that mode was used. They are not stored as durations.\n'
-                '- A flight is a DRAFT when total_time IS NULL. Set total_time (1 minute or more) to make it complete. total_time 0 is refused: the app stores 0 as a complete flight with no duration, which the pilot cannot see or fix. To clear a time and make a flight a draft again, pass draft: true, because a null total_time cannot be sent over MCP. Lists include drafts; totals exclude them.\n'
+                '- A flight is a DRAFT when total_time IS NULL. Set total_time (1 minute or more) to make it complete. total_time 0 is refused: the app stores 0 as a complete flight with no duration, which the pilot cannot see or fix. To clear a time and make a flight a draft again, pass draft: true, because a null total_time cannot be sent over MCP. Lists include drafts, sums exclude them, and logbook_stats separates flights, flights_complete, zero_time and drafts.\n'
                 '- ids for flights, aircraft, crew_members, custom_airports and flights_settings are RFC 4122 version 4 UUIDs, lowercase and hyphenated, the shape the cloud schema requires before a row can sync. A create tool accepts an optional UUID v4 id so an import can keep its own, and refuses any other shape. saved_routes keeps its integer id.\n'
                 '- day_order is the order of a flight within its date: a create takes the next free order for that day, and an update recomputes it when the date moves the flight to another day. updated_at records the last write.\n'
                 '- Flights are ordered date DESC, day_order DESC, id, the same as the app. Flights on the same date are newest-first within the day.\n'
-                '- Reads return local rows only (owner_id NULL or "local") unless include_shared is true. Paged reads return count (rows on this page), total (all matching rows), has_more and offset, and default to 20 rows with a maximum of 200. A listed flight is a twelve-field summary unless full: true.\n'
+                '- Reads return local rows only (owner_id NULL or "local") unless include_shared is true. Paged reads return count (rows on this page), total (all matching rows), has_more and offset, and default to 20 rows with a maximum of 200; the list reads state in their own limit description how many they return and report total and has_more. A listed flight is a summary, with departure_icao and arrival_icao derived from route, unless full: true.\n'
+                '- flights.route is free text. It is a route pair only when it is exactly "AAA - BBB": two segments split on " - ", each 3 or 4 characters and equal in length, the same rule the app applies. Anything else is a description and has no direction, so departure_icao and arrival_icao are null and the route filters cannot match it. The two codes are derived, not stored: full rows and get_flight carry them, the twelve-field summary does not. Write tools warn when a route will be stored as a description.\n'
                 '- aircraft.registration is the BARE registration (e.g. country_code=VH, registration=XZO). The app displays country_code + "-" + registration.\n'
-                '- flights.aircraft_registration is the display registration (e.g. VH-XZO). Write tools accept either form and set aircraft_id from the matching aircraft row; flights.crew_members_name is matched the same way to set crew_member_id.\n'
+                '- flights.aircraft_registration is the display registration (e.g. VH-XZO). Write tools accept either form and set aircraft_id from the matching aircraft row; flights.crew_members_name is matched the same way to set crew_member_id. When more than one active row matches a name or registration, the link is left unset and the warning lists the candidates, so pass aircraft_id or crew_member_id to choose.\n'
+                '- Read filters on flights match without case: aircraft_registration takes bare (XZO) or display (VH-XZO), flight_type takes route or details, and a crew_members_name filter also matches flights linked to that crew row. departure_icao and arrival_icao match one direction only and never a description. Airport search ranks an exact code first, then a prefix, then name or city, and ties break on ICAO.\n'
                 '- flight_type values: route, details. crew_role values: pilotInCommand, copilot, student.\n'
+                '- find_missing_times lists every row the app cannot show complete, with a reason per row: draft (no total), missing_split (both sides null), half_split (one side null), split_mismatch (the sides do not add up), or simulator_no_duration. Simulator sessions are excluded unless include_simulator is true, because the app expects them to carry a total and no split.\n'
                 '- calculate_time_mode values: utc, local, time, hobbsTacho. flight_time_format values: hhmm, decimal1, decimal2.\n'
                 '- logbook_country is "AU", "NZ", or null.\n'
                 '- total_time is the authoritative flight duration; takeoffs/landings are counts per flight row.\n'
-                '- is_simulator and is_ifr are stored as 0/1.\n'
+                '- is_simulator and is_ifr are stored as 0/1 and rendered as true or false, as are archived and the aircraft flags (multi_engine, ifr, complex, pressurised, tailwheel, simulator, helicopter, float_plane).\n'
                 '- Expiry status is computed at read time, never stored: whole local days from today to due_date, below the orange threshold is red (which includes today and every overdue day), below the green threshold is orange, green above it. Thresholds come from expiry_settings (a local row first, then the newest), or 90 and 30 days when that table has no row. list_expiries includes overdue rows by default.\n'
                 '- Currency thresholds are HOURS for the four time metrics, because the app divides those values by 60, and counts for the other four. is_exceeded means the rule needs attention: for a requirement that is being below the threshold, for a limit it is reaching it. currency_status reproduces the app\'s currency page, which applies no owner filter and counts drafts as flights, so its numbers can mix owners on a synced logbook.\n'
                 '- entity_totals.flights_complete counts COMPLETE flights, because it counts the rows its minutes come from; logbook_stats.flights counts every row including drafts, and its flights_complete is the same number. Aircraft and type group on flights.aircraft_id and crew groups on flights.crew_member_id, so a flight that only carries registration text is in the registration group alone. It pages with limit, offset, count, total and has_more like the flight lists, and the registration it reports for an aircraft is the app\'s display form (country code and tail joined, without doubling a tail that already carries the code).\n'

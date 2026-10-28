@@ -1,6 +1,7 @@
 import 'dart:io';
 
 import 'package:falcon_mcp/falcon_mcp.dart';
+import 'package:sqlite3/sqlite3.dart' show SqliteException;
 import 'package:test/test.dart';
 
 import 'support/harness.dart';
@@ -120,6 +121,20 @@ void main() {
   test('write connections enforce foreign keys', () {
     final db = openDb(dbPath);
     addTearDown(db.close);
+    // The pragma itself, so a refactor that drops it fails here first: the
+    // behavioural asserts below would also catch it, but only through the
+    // ON DELETE clause.
+    expect(db.query('PRAGMA foreign_keys').single['foreign_keys'], 1);
+    // A dangling link is refused, not stored.
+    expect(
+      () => db.execute(
+        "INSERT INTO flights (id, date, aircraft_id, created_at) "
+        "VALUES ('fl-bogus', 1761408000, 'aircraft-that-does-not-exist', 0)",
+      ),
+      throwsA(isA<SqliteException>()),
+    );
+    expect(db.query("SELECT id FROM flights WHERE id = 'fl-bogus'"), isEmpty);
+    // Deleting a linked aircraft unlinks the flight (ON DELETE SET NULL).
     db.execute("DELETE FROM aircraft WHERE id = 'ac-1'");
     expect(
       db
