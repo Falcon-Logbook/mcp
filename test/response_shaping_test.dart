@@ -390,14 +390,17 @@ void main() {
     // Write mode is the catalog most sessions never pay for, and it grows with
     // the write schemas. Issue #11 budgets 28 KB, but that figure was measured
     // before #15 grew the catalog to 27,193 B with write validation text; the
-    // read-side text here takes it to about 28.0 KB, so 28 KB is not reachable
-    // until PR 2 collapses the flight write schemas, which is when it should be
-    // tightened to the 22 KB target. This guards against re-inflation meanwhile.
+    // read-side text here takes it to 28,062 B. That is 610 B under 28 KiB
+    // (28,672 B), so the bound is that Ki figure and it is deliberately tight:
+    // a new argument description of more than a few hundred bytes fails here.
+    // PR 2 should tighten it to the 22 KB target when it collapses the flight
+    // write schemas. This guards against re-inflation meanwhile.
     final writer = await start(write: true);
     final writeCatalog = utf8
         .encode(jsonEncode((await writer.send('tools/list', {}))['result']))
         .length;
-    expect(writeCatalog, lessThan(29000),
-        reason: 'the write-mode catalog costs $writeCatalog B');
+    expect(writeCatalog, lessThan(28672),
+        reason: 'the write-mode catalog costs $writeCatalog B, '
+            'and 28 KiB is 28,672 B');
   });
 }
