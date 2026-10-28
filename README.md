@@ -130,8 +130,7 @@ year". If the number matches the app, you are set up.
 Supported: Claude Desktop, Claude Code, Codex, Cursor, and any other client that speaks MCP.
 
 Something broken, or a question: open an issue at
-[github.com/Falcon-Logbook/mcp/issues](https://github.com/Falcon-Logbook/mcp/issues), or email
-falcon@teamsuperpanda.com.
+[github.com/Falcon-Logbook/mcp/issues](https://github.com/Falcon-Logbook/mcp/issues).
 
 ---
 
