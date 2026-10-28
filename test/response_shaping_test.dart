@@ -48,6 +48,35 @@ void main() {
   Map<String, dynamic> payloadOf(({bool isError, Object? payload}) result) =>
       result.payload as Map<String, dynamic>;
 
+  /// The `limit` default and maximum each tool declares in the catalog an agent
+  /// reads, parsed out of the description rather than from a constant here, so a
+  /// description that disagrees with the callback fails a test.
+  Future<Map<String, ({int byDefault, int atMost})>> declaredLimits(
+      McpProcess server, List<String> tools) async {
+    final response = await server.send('tools/list', {});
+    final catalog =
+        ((response['result'] as Map<String, dynamic>)['tools'] as List)
+            .cast<Map<String, dynamic>>();
+    return {
+      for (final name in tools)
+        name: () {
+          final properties =
+              (catalog.firstWhere((tool) => tool['name'] == name)['inputSchema']
+                  as Map)['properties'] as Map;
+          final description = (properties['limit'] as Map)['description'];
+          final match = RegExp(r'Default (\d+), maximum (\d+)\.')
+              .firstMatch('$description');
+          if (match == null) {
+            throw StateError('$name does not declare its limit: $description');
+          }
+          return (
+            byDefault: int.parse(match.group(1)!),
+            atMost: int.parse(match.group(2)!),
+          );
+        }(),
+    };
+  }
+
   /// Fifty complete flights plus two drafts: enough that the default page
   /// leaves rows behind, and enough to measure a page at the 200-row cap.
   void seedLogbook() {
@@ -238,6 +267,60 @@ void main() {
     final typo = await server.call('list_flights', {'fulll': true});
     expect(typo.isError, isTrue);
     expect('${typo.payload}', contains('fulll'));
+  });
+
+  test('every flight read returns the rows its limit schema promises',
+      () async {
+    // 250 drafts: more rows than either default, so a tool that declares one
+    // default and delivers another shows up here instead of only in a token
+    // report. The old declaration promised 20 rows from find_missing_times and
+    // got 200.
+    insertFlights(dbPath, [
+      for (var day = 1; day <= 250; day++)
+        {
+          'id': 'fl-draft-$day',
+          'date': DateTime(2025, 2, 1).add(Duration(days: day)),
+          'day_order': day % 3,
+          'route': 'YSBK - YSSY',
+          'created_at': 1700000000,
+        },
+    ]);
+    final server = await start();
+    final limits = await declaredLimits(
+        server, ['list_flights', 'search_flights', 'find_missing_times']);
+
+    // The two paged reads keep the documented page. find_missing_times is not
+    // paged: it exists to find every draft, so it declares the 200 rows its
+    // callback actually returns.
+    for (final tool in ['list_flights', 'search_flights']) {
+      expect(limits[tool], (byDefault: 20, atMost: 200),
+          reason: '$tool is a page of 20 by default');
+    }
+    expect(limits['find_missing_times'], (byDefault: 200, atMost: 200),
+        reason: 'find_missing_times returns every match up to the cap');
+
+    final listed = payloadOf(await server.call('list_flights', {}));
+    expect(
+        (listed['flights'] as List).length, limits['list_flights']!.byDefault);
+    expect(listed['has_more'], isTrue, reason: 'the rest are on later pages');
+
+    final searched =
+        payloadOf(await server.call('search_flights', {'query': 'YSBK'}));
+    expect((searched['flights'] as List).length,
+        limits['search_flights']!.byDefault);
+
+    // More rows than the default: the response is exactly the count the
+    // catalog promises, not one row more.
+    final missing = payloadOf(await server.call('find_missing_times', {}));
+    expect(missing['count'], limits['find_missing_times']!.byDefault,
+        reason: 'find_missing_times returns the 200 rows it declares');
+    expect((missing['flights'] as List).length, missing['count']);
+
+    // The cap is in the schema, so an inflated limit is refused by the schema
+    // and the refusal names it, as on the two paged reads.
+    final tooMany = await server.call('find_missing_times', {'limit': 201});
+    expect(tooMany.isError, isTrue);
+    expect('${tooMany.payload}', contains('200'));
   });
 
   test('the flights resource is capped, slim and states its units', () async {

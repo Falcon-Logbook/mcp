@@ -236,10 +236,19 @@ JsonSchema get _fullFlightSchema => JsonSchema.boolean(
     description: 'Every column instead of the twelve-field summary, at about '
         'four times the tokens.');
 
-/// The `limit` argument on the paged flight reads: 20 rows by default, 200 at
-/// most, so the page size is honest and `has_more` says what is left.
+/// The `limit` argument on the two paged flight reads, `list_flights` and
+/// `search_flights`: 20 rows by default, 200 at most, so the page size is honest
+/// and `has_more` says what is left. `find_missing_times` is not paged and
+/// returns every match up to the cap, so it declares its own default; reusing
+/// this schema there would promise 20 rows and deliver 200.
 JsonSchema get _flightLimitSchema => JsonSchema.integer(
     minimum: 1, maximum: 200, description: 'Default 20, maximum 200.');
+
+/// The `limit` argument on `find_missing_times`, which exists to find every
+/// draft rather than to page: 200 rows by default, which is what its callback
+/// does, so the catalog and the response agree.
+JsonSchema get _missingTimesLimitSchema => JsonSchema.integer(
+    minimum: 1, maximum: 200, description: 'Default 200, maximum 200.');
 
 /// Arguments that select the date window, shared by every filtered read.
 const Set<String> _dateFilterKeys = {'date_from', 'date_to', 'period'};
@@ -1602,7 +1611,7 @@ Future<void> runServer(String dbPath, {bool readonly = true}) async {
         'is a twelve-field summary unless full is true. Local rows only unless '
         'include_shared is true.',
     inputSchema: JsonSchema.object(properties: {
-      'limit': _flightLimitSchema,
+      'limit': _missingTimesLimitSchema,
       'full': _fullFlightSchema,
       _includeSharedKey: JsonSchema.boolean(
           description:
