@@ -50,7 +50,11 @@ Falcon stays the authority. The agent is the shortcut.
 - "Is my medical still valid, and when does my type rating run out?"
 - "Where are my gaps?"
 
-It asks when it needs a detail, rather than inventing one.
+When it needs something it does not know, it asks: which aircraft, UTC or local, which column is the
+date. In a client that can show a form you get a picker or a short form. In one that cannot, the
+same questions arrive as plain questions in the chat. If you leave an optional one alone, the answer
+comes back marked as a default rather than as your choice, so a guess is never reported as your
+answer. It does not invent an aircraft, a time or a column.
 
 ---
 

@@ -379,9 +379,11 @@ void main() {
     // `currency_status` 1,405, schemas included), taking the catalog from
     // 11,096 B to 13,798 B. The bound moves to 15 KiB (15,360 B), which is
     // 1,562 B of room: a description that grows by more than that fails here.
-    expect(readOnlyCatalog, lessThan(15360),
+    // #6's `ask_user` adds its 888 B for 15,304 B, so the bound moves with
+    // catalog_cost_test to 16 KiB (16,384 B), 1,080 B of room.
+    expect(readOnlyCatalog, lessThan(16384),
         reason: 'the read-only catalog costs $readOnlyCatalog B, '
-            'and 15 KiB is 15,360 B');
+            'and 16 KiB is 16,384 B');
 
     final typo = await bytesOf(server, 'list_flights', {'limt': 5});
     expect(typo, lessThan(400), reason: 'a typo error costs $typo B');
