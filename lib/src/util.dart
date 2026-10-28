@@ -10,6 +10,11 @@ final RegExp _dateOnly = RegExp(r'^(\d{4})-(\d{1,2})-(\d{1,2})$');
 /// stores. Dates are interpreted in local time, matching the app: the `date`
 /// column holds local midnight of the flight date.
 ///
+/// Timezone independence is deliberately not handled here: mapping a stored
+/// local midnight back to the calendar date it represents needs the zone the
+/// app wrote in, so the follow-up slice tracked in issue #9 (#4) adds a declared
+/// logbook zone (FALCON_TZ or a stored setting) before this changes.
+///
 /// [endOfDay] returns 23:59:59 of the same local day, useful for inclusive
 /// upper bounds.
 int? dateToEpoch(Object? value, {bool endOfDay = false}) {
