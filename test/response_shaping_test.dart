@@ -248,8 +248,14 @@ void main() {
     expect(missing['count'], 1);
     final missingRow = (missing['flights'] as List).single as Map;
     expect(missingRow.keys.toSet(), {
-      'id', 'date', 'route', 'total_time', 'day_time', 'night_time',
-      'is_simulator', 'reason',
+      'id',
+      'date',
+      'route',
+      'total_time',
+      'day_time',
+      'night_time',
+      'is_simulator',
+      'reason',
     });
     expect(missingRow, containsPair('id', 'fl-draft'));
     expect(missingRow, containsPair('reason', 'draft'),
@@ -391,13 +397,14 @@ void main() {
     // `currency_status` 1,405, schemas included), taking the catalog from
     // 11,096 B to 13,798 B. Slice 2's `entity_totals` and `get_settings` add
     // 2,344 B, the flights_complete rename 55 B, #6's `ask_user` 888 B and
-    // the type/sort enums with the offset argument 138 B. The bound is the
-    // measurement plus 1,024 B of headroom, which leaves room to reword a
+    // the type/sort enums with the offset argument 138 B. #12's
+    // `data_quality_report` adds 1,421 B, measured at 19,333 B. The bound is
+    // the measurement plus 1,024 B of headroom, which leaves room to reword a
     // description but trips on a new tool or a description that grows
     // materially.
-    expect(readOnlyCatalog, lessThanOrEqualTo(18936),
+    expect(readOnlyCatalog, lessThanOrEqualTo(20357),
         reason: 'the read-only catalog costs $readOnlyCatalog B, against '
-            '17,912 B measured plus 1,024 B of wording headroom');
+            '19,333 B measured plus 1,024 B of wording headroom');
 
     final typo = await bytesOf(server, 'list_flights', {'limt': 5});
     expect(typo, lessThan(400), reason: 'a typo error costs $typo B');
