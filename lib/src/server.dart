@@ -726,8 +726,8 @@ Map<String, dynamic> _rangeOf(_DateWindow window) =>
 /// happens to be stored, because a filter that returns nothing teaches a caller
 /// that there is no such flight.
 Map<String, JsonSchema> _flightNarrowingProperties() => {
-      'aircraft_registration': JsonSchema.string(
-          description: 'Bare (XZO) or display (VH-XZO).'),
+      'aircraft_registration':
+          JsonSchema.string(description: 'Bare (XZO) or display (VH-XZO).'),
       'flight_type': JsonSchema.string(),
       'crew_members_name': JsonSchema.string(),
       'departure_icao': JsonSchema.string(),
@@ -898,12 +898,13 @@ class _Auditor {
     Map<String, dynamic> args, {
     String? id,
     String? error,
+    String? result,
   }) {
     appendAudit(dbPath, {
       'ts': DateTime.now().toUtc().toIso8601String(),
       'tool': tool,
       'args': args,
-      'result': error == null ? 'ok' : 'error',
+      'result': result ?? (error == null ? 'ok' : 'error'),
       if (id != null) 'id': id,
       if (error != null) 'error': error,
     });
@@ -924,11 +925,26 @@ CallToolResult _runWrite(
   Map<String, dynamic> args,
   Object? Function() body,
 ) {
+  final dryRun = args['dry_run'] == true;
   try {
-    final result = db.transaction(body);
+    final result = db.transaction(() {
+      final value = body();
+      // A dry run previews with the body's own machinery: it resolves ids and
+      // links, renders the row as written and collects warnings, then this
+      // throw rolls the transaction back. A validation failure on the way
+      // still surfaces as that write's error, which is the point of a preview.
+      if (dryRun) {
+        throw _DryRun(Map<String, Object?>.of(value as Map<String, Object?>));
+      }
+      return value;
+    });
     final id = result is Map ? result['id'] : null;
     auditor.record(tool, args, id: id?.toString());
     return _ok(result);
+  } on _DryRun catch (dry) {
+    auditor.record(tool, args,
+        id: dry.result['id']?.toString(), result: 'dry_run');
+    return _ok({...dry.result, 'dry_run': true});
   } on _ToolError catch (error) {
     auditor.record(tool, args, error: error.detail);
     return _failWith(error);
@@ -1185,8 +1201,10 @@ const Set<String> _splitFields = {'total_time', 'day_time', 'night_time'};
 }) {
   final values = <String, Object?>{};
   final warnings = <String>[];
-  _rejectUnknown(args,
-      _fieldNames(_flightColumns, {'id', ..._hoursAliases.values, 'draft'}),
+  _rejectUnknown(
+      args,
+      _fieldNames(
+          _flightColumns, {'id', ..._hoursAliases.values, 'draft', 'dry_run'}),
       tool: tool);
   final fields = _minutesFromHours(args);
   _applyDraft(fields, args);
@@ -1470,6 +1488,22 @@ JsonSchema get _expectedUpdatedAtSchema => JsonSchema.integer(
     minimum: 0,
     description: 'The updated_at you read. A conflict returns the current row '
         'when it changed since. Omit to write unconditionally.');
+
+/// The `dry_run` argument every write tool accepts.
+JsonSchema get _dryRunSchema => JsonSchema.boolean(
+    description:
+        'True previews the write: the tool resolves, validates and answers '
+        'exactly as it would, with dry_run: true on the response, and changes '
+        'nothing.');
+
+/// Escapes a dry-run body with the result it built. Thrown after the body has
+/// resolved everything it would write, so the enclosing transaction rolls back:
+/// the preview answer is the write answer, minus the write.
+class _DryRun {
+  _DryRun(this.result);
+
+  final Map<String, Object?> result;
+}
 
 /// The extra WHERE fragment and bind values that turn an update into an
 /// optimistic one: with expected_updated_at the write applies only to the row
@@ -2382,8 +2416,7 @@ Future<void> runServer(String dbPath, {bool readonly = true}) async {
         'rows only unless include_shared is true.',
     inputSchema: JsonSchema.object(properties: {
       'type': JsonSchema.string(
-          enumValues: entityTotalDimensions,
-          description: 'What to group by.'),
+          enumValues: entityTotalDimensions, description: 'What to group by.'),
       'sort': JsonSchema.string(
           enumValues: entityTotalSorts,
           description: 'minutes and flights_complete order descending, label '
@@ -2816,6 +2849,7 @@ Future<void> runServer(String dbPath, {bool readonly = true}) async {
           'warnings for anything odd but legal.',
       inputSchema: JsonSchema.object(
         properties: {
+          'dry_run': _dryRunSchema,
           'id': _createIdSchema,
           ..._flightWriteProperties(db, notes: true),
         },
@@ -2871,6 +2905,7 @@ Future<void> runServer(String dbPath, {bool readonly = true}) async {
           'in falcon://conventions.',
       inputSchema: JsonSchema.object(
         properties: {
+          'dry_run': _dryRunSchema,
           'id': JsonSchema.string(),
           'expected_updated_at': _expectedUpdatedAtSchema,
           ..._flightWriteProperties(db, notes: false),
@@ -2933,7 +2968,8 @@ Future<void> runServer(String dbPath, {bool readonly = true}) async {
       'delete_flight',
       description: 'Delete a flight by id.',
       inputSchema: JsonSchema.object(
-          properties: {'id': JsonSchema.string()}, required: ['id']),
+          properties: {'dry_run': _dryRunSchema, 'id': JsonSchema.string()},
+          required: ['id']),
       annotations: const ToolAnnotations(
           readOnlyHint: false, destructiveHint: true, openWorldHint: false),
       callback: (args, extra) async =>
@@ -2957,6 +2993,7 @@ Future<void> runServer(String dbPath, {bool readonly = true}) async {
           'Add an aircraft. Registration is the bare registration without country code.',
       inputSchema: JsonSchema.object(
         properties: {
+          'dry_run': _dryRunSchema,
           'id': _createIdSchema,
           ..._propertiesOf(_supported(db, 'aircraft', _aircraftColumns)),
         },
@@ -2966,7 +3003,7 @@ Future<void> runServer(String dbPath, {bool readonly = true}) async {
           readOnlyHint: false, destructiveHint: false, openWorldHint: false),
       callback: (args, extra) async =>
           _runWrite(db, auditor, 'add_aircraft', args, () {
-        _rejectUnknown(args, _fieldNames(_aircraftColumns, {'id'}),
+        _rejectUnknown(args, _fieldNames(_aircraftColumns, {'id', 'dry_run'}),
             tool: 'add_aircraft');
         final type = asText(args['type']);
         final registration = asText(args['registration']);
@@ -3011,6 +3048,7 @@ Future<void> runServer(String dbPath, {bool readonly = true}) async {
           'Update an aircraft by id. Only the fields provided are changed.',
       inputSchema: JsonSchema.object(
         properties: {
+          'dry_run': _dryRunSchema,
           'id': JsonSchema.string(),
           'expected_updated_at': _expectedUpdatedAtSchema,
           ..._propertiesOf(_supported(db, 'aircraft', _aircraftColumns))
@@ -3022,7 +3060,9 @@ Future<void> runServer(String dbPath, {bool readonly = true}) async {
       callback: (args, extra) async =>
           _runWrite(db, auditor, 'update_aircraft', args, () {
         _rejectUnknown(
-            args, _fieldNames(_aircraftColumns, {'id', 'expected_updated_at'}),
+            args,
+            _fieldNames(
+                _aircraftColumns, {'id', 'expected_updated_at', 'dry_run'}),
             tool: 'update_aircraft');
         final id = asText(args['id']);
         if (id == null) throw _ToolError('Missing or invalid id', field: 'id');
@@ -3092,7 +3132,8 @@ Future<void> runServer(String dbPath, {bool readonly = true}) async {
       description:
           'Delete an aircraft by id. Flights keep their registration text but lose the link.',
       inputSchema: JsonSchema.object(
-          properties: {'id': JsonSchema.string()}, required: ['id']),
+          properties: {'dry_run': _dryRunSchema, 'id': JsonSchema.string()},
+          required: ['id']),
       annotations: const ToolAnnotations(
           readOnlyHint: false, destructiveHint: true, openWorldHint: false),
       callback: (args, extra) async =>
@@ -3115,6 +3156,7 @@ Future<void> runServer(String dbPath, {bool readonly = true}) async {
       description: 'Add a crew member.',
       inputSchema: JsonSchema.object(
         properties: {
+          'dry_run': _dryRunSchema,
           'id': _createIdSchema,
           ..._propertiesOf(_supported(db, 'crew_members', _crewColumns)),
         },
@@ -3124,7 +3166,7 @@ Future<void> runServer(String dbPath, {bool readonly = true}) async {
           readOnlyHint: false, destructiveHint: false, openWorldHint: false),
       callback: (args, extra) async =>
           _runWrite(db, auditor, 'add_crew', args, () {
-        _rejectUnknown(args, _fieldNames(_crewColumns, {'id'}),
+        _rejectUnknown(args, _fieldNames(_crewColumns, {'id', 'dry_run'}),
             tool: 'add_crew');
         final firstName = asText(args['first_name']);
         final lastName = asText(args['last_name']);
@@ -3155,6 +3197,7 @@ Future<void> runServer(String dbPath, {bool readonly = true}) async {
           'Update a crew member by id. Only the fields provided are changed.',
       inputSchema: JsonSchema.object(
         properties: {
+          'dry_run': _dryRunSchema,
           'id': JsonSchema.string(),
           'expected_updated_at': _expectedUpdatedAtSchema,
           ..._propertiesOf(_supported(db, 'crew_members', _crewColumns))
@@ -3165,8 +3208,8 @@ Future<void> runServer(String dbPath, {bool readonly = true}) async {
           readOnlyHint: false, destructiveHint: false, openWorldHint: false),
       callback: (args, extra) async =>
           _runWrite(db, auditor, 'update_crew', args, () {
-        _rejectUnknown(
-            args, _fieldNames(_crewColumns, {'id', 'expected_updated_at'}),
+        _rejectUnknown(args,
+            _fieldNames(_crewColumns, {'id', 'expected_updated_at', 'dry_run'}),
             tool: 'update_crew');
         final id = asText(args['id']);
         if (id == null) throw _ToolError('Missing or invalid id', field: 'id');
@@ -3202,7 +3245,8 @@ Future<void> runServer(String dbPath, {bool readonly = true}) async {
       description:
           'Delete a crew member by id. Flights keep the crew name but lose the link.',
       inputSchema: JsonSchema.object(
-          properties: {'id': JsonSchema.string()}, required: ['id']),
+          properties: {'dry_run': _dryRunSchema, 'id': JsonSchema.string()},
+          required: ['id']),
       annotations: const ToolAnnotations(
           readOnlyHint: false, destructiveHint: true, openWorldHint: false),
       callback: (args, extra) async =>
@@ -3227,6 +3271,7 @@ Future<void> runServer(String dbPath, {bool readonly = true}) async {
           'Add a custom airport that is not in the built-in airport list.',
       inputSchema: JsonSchema.object(
         properties: {
+          'dry_run': _dryRunSchema,
           'id': _createIdSchema,
           ..._propertiesOf(
               _supported(db, 'custom_airports', _customAirportColumns)),
@@ -3237,7 +3282,8 @@ Future<void> runServer(String dbPath, {bool readonly = true}) async {
           readOnlyHint: false, destructiveHint: false, openWorldHint: false),
       callback: (args, extra) async =>
           _runWrite(db, auditor, 'add_custom_airport', args, () {
-        _rejectUnknown(args, _fieldNames(_customAirportColumns, {'id'}),
+        _rejectUnknown(
+            args, _fieldNames(_customAirportColumns, {'id', 'dry_run'}),
             tool: 'add_custom_airport');
         final name = asText(args['name']);
         if (name == null) throw _ToolError('name is required');
@@ -3263,6 +3309,7 @@ Future<void> runServer(String dbPath, {bool readonly = true}) async {
           'Update a custom airport by id. Only the fields provided are changed.',
       inputSchema: JsonSchema.object(
         properties: {
+          'dry_run': _dryRunSchema,
           'id': JsonSchema.string(),
           'expected_updated_at': _expectedUpdatedAtSchema,
           ..._propertiesOf(
@@ -3274,8 +3321,10 @@ Future<void> runServer(String dbPath, {bool readonly = true}) async {
           readOnlyHint: false, destructiveHint: false, openWorldHint: false),
       callback: (args, extra) async =>
           _runWrite(db, auditor, 'update_custom_airport', args, () {
-        _rejectUnknown(args,
-            _fieldNames(_customAirportColumns, {'id', 'expected_updated_at'}),
+        _rejectUnknown(
+            args,
+            _fieldNames(_customAirportColumns,
+                {'id', 'expected_updated_at', 'dry_run'}),
             tool: 'update_custom_airport');
         final id = asText(args['id']);
         if (id == null) throw _ToolError('Missing or invalid id', field: 'id');
@@ -3311,7 +3360,8 @@ Future<void> runServer(String dbPath, {bool readonly = true}) async {
       'delete_custom_airport',
       description: 'Delete a custom airport by id.',
       inputSchema: JsonSchema.object(
-          properties: {'id': JsonSchema.string()}, required: ['id']),
+          properties: {'dry_run': _dryRunSchema, 'id': JsonSchema.string()},
+          required: ['id']),
       annotations: const ToolAnnotations(
           readOnlyHint: false, destructiveHint: true, openWorldHint: false),
       callback: (args, extra) async =>
@@ -3334,15 +3384,17 @@ Future<void> runServer(String dbPath, {bool readonly = true}) async {
       'add_saved_route',
       description: 'Add a saved route.',
       inputSchema: JsonSchema.object(
-        properties:
-            _propertiesOf(_supported(db, 'saved_routes', _savedRouteColumns)),
+        properties: {
+          'dry_run': _dryRunSchema,
+          ..._propertiesOf(_supported(db, 'saved_routes', _savedRouteColumns)),
+        },
         required: ['flight_number', 'departure_icao', 'arrival_icao'],
       ),
       annotations: const ToolAnnotations(
           readOnlyHint: false, destructiveHint: false, openWorldHint: false),
       callback: (args, extra) async =>
           _runWrite(db, auditor, 'add_saved_route', args, () {
-        _rejectUnknown(args, _fieldNames(_savedRouteColumns, {'id'}),
+        _rejectUnknown(args, _fieldNames(_savedRouteColumns, {'id', 'dry_run'}),
             tool: 'add_saved_route');
         final flightNumber = asText(args['flight_number']);
         final departure = asText(args['departure_icao']);
@@ -3371,6 +3423,7 @@ Future<void> runServer(String dbPath, {bool readonly = true}) async {
           'Update a saved route by id. Only the fields provided are changed.',
       inputSchema: JsonSchema.object(
         properties: {
+          'dry_run': _dryRunSchema,
           'id': JsonSchema.integer(),
           'expected_updated_at': _expectedUpdatedAtSchema,
           ..._propertiesOf(_supported(db, 'saved_routes', _savedRouteColumns))
@@ -3381,8 +3434,10 @@ Future<void> runServer(String dbPath, {bool readonly = true}) async {
           readOnlyHint: false, destructiveHint: false, openWorldHint: false),
       callback: (args, extra) async =>
           _runWrite(db, auditor, 'update_saved_route', args, () {
-        _rejectUnknown(args,
-            _fieldNames(_savedRouteColumns, {'id', 'expected_updated_at'}),
+        _rejectUnknown(
+            args,
+            _fieldNames(
+                _savedRouteColumns, {'id', 'expected_updated_at', 'dry_run'}),
             tool: 'update_saved_route');
         final id = asInt(args['id']);
         if (id == null) throw _ToolError('Missing or invalid id', field: 'id');
@@ -3418,7 +3473,8 @@ Future<void> runServer(String dbPath, {bool readonly = true}) async {
       description:
           'Delete a saved route by id. Flights that referenced it are unlinked.',
       inputSchema: JsonSchema.object(
-          properties: {'id': JsonSchema.integer()}, required: ['id']),
+          properties: {'dry_run': _dryRunSchema, 'id': JsonSchema.integer()},
+          required: ['id']),
       annotations: const ToolAnnotations(
           readOnlyHint: false, destructiveHint: true, openWorldHint: false),
       callback: (args, extra) async =>
@@ -3458,6 +3514,7 @@ Future<void> runServer(String dbPath, {bool readonly = true}) async {
           'settings as written as settings.',
       inputSchema: JsonSchema.object(
         properties: {
+          'dry_run': _dryRunSchema,
           'expected_updated_at': _expectedUpdatedAtSchema,
           ..._propertiesOf(
               _supported(db, 'flights_settings', _flightSettingsColumns)),
@@ -3468,7 +3525,9 @@ Future<void> runServer(String dbPath, {bool readonly = true}) async {
       callback: (args, extra) async =>
           _runWrite(db, auditor, 'update_flight_settings', args, () {
         _rejectUnknown(
-            args, _fieldNames(_flightSettingsColumns, {'expected_updated_at'}),
+            args,
+            _fieldNames(
+                _flightSettingsColumns, {'expected_updated_at', 'dry_run'}),
             tool: 'update_flight_settings');
         final columns = <String>[];
         final values = <Object?>[];
@@ -3641,6 +3700,7 @@ Future<void> runServer(String dbPath, {bool readonly = true}) async {
                 '- A field means the same thing wherever it appears: create_flight and update_flight take the same flight fields with the same types and limits, the per-field notes are written once on create_flight, and what a field means is written here.\n'
                 '- Use get_schema for table names and their column counts; pass table for one table\'s columns, and detail: "full" for its default and pk columns too.\n'
                 '- Update tools accept expected_updated_at: the updated_at of the row as the caller read it. The write then applies only to an unchanged row, so a concurrent change from the app or another writer fails with a conflict that returns the current row, instead of being silently overwritten. Omitting it writes unconditionally, as before.\n'
+                '- Every write tool accepts dry_run: true: it resolves, validates and answers exactly as the write would (the row as written, computed ids, warnings), marks the response dry_run: true, and commits nothing. A preview error is the write error, so a clean preview means the write will apply; an id a preview generated is not reserved, so pass your own or let the real call make one.\n'
                 '- A failed call returns {error, field, detail}: error is a stable code (unknown_field, invalid_value, not_found, conflict, constraint, busy, internal), field is the argument at fault, and unknown_field also names the tool. detail is one sentence, and the accepted list is capped at eight names plus a count. A conflict adds current, the row as it stands now.',
           ),
         ],
