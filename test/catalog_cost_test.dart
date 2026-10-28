@@ -246,9 +246,13 @@ void main() {
       }
 
       // Every column note is on create_flight and absent from update_flight.
+      // dry_run is the one exception by design: the preview argument rides
+      // every write tool with its one line, like expected_updated_at does on
+      // the update side.
       final noted = [
         for (final entry in create.entries)
-          if (entry.value['description'] != null) entry.key,
+          if (entry.value['description'] != null && entry.key != 'dry_run')
+            entry.key,
       ];
       expect(noted, containsAll(['date', 'total_time', 'time_start', 'route']));
       expect(noted.length, greaterThan(15),
@@ -260,8 +264,12 @@ void main() {
       }
       for (final name in update.keys) {
         // id and draft are the two bare flight arguments; expected_updated_at
-        // is the concurrency guard whose description lives on the argument.
-        if (name == 'draft' || name == 'id' || name == 'expected_updated_at') {
+        // is the concurrency guard and dry_run the preview argument, whose
+        // descriptions live on the arguments themselves.
+        if (name == 'draft' ||
+            name == 'id' ||
+            name == 'expected_updated_at' ||
+            name == 'dry_run') {
           continue;
         }
         expect(update[name]!['description'], isNull,
@@ -306,14 +314,15 @@ void main() {
       // this from 29,956 B to 33,428 B, the 138 B of enum values and offset to
       // 33,566 B, and #24's route rework moved it again. #10's conflict guard
       // adds `expected_updated_at` to the six update tools (name, integer
-      // type and one line each). Measured on the rebased tree: 35,264 B. Same
-      // rule as above: measured plus 1,024 B, so wording has room and a tool
-      // does not.
+      // type and one line each), measured at 35,264 B on that tree. #10's
+      // dry-run slice adds `dry_run` to all sixteen write tools (name,
+      // boolean type and one line each) at 3,024 B. Same rule as above:
+      // measured plus 1,024 B, so wording has room and a tool does not.
       final writeMode =
           bytesOf(jsonEncode((await writer.send('tools/list', {}))['result']));
-      expect(writeMode, lessThanOrEqualTo(36288),
+      expect(writeMode, lessThanOrEqualTo(39312),
           reason: 'the write-mode catalog costs $writeMode B, against '
-              '35,264 B measured plus 1,024 B of wording headroom');
+              '38,288 B measured plus 1,024 B of wording headroom');
     });
   });
 
@@ -444,8 +453,8 @@ void main() {
       // The accepted list is capped: eight names then a count, so the envelope
       // stays inside the budget the issue sets.
       final detail = envelope['detail'] as String;
-      expect(detail, contains('and 34 more'),
-          reason: 'update_flight accepts 43 arguments; eight are named');
+      expect(detail, contains('and 35 more'),
+          reason: 'update_flight accepts 44 arguments; eight are named');
       final named = detail.replaceFirst('accepts ', '').split(' and ').first;
       expect(named.split(', '), hasLength(8));
       expect(
