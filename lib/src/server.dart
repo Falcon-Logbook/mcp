@@ -899,6 +899,7 @@ class _Auditor {
     String? id,
     String? error,
     String? result,
+    List<String>? ids,
   }) {
     appendAudit(dbPath, {
       'ts': DateTime.now().toUtc().toIso8601String(),
@@ -906,6 +907,7 @@ class _Auditor {
       'args': args,
       'result': result ?? (error == null ? 'ok' : 'error'),
       if (id != null) 'id': id,
+      if (ids != null) 'ids': ids,
       if (error != null) 'error': error,
     });
   }
@@ -939,11 +941,16 @@ CallToolResult _runWrite(
       return value;
     });
     final id = result is Map ? result['id'] : null;
-    auditor.record(tool, args, id: id?.toString());
+    final ids = result is Map ? result['affected_ids'] : null;
+    auditor.record(tool, args,
+        id: id?.toString(), ids: ids is List ? ids.cast<String>() : null);
     return _ok(result);
   } on _DryRun catch (dry) {
+    final ids = dry.result['affected_ids'];
     auditor.record(tool, args,
-        id: dry.result['id']?.toString(), result: 'dry_run');
+        id: dry.result['id']?.toString(),
+        ids: ids is List ? ids.cast<String>() : null,
+        result: 'dry_run');
     return _ok({...dry.result, 'dry_run': true});
   } on _ToolError catch (error) {
     auditor.record(tool, args, error: error.detail);
@@ -993,6 +1000,65 @@ DateTime? _localDate(Object? value) => switch (value) {
 /// skipped a blank registration.
 String _displayRegistration(String? countryCode, String registration) =>
     displayRegistration(countryCode, registration) ?? registration;
+
+/// Today's local midnight as the epoch seconds a `date` column stores, so
+/// "future" in a report means after today, not after this second.
+int _todayLocalMidnightEpoch() {
+  final now = DateTime.now();
+  return DateTime(now.year, now.month, now.day).millisecondsSinceEpoch ~/ 1000;
+}
+
+/// The pilot's own registration country from `flights_settings`, or null. The
+/// aircraft link prefers it when one bare registration exists under two
+/// country codes, because the pilot's fleet is the likelier match.
+String? _logbookCountry(FalconDb db) {
+  if (!db.hasTable('flights_settings') ||
+      !db.columnsOf('flights_settings').contains('logbook_country')) {
+    return null;
+  }
+  final rows = db.query('SELECT logbook_country FROM flights_settings '
+      "WHERE logbook_country IS NOT NULL AND logbook_country != '' LIMIT 1");
+  return rows.isEmpty ? null : asText(rows.first['logbook_country']);
+}
+
+/// The registration country prefixes the pilot's own fleet carries, from
+/// `flights_settings.logbook_country`.
+///
+/// `logbook_country` is the CAA authority ('AU' or 'NZ'), not a registration
+/// prefix, so it maps to the prefix a fleet of that authority carries (VH,
+/// ZK). The authority itself is accepted too, because the app's importer
+/// writes `logbook_country` as the default aircraft country code. The aircraft
+/// link prefers these when one bare registration exists under two codes,
+/// because the pilot's own fleet is the likelier match.
+Set<String> _preferredCountryCodes(FalconDb db) {
+  final country = _logbookCountry(db)?.toUpperCase();
+  if (country == null) return const {};
+  final prefix = switch (country) {
+    'AU' => 'VH',
+    'NZ' => 'ZK',
+    _ => null,
+  };
+  return prefix == null ? {country} : {country, prefix};
+}
+
+/// A list-of-ids argument as clean strings, refusing anything else so a
+/// malformed call fails loudly instead of silently linking nothing.
+List<String> _idListArg(Map<String, dynamic> args, String key) {
+  final value = args[key];
+  if (value == null) return const [];
+  if (value is! List) {
+    throw _ToolError('$key must be a list of ids', field: key);
+  }
+  final ids = <String>[];
+  for (final entry in value) {
+    final id = asText(entry);
+    if (id == null) {
+      throw _ToolError('$key must be a list of ids', field: key);
+    }
+    ids.add(id);
+  }
+  return ids;
+}
 
 /// Every aircraft whose stored registration or display form normalises to the
 /// same key as [registration], active rows only when any are active.
@@ -1114,6 +1180,10 @@ List<T> _activeOr<T>(List<T> rows, bool Function(T row) archived) {
 /// `crew_member_id` matches a name filter even when its stored name is null.
 List<String> _crewIdsNamed(FalconDb db, String name) =>
     [for (final match in _crewCandidates(db, name)) match.id];
+
+/// The most rows any one `data_quality_report` class shows in its sample. A
+/// count is the finding; four rows is enough to start acting on it.
+const _reportSampleCap = 4;
 
 /// Converts every `*_hours` argument to the minutes the column stores, so the
 /// conversion happens once. Supplying both forms of one field is an error.
@@ -1495,6 +1565,13 @@ JsonSchema get _dryRunSchema => JsonSchema.boolean(
         'True previews the write: the tool resolves, validates and answers '
         'exactly as it would, with dry_run: true on the response, and changes '
         'nothing.');
+
+/// The `dry_run` argument the repair tools take, which default to a preview:
+/// the agent must pass false explicitly to change rows.
+JsonSchema get _repairDryRunSchema => JsonSchema.boolean(
+    description:
+        'Default true: the repair reports what it would change and touches '
+        'nothing. Pass false to apply, for the same diff as the preview.');
 
 /// Escapes a dry-run body with the result it built. Thrown after the body has
 /// resolved everything it would write, so the enclosing transaction rolls back:
@@ -2831,9 +2908,253 @@ Future<void> runServer(String dbPath, {bool readonly = true}) async {
     },
   );
 
-  // ============================================================
-  // WRITE TOOLS - only registered when writes are enabled
-  // ============================================================
+  // One pass over the logbook's defect classes, so an agent can see the whole
+  // mess before repairing any of it.
+  server.registerTool(
+    'data_quality_report',
+    description:
+        'Every defect class an imported logbook can have, in one call: drafts, '
+        'missing or mismatched day/night splits, absurd totals, unlinked '
+        'aircraft and crew, duplicate crew and duplicate flights, unparsable '
+        'routes, future dates, dangling route links, simulator oddities and '
+        'orphaned registration text. Each class carries a count and a small '
+        'sample; act on a class with merge_crew or the link tools. Read-only.',
+    inputSchema: JsonSchema.object(properties: {
+      _includeSharedKey: JsonSchema.boolean(
+          description:
+              'Include rows owned by another device or account. Default false.'),
+    }),
+    annotations: readOnlyAnnotations,
+    callback: (args, extra) async {
+      try {
+        _rejectUnknown(args, {_includeSharedKey}, tool: 'data_quality_report');
+        final owner = _ownerClause(db, 'flights',
+            includeShared: asBool(args[_includeSharedKey]) ?? false);
+        final classes = <Map<String, dynamic>>[];
+        final flights = db.query(
+          'SELECT id, date, route, route_id, total_time, day_time, night_time,'
+          ' is_simulator, aircraft_id, aircraft_registration,'
+          ' crew_member_id, crew_members_name FROM flights'
+          '${owner.isEmpty ? '' : ' WHERE $owner'} ORDER BY date DESC, id',
+        );
+        final routesTable = db.hasTable('saved_routes');
+
+        // One rendering per flight, reused by the sample rows: id, date,
+        // route, so an agent can act on a class without a second lookup.
+        Map<String, dynamic> sample(Map<String, dynamic> row,
+                [Map<String, dynamic>? extra]) =>
+            {
+              'id': row['id'],
+              'date': row['date'],
+              if (row['route'] != null) 'route': row['route'],
+              ...?extra,
+            };
+
+        void addClass(String id, String label, List<Map<String, dynamic>> rows,
+            {int? count}) {
+          if (rows.isEmpty && (count ?? 0) == 0) return;
+          classes.add({
+            'id': id,
+            'label': label,
+            'count': count ?? rows.length,
+            'sample': [
+              for (final row in rows.take(_reportSampleCap)) row,
+            ],
+          });
+        }
+
+        final drafts = <Map<String, dynamic>>[];
+        final missingSplit = <Map<String, dynamic>>[];
+        final splitMismatch = <Map<String, dynamic>>[];
+        final absurdTotals = <Map<String, dynamic>>[];
+        final aircraftMatchable = <Map<String, dynamic>>[];
+        final aircraftUnmatched = <Map<String, dynamic>>[];
+        final crewMatchable = <Map<String, dynamic>>[];
+        final routeUnparsable = <Map<String, dynamic>>[];
+        final futureDates = <Map<String, dynamic>>[];
+        final danglingRoute = <Map<String, dynamic>>[];
+        final simulatorOdd = <Map<String, dynamic>>[];
+        final orphanedText = <Map<String, dynamic>>[];
+        final today = _todayLocalMidnightEpoch();
+        for (final flight in flights) {
+          final total = asInt(flight['total_time']);
+          final day = asInt(flight['day_time']);
+          final night = asInt(flight['night_time']);
+          final sim = asBool(flight['is_simulator']) ?? false;
+          final aircraftId = asText(flight['aircraft_id']);
+          final registration = asText(flight['aircraft_registration'])?.trim();
+          final crewId = asText(flight['crew_member_id']);
+          final crewName = asText(flight['crew_members_name'])?.trim();
+          if (total == null) drafts.add(sample(flight));
+          if (total != null && !sim && (day == null || night == null)) {
+            missingSplit.add(sample(flight));
+          }
+          if (total != null && day != null && night != null && !sim) {
+            if (day + night != total) splitMismatch.add(sample(flight));
+          }
+          if (total != null && (total == 0 || total > maxFlightMinutes)) {
+            absurdTotals.add(sample(flight));
+          }
+          if (aircraftId == null &&
+              registration != null &&
+              registration.isNotEmpty) {
+            final matches = _aircraftCandidates(db, registration);
+            final extra = <String, dynamic>{
+              'aircraft_registration': registration,
+              'candidates': matches.length,
+            };
+            if (matches.isEmpty) {
+              aircraftUnmatched.add(sample(flight, extra));
+            } else {
+              aircraftMatchable.add(sample(flight, extra));
+            }
+          }
+          if (crewId == null &&
+              crewName != null &&
+              crewName.isNotEmpty &&
+              _crewCandidates(db, crewName).isNotEmpty) {
+            crewMatchable.add(sample(flight));
+          }
+          final route = asText(flight['route'])?.trim();
+          if (route != null && route.isNotEmpty && parseRoute(route) == null) {
+            routeUnparsable.add(sample(flight));
+          }
+          final date = _localDate(flight['date']);
+          if (date != null && date.millisecondsSinceEpoch ~/ 1000 > today) {
+            futureDates.add(sample(flight));
+          }
+          if (routesTable &&
+              flight['route_id'] != null &&
+              db.query('SELECT id FROM saved_routes WHERE id = ?',
+                  [flight['route_id']]).isEmpty) {
+            danglingRoute.add(sample(flight));
+          }
+          if (sim && total == null) {
+            simulatorOdd.add(sample(flight, {'reason': 'no_duration'}));
+          } else if (sim &&
+              aircraftId != null &&
+              db.query(
+                  'SELECT id FROM aircraft WHERE id = ? '
+                  'AND coalesce(simulator, 0) = 0',
+                  [aircraftId]).isNotEmpty) {
+            simulatorOdd.add(sample(flight, {'reason': 'aircraft_not_sim'}));
+          }
+          if ((aircraftId != null) !=
+              (registration != null && registration.isNotEmpty)) {
+            orphanedText.add(sample(flight, {
+              'aircraft_id': aircraftId,
+              'aircraft_registration': registration,
+            }));
+          }
+        }
+
+        // Duplicate crews and flights are group lenses: the sample entry is
+        // the group with every member id, not a lone row.
+        final crewOwner = _ownerClause(db, 'crew_members',
+            includeShared: asBool(args[_includeSharedKey]) ?? false);
+        final crewRows = db.query('SELECT id, name, archived FROM crew_members'
+            '${crewOwner.isEmpty ? '' : ' WHERE $crewOwner'} ORDER BY name, id');
+        final crewGroups = <String, List<Map<String, dynamic>>>{};
+        for (final row in crewRows) {
+          final key = _normalizeKey(asText(row['name']) ?? '');
+          if (key.isEmpty) continue;
+          crewGroups.putIfAbsent(key, () => []).add(row);
+        }
+        final duplicateCrew = [
+          for (final entry in crewGroups.entries)
+            if (entry.value.length > 1)
+              {
+                'name': entry.key,
+                'members': [
+                  for (final member in entry.value)
+                    {
+                      'id': member['id'],
+                      'name': member['name'],
+                      'archived': member['archived'],
+                    },
+                ],
+              },
+        ];
+
+        final flightGroups = <String, List<Map<String, dynamic>>>{};
+        for (final flight in flights) {
+          final key = [
+            flight['date'],
+            flight['route'],
+            flight['aircraft_registration'],
+            flight['total_time'],
+          ].join('\u{1}');
+          flightGroups.putIfAbsent(key, () => []).add(flight);
+        }
+        final duplicateFlights = [
+          for (final entry in flightGroups.entries)
+            if (entry.value.length > 1)
+              {
+                'date': entry.value.first['date'],
+                'route': entry.value.first['route'],
+                'aircraft_registration':
+                    entry.value.first['aircraft_registration'],
+                'total_time': entry.value.first['total_time'],
+                'flight_ids': [for (final row in entry.value) row['id']],
+              },
+        ];
+
+        addClass('drafts', 'Flights with no total_time (drafts)', drafts);
+        addClass('missing_split',
+            'Complete flights with a missing day/night split', missingSplit);
+        addClass(
+            'split_mismatch',
+            'Flights whose day + night does not equal the total',
+            splitMismatch);
+        addClass(
+            'absurd_totals',
+            'Totals of zero, or above the app cap of $maxFlightMinutes minutes',
+            absurdTotals);
+        addClass(
+            'aircraft_matchable',
+            'Flights whose registration text matches an aircraft row, unlinked',
+            aircraftMatchable);
+        addClass(
+            'aircraft_unmatched',
+            'Flights whose registration text matches no aircraft row',
+            aircraftUnmatched);
+        addClass(
+            'crew_matchable',
+            'Flights whose crew name matches a crew member, unlinked',
+            crewMatchable);
+        addClass('duplicate_crew', 'Crew members whose names normalise alike',
+            duplicateCrew);
+        addClass('duplicate_flights',
+            'Same date, route, registration and total', duplicateFlights);
+        addClass(
+            'route_unparsable',
+            'Routes the app reads as free text, not an airport pair',
+            routeUnparsable);
+        addClass('future_dates', 'Flights dated after today', futureDates);
+        addClass('dangling_route_link',
+            'Route links pointing at no saved route', danglingRoute);
+        addClass(
+            'simulator_oddities',
+            'Simulator sessions with no duration, or on a non-sim aircraft',
+            simulatorOdd);
+        addClass(
+            'orphaned_aircraft_text',
+            'One of the aircraft pair (link, registration text) set, other empty',
+            orphanedText);
+
+        return _ok({
+          'generated_at': DateTime.now().toUtc().toIso8601String(),
+          'total_flights': flights.length,
+          'classes': classes,
+        });
+      } on _ToolError catch (error) {
+        return _failWith(error);
+      } catch (error) {
+        return _failWith(_asToolError(error));
+      }
+    },
+  );
+
   if (!readonly) {
     // --- flights ---
 
@@ -3595,6 +3916,414 @@ Future<void> runServer(String dbPath, {bool readonly = true}) async {
         };
       }),
     );
+
+    // --- repairs: dry-run-first fixes for an imported logbook ---
+
+    server.registerTool(
+      'merge_crew',
+      description:
+          'Merge duplicate crew members the way the app does: flights pointing '
+          'at the discarded rows are repointed at the survivor with the '
+          "survivor's name, and each discarded row is deleted with a sync "
+          'tombstone. dry_run defaults to true; pass false to apply. Find the '
+          'ids with dedupe_crew. Refuses a missing id, into_id inside '
+          'from_ids, and an archived survivor over an active row.',
+      inputSchema: JsonSchema.object(
+        properties: {
+          'dry_run': _repairDryRunSchema,
+          'into_id': JsonSchema.string(
+              description: 'The crew member that survives the merge.'),
+          'from_ids': JsonSchema.array(
+            items: JsonSchema.string(),
+            description: 'The crew members to merge away and delete.',
+          ),
+        },
+        required: ['into_id', 'from_ids'],
+      ),
+      annotations: const ToolAnnotations(
+          readOnlyHint: false, destructiveHint: true, openWorldHint: false),
+      callback: (args, extra) async {
+        // A repair defaults to a preview: the agent must say false to apply.
+        final effectiveArgs = {
+          ...args,
+          'dry_run': asBool(args['dry_run']) != false,
+        };
+        return _runWrite(db, auditor, 'merge_crew', effectiveArgs, () {
+          final intoId = asText(args['into_id']);
+          if (intoId == null) {
+            throw _ToolError('into_id is required', field: 'into_id');
+          }
+          final fromIds = _idListArg(args, 'from_ids');
+          if (fromIds.isEmpty) {
+            throw _ToolError(
+                'from_ids needs at least one crew id to merge away',
+                field: 'from_ids');
+          }
+          if (fromIds.contains(intoId)) {
+            throw _ToolError('into_id must not also be in from_ids',
+                field: 'into_id');
+          }
+          final keepRows = db.query(
+              'SELECT id, name, first_name, last_name, archived '
+              'FROM crew_members WHERE id = ?',
+              [intoId]);
+          if (keepRows.isEmpty) {
+            throw _ToolError('Crew member not found: $intoId',
+                code: 'not_found', field: 'into_id');
+          }
+          final keep = keepRows.first;
+          final keepArchived = asBool(keep['archived']) ?? false;
+          final keepName = (asText(keep['name']) ?? '').trim();
+          final discards = <Map<String, dynamic>>[];
+          for (final id in fromIds) {
+            final rows = db.query(
+                'SELECT id, name, archived FROM crew_members WHERE id = ?',
+                [id]);
+            if (rows.isEmpty) {
+              throw _ToolError('Crew member not found: $id',
+                  code: 'not_found', field: 'from_ids');
+            }
+            final discard = rows.single;
+            if (keepArchived && !(asBool(discard['archived']) ?? false)) {
+              throw _ToolError(
+                  'The survivor ${keep['name']} is archived and $id is not; '
+                  'merge into an active crew member instead.',
+                  field: 'into_id');
+            }
+            discards.add(discard);
+          }
+
+          // The app's merge (crewDao.mergeCrewMembers): repoint every flight
+          // linked to the discard, then the flights whose text names the
+          // discard but whose link points elsewhere, then tombstone and
+          // delete the discard. One transaction, so a refusal halfway leaves
+          // every row as it was.
+          var repointed = 0;
+          var renamed = 0;
+          final removed = <Map<String, dynamic>>[];
+          final affectedIds = <String>[intoId];
+          for (final discard in discards) {
+            final discardId = discard['id'] as String;
+            final discardName = (asText(discard['name']) ?? '').trim();
+            affectedIds.addAll([
+              for (final row in db.query(
+                  'SELECT id FROM flights WHERE crew_member_id = ?',
+                  [discardId]))
+                row['id'] as String,
+            ]);
+            repointed += db.execute(
+              'UPDATE flights SET crew_member_id = ?, crew_members_name = ?, '
+              'updated_at = ? WHERE crew_member_id = ?',
+              [intoId, keepName, nowEpochSeconds(), discardId],
+            );
+            if (discardName.isNotEmpty) {
+              affectedIds.addAll([
+                for (final row in db.query(
+                    'SELECT id FROM flights WHERE crew_members_name = ? '
+                    'AND crew_member_id IS NOT NULL AND crew_member_id != ?',
+                    [discardName, intoId]))
+                  row['id'] as String,
+              ]);
+              renamed += db.execute(
+                'UPDATE flights SET crew_member_id = ?, crew_members_name = ?, '
+                'updated_at = ? WHERE crew_members_name = ? '
+                'AND crew_member_id IS NOT NULL AND crew_member_id != ?',
+                [intoId, keepName, nowEpochSeconds(), discardName, intoId],
+              );
+            }
+            _deleteSyncedRow(db, 'crew_members', discardId, 'Crew member');
+            affectedIds.add(discardId);
+            removed.add({'id': discardId, 'name': discard['name']});
+          }
+          return {
+            'status': 'merged',
+            'id': intoId,
+            'name': keepName,
+            'flights_repointed': repointed,
+            'flights_renamed': renamed,
+            'removed': removed,
+            'affected_ids': affectedIds,
+          };
+        });
+      },
+    );
+
+    server.registerTool(
+      'link_flights_to_aircraft',
+      description:
+          'Link flights to aircraft by resolving their registration text '
+          'against the fleet, the way a write does, so "VH-XZO" or "XZO" '
+          'matches an aircraft stored as bare "XZO". Also fills registration '
+          'text from the linked aircraft when the link is set and the text is '
+          'empty. Ambiguous registrations (one tail under two countries) are '
+          'reported, not guessed, unless logbook_country settles them. Never '
+          'creates aircraft. dry_run defaults to true.',
+      inputSchema: JsonSchema.object(properties: {
+        'dry_run': _repairDryRunSchema,
+        'aircraft_id': JsonSchema.string(
+            description:
+                'Link the named flights to this aircraft (the picker flow, '
+                'after ask_user). Requires flight_ids.'),
+        'flight_ids': JsonSchema.array(
+          items: JsonSchema.string(),
+          description: 'Link only these flights. Default: every flight with an '
+              'unresolved aircraft pair.',
+        ),
+      }),
+      annotations: const ToolAnnotations(
+          readOnlyHint: false, destructiveHint: false, openWorldHint: false),
+      callback: (args, extra) async {
+        final effectiveArgs = {
+          ...args,
+          'dry_run': asBool(args['dry_run']) != false,
+        };
+        return _runWrite(db, auditor, 'link_flights_to_aircraft', effectiveArgs,
+            () {
+          final aircraftId = asText(args['aircraft_id']);
+          final flightIds = _idListArg(args, 'flight_ids');
+          final preferred = _preferredCountryCodes(db);
+
+          // The picker flow: the user chose one aircraft, the agent names the
+          // flights. Resolve nothing; link what it was told to.
+          Map<String, dynamic>? target;
+          if (aircraftId != null) {
+            final rows = db.query(
+                'SELECT id, country_code, registration FROM aircraft '
+                'WHERE id = ?',
+                [aircraftId]);
+            if (rows.isEmpty) {
+              throw _ToolError('Aircraft not found: $aircraftId',
+                  code: 'not_found', field: 'aircraft_id');
+            }
+            if (flightIds.isEmpty) {
+              throw _ToolError(
+                  'aircraft_id names the target; pass flight_ids to say which '
+                  'flights to link',
+                  field: 'flight_ids');
+            }
+            target = rows.first;
+          }
+
+          final candidates = <Map<String, dynamic>>[];
+          if (flightIds.isNotEmpty) {
+            for (final id in flightIds) {
+              final rows = db.query(
+                  'SELECT id, date, route, aircraft_id,'
+                  ' aircraft_registration FROM flights WHERE id = ?',
+                  [id]);
+              if (rows.isEmpty) {
+                throw _ToolError('Flight not found: $id',
+                    code: 'not_found', field: 'flight_ids');
+              }
+              candidates.add(rows.single);
+            }
+          } else {
+            if (aircraftId != null) {
+              throw _ToolError(
+                  'Pass flight_ids to say which flights to link to $aircraftId',
+                  field: 'flight_ids');
+            }
+            candidates.addAll(db.query(
+              'SELECT id, date, route, aircraft_id, aircraft_registration '
+              'FROM flights WHERE (aircraft_id IS NULL AND '
+              "trim(coalesce(aircraft_registration, '')) != '') OR "
+              "(aircraft_id IS NOT NULL AND "
+              "trim(coalesce(aircraft_registration, '')) = '') "
+              'ORDER BY date DESC, id',
+            ));
+          }
+
+          var linked = 0;
+          var reverseFixed = 0;
+          final ambiguous = <Map<String, dynamic>>[];
+          final unmatched = <Map<String, dynamic>>[];
+          final affectedIds = <String>[];
+          for (final flight in candidates) {
+            final id = flight['id'] as String;
+            final currentId = asText(flight['aircraft_id']);
+            final registration =
+                asText(flight['aircraft_registration'])?.trim();
+            final hasText = registration != null && registration.isNotEmpty;
+
+            String displayOf(Map<String, dynamic> aircraft) =>
+                _displayRegistration(asText(aircraft['country_code']),
+                    asText(aircraft['registration']) ?? '');
+
+            void linkTo(String targetId, String display) {
+              db.execute(
+                'UPDATE flights SET aircraft_id = ?, aircraft_registration = ?,'
+                ' updated_at = ? WHERE id = ?',
+                [targetId, display, nowEpochSeconds(), id],
+              );
+              linked++;
+              affectedIds.add(id);
+            }
+
+            if (target != null) {
+              linkTo(target['id'] as String, displayOf(target));
+              continue;
+            }
+            if (currentId != null && !hasText) {
+              // The reverse case: the link is set and the text went missing.
+              final rows = db.query(
+                  'SELECT country_code, registration FROM aircraft '
+                  'WHERE id = ?',
+                  [currentId]);
+              if (rows.isEmpty) {
+                unmatched.add({
+                  'flight_id': id,
+                  'aircraft_id': currentId,
+                  'detail': 'linked aircraft row no longer exists',
+                });
+              } else {
+                db.execute(
+                  'UPDATE flights SET aircraft_registration = ?, updated_at = ?'
+                  ' WHERE id = ?',
+                  [displayOf(rows.first), nowEpochSeconds(), id],
+                );
+                reverseFixed++;
+                affectedIds.add(id);
+              }
+              continue;
+            }
+            if (currentId != null) continue;
+            final matches = _aircraftCandidates(db, registration!);
+            var chosen = matches;
+            if (matches.length > 1 && preferred.isNotEmpty) {
+              final inCountry = matches
+                  .where((match) => preferred.contains(match.countryCode))
+                  .toList();
+              if (inCountry.length == 1) chosen = inCountry;
+            }
+            if (chosen.length == 1) {
+              linkTo(chosen.single.id, chosen.single.display);
+            } else if (matches.isEmpty) {
+              unmatched.add(
+                  {'flight_id': id, 'aircraft_registration': registration});
+            } else {
+              ambiguous.add({
+                'flight_id': id,
+                'aircraft_registration': registration,
+                'candidates': [
+                  for (final match in matches)
+                    {'id': match.id, 'registration': match.display},
+                ],
+              });
+            }
+          }
+          return {
+            'status': 'linked',
+            'linked': linked,
+            if (reverseFixed > 0) 'reverse_fixed': reverseFixed,
+            if (ambiguous.isNotEmpty)
+              'ambiguous': ambiguous.length > _reportSampleCap * 5
+                  ? ambiguous.take(_reportSampleCap * 5).toList()
+                  : ambiguous,
+            if (unmatched.isNotEmpty)
+              'unmatched': unmatched.length > _reportSampleCap * 5
+                  ? unmatched.take(_reportSampleCap * 5).toList()
+                  : unmatched,
+            'affected_ids': affectedIds,
+          };
+        });
+      },
+    );
+
+    server.registerTool(
+      'link_flights_to_crew',
+      description:
+          'Link flights to crew members by resolving their crew name text '
+          'against the fleet, so "J Smith" matches a crew member stored as '
+          '"John Smith" when the normaliser agrees. Ambiguous names (two crew '
+          'whose names normalise alike) are reported, never guessed. dry_run '
+          'defaults to true.',
+      inputSchema: JsonSchema.object(properties: {
+        'dry_run': _repairDryRunSchema,
+        'flight_ids': JsonSchema.array(
+          items: JsonSchema.string(),
+          description:
+              'Link only these flights. Default: every flight with a crew '
+              'name but no crew link.',
+        ),
+      }),
+      annotations: const ToolAnnotations(
+          readOnlyHint: false, destructiveHint: false, openWorldHint: false),
+      callback: (args, extra) async {
+        final effectiveArgs = {
+          ...args,
+          'dry_run': asBool(args['dry_run']) != false,
+        };
+        return _runWrite(db, auditor, 'link_flights_to_crew', effectiveArgs,
+            () {
+          final flightIds = _idListArg(args, 'flight_ids');
+          final candidates = <Map<String, dynamic>>[];
+          if (flightIds.isNotEmpty) {
+            for (final id in flightIds) {
+              final rows = db.query(
+                  'SELECT id, date, route, crew_member_id, crew_members_name '
+                  'FROM flights WHERE id = ?',
+                  [id]);
+              if (rows.isEmpty) {
+                throw _ToolError('Flight not found: $id',
+                    code: 'not_found', field: 'flight_ids');
+              }
+              candidates.add(rows.single);
+            }
+          } else {
+            candidates.addAll(db.query(
+              "SELECT id, date, route, crew_member_id, crew_members_name FROM"
+              " flights WHERE crew_member_id IS NULL AND"
+              " trim(coalesce(crew_members_name, '')) != ''"
+              ' ORDER BY date DESC, id',
+            ));
+          }
+
+          var linked = 0;
+          final ambiguous = <Map<String, dynamic>>[];
+          final unmatched = <Map<String, dynamic>>[];
+          final affectedIds = <String>[];
+          for (final flight in candidates) {
+            final id = flight['id'] as String;
+            final name = asText(flight['crew_members_name'])?.trim();
+            if (name == null || name.isEmpty) continue;
+            final matches = _crewCandidates(db, name);
+            if (matches.length == 1) {
+              db.execute(
+                'UPDATE flights SET crew_member_id = ?, updated_at = ? '
+                'WHERE id = ?',
+                [matches.single.id, nowEpochSeconds(), id],
+              );
+              linked++;
+              affectedIds.add(id);
+            } else if (matches.isEmpty) {
+              unmatched.add({'flight_id': id, 'crew_members_name': name});
+            } else {
+              ambiguous.add({
+                'flight_id': id,
+                'crew_members_name': name,
+                'candidates': [
+                  for (final match in matches)
+                    {'id': match.id, 'name': match.name},
+                ],
+              });
+            }
+          }
+          return {
+            'status': 'linked',
+            'linked': linked,
+            if (ambiguous.isNotEmpty)
+              'ambiguous': ambiguous.length > _reportSampleCap * 5
+                  ? ambiguous.take(_reportSampleCap * 5).toList()
+                  : ambiguous,
+            if (unmatched.isNotEmpty)
+              'unmatched': unmatched.length > _reportSampleCap * 5
+                  ? unmatched.take(_reportSampleCap * 5).toList()
+                  : unmatched,
+            'affected_ids': affectedIds,
+          };
+        });
+      },
+    );
   }
 
   // ============================================================
@@ -3701,6 +4430,8 @@ Future<void> runServer(String dbPath, {bool readonly = true}) async {
                 '- Use get_schema for table names and their column counts; pass table for one table\'s columns, and detail: "full" for its default and pk columns too.\n'
                 '- Update tools accept expected_updated_at: the updated_at of the row as the caller read it. The write then applies only to an unchanged row, so a concurrent change from the app or another writer fails with a conflict that returns the current row, instead of being silently overwritten. Omitting it writes unconditionally, as before.\n'
                 '- Every write tool accepts dry_run: true: it resolves, validates and answers exactly as the write would (the row as written, computed ids, warnings), marks the response dry_run: true, and commits nothing. A preview error is the write error, so a clean preview means the write will apply; an id a preview generated is not reserved, so pass your own or let the real call make one.\n'
+                '- data_quality_report is one read-only call over every defect class an imported logbook can have: drafts, missing or mismatched splits, absurd totals, unlinked aircraft and crew, duplicate crew and flights, unparsable routes, future dates, dangling route links, simulator oddities, orphaned registration text. Each class carries a stable id, a count and a sample of up to 4 rows; a count is the finding, not the full list.\n'
+                '- The repair tools merge_crew, link_flights_to_aircraft and link_flights_to_crew default to dry_run: true and say so on the response; pass dry_run: false to apply the same diff. They run in one transaction, stamp updated_at, tombstone deletions so sync propagates them, never create rows beyond the operation named, and never delete flights: duplicate flights are reported for a human to decide.\n'
                 '- A failed call returns {error, field, detail}: error is a stable code (unknown_field, invalid_value, not_found, conflict, constraint, busy, internal), field is the argument at fault, and unknown_field also names the tool. detail is one sentence, and the accepted list is capped at eight names plus a count. A conflict adds current, the row as it stands now.',
           ),
         ],
