@@ -294,8 +294,9 @@ void main() {
       // the two list separators), the flights_complete rename 55 B, and #6's
       // `ask_user` 888 B; enum values on entity_totals' type and sort plus its
       // offset argument add 138 B. #12's `data_quality_report` adds 1,421 B.
-      // The bound is the measurement plus 1,024 B: 19,333 B measured, so
-      // 20,357 B.
+      // #7's `logbook_overview` adds 640 B.
+      // The bound is the measurement plus 1,024 B: 19,973 B measured, so
+      // 20,997 B.
       // The headroom is for wording, not for tools: a new tool or a
       // description that grows materially is hundreds of bytes and trips this,
       // while wording that fixes a sentence does not, so the next author does
@@ -303,8 +304,8 @@ void main() {
       // deliberate act with a new measurement.
       final readOnly =
           bytesOf(jsonEncode((await reader.send('tools/list', {}))['result']));
-      expect(readOnly, lessThanOrEqualTo(20357),
-          reason: 'the read-only catalog costs $readOnly B, against 19,333 B '
+      expect(readOnly, lessThanOrEqualTo(20997),
+          reason: 'the read-only catalog costs $readOnly B, against 19,973 B '
               'measured plus 1,024 B of wording headroom');
 
       // Issue #11 sets 22 KiB here, measured when the two flight write schemas
@@ -320,13 +321,14 @@ void main() {
       // dry-run slice adds `dry_run` to all sixteen write tools (name,
       // boolean type and one line each) at 3,024 B. #12's three repairs
       // (`merge_crew`, `link_flights_to_aircraft`, `link_flights_to_crew`)
-      // add 3,778 B of argument and description text. Same rule as above:
-      // measured plus 1,024 B, so wording has room and a tool does not.
+      // add 3,778 B of argument and description text. #7's `logbook_overview`
+      // is a read tool, so it is in this catalog too, at 640 B. Same rule as
+      // above: measured plus 1,024 B, so wording has room and a tool does not.
       final writeMode =
           bytesOf(jsonEncode((await writer.send('tools/list', {}))['result']));
-      expect(writeMode, lessThanOrEqualTo(43090),
+      expect(writeMode, lessThanOrEqualTo(43730),
           reason: 'the write-mode catalog costs $writeMode B, against '
-              '42,066 B measured plus 1,024 B of wording headroom');
+              '42,706 B measured plus 1,024 B of wording headroom');
     });
   });
 
@@ -597,6 +599,7 @@ void main() {
           ('search_flights', {'query': 'YSSY'}),
           ('find_missing_times', <String, dynamic>{}),
           ('logbook_stats', <String, dynamic>{}),
+          ('logbook_overview', <String, dynamic>{}),
           ('list_aircraft', <String, dynamic>{}),
           ('list_expiries', <String, dynamic>{}),
           ('currency_status', <String, dynamic>{}),

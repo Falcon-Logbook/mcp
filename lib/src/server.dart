@@ -748,6 +748,27 @@ String _ownerClause(FalconDb db, String table,
         ? "(${prefix}owner_id IS NULL OR ${prefix}owner_id = 'local')"
         : '';
 
+/// The aggregate row `logbook_stats` reports. `logbook_overview` reads the same
+/// numbers from the same query over the same rows, so the two tools cannot
+/// disagree about a logbook.
+const String _flightAggregateSql = 'SELECT COUNT(*) AS flights, '
+    'COALESCE(SUM(CASE WHEN total_time IS NOT NULL THEN 1 ELSE 0 END), 0) AS flights_complete, '
+    'COALESCE(SUM(CASE WHEN total_time IS NULL THEN 1 ELSE 0 END), 0) AS drafts, '
+    'COALESCE(SUM(CASE WHEN total_time = 0 THEN 1 ELSE 0 END), 0) AS zero_time, '
+    'COALESCE(SUM(total_time), 0) AS total_minutes, '
+    'COALESCE(SUM(night_time), 0) AS night_minutes, '
+    'COALESCE(SUM(day_time), 0) AS day_minutes, '
+    'COALESCE(SUM(landings), 0) AS landings, '
+    'COALESCE(SUM(takeoffs), 0) AS takeoffs '
+    'FROM flights';
+
+/// The counts and sums, in minutes, of the flights [where] selects.
+Map<String, dynamic> _flightAggregate(
+    FalconDb db, List<String> where, List<Object?> params) {
+  final rows = db.query('$_flightAggregateSql${_whereSql(where)}', params);
+  return rows.isEmpty ? <String, dynamic>{} : rows.first;
+}
+
 /// Total rows matching the same WHERE, and whether the page leaves more
 /// behind. [params] must not already carry the LIMIT/OFFSET values.
 ({int total, bool hasMore}) _pageInfo(
@@ -1717,8 +1738,414 @@ JsonSchema get _createIdSchema => JsonSchema.string(
         'Omit it and one is generated.');
 
 // ============================================================
+// Logbook overview
+// ============================================================
+
+/// How many rows one `attention` list carries. The count is what a first answer
+/// needs; the list is the evidence, and a pilot with twenty expiries reads the
+/// same one sentence as a pilot with two.
+const int _overviewAttentionCap = 3;
+
+/// [minutes] as hours to one decimal, the precision a logbook answer is read
+/// at: `41.2`, not `41.199999999999996`, and not a float that costs bytes to say
+/// nothing more.
+double _hours(int minutes) => (minutes / 6).roundToDouble() / 10;
+
+/// The `logbook_overview` payload: the facts a first answer to "what about my
+/// logbook?" needs, in one small object with no flight rows.
+///
+/// Keys are left out rather than zeroed when the data behind them is not there:
+/// no expiries, no currency rules, no settings row, no aircraft, no flights at
+/// all. A zero claims the pilot has none of something; a missing key says this
+/// logbook cannot tell. Nothing here carries the database path: an answer is
+/// often screenshotted, and the path is noise to a pilot.
+Map<String, dynamic> _logbookOverview(
+  FalconDb db, {
+  required int days,
+  required bool readonly,
+  required DateTime now,
+}) {
+  final owner = _ownerClause(db, 'flights', includeShared: false);
+  final all = _flightAggregate(db, [if (owner.isNotEmpty) owner], const []);
+  final flights = asInt(all['flights']) ?? 0;
+  final drafts = asInt(all['drafts']) ?? 0;
+
+  // The last [days] days, over the calendar arithmetic the date presets use (a
+  // last-N-days window is today plus the N-1 days before it) and the same
+  // aggregate `logbook_stats` reports, so the two numbers agree.
+  final from = DateTime(now.year, now.month, now.day - (days - 1));
+  final window = _flightDateFilter(
+    {'date_from': formatCalendarDate(from), 'date_to': formatCalendarDate(now)},
+    now: now,
+  );
+  final recent = _flightAggregate(
+    db,
+    [...window.where, if (owner.isNotEmpty) owner],
+    window.params,
+  );
+
+  final dueSoon = _expiriesDueSoon(db, now);
+  final failing = _currencyFailing(db, now);
+  final fleet = _fleetSummary(db);
+  final activity = _recentActivity(db, now);
+
+  return {
+    'flights': flights,
+    'hours': _hours(asInt(all['total_minutes']) ?? 0),
+    'drafts': drafts,
+    'recent': {
+      'days': days,
+      'flights': asInt(recent['flights']) ?? 0,
+      'hours': _hours(asInt(recent['total_minutes']) ?? 0),
+      'night_hours': _hours(asInt(recent['night_minutes']) ?? 0),
+    },
+    if (fleet != null) 'fleet': fleet,
+    if (activity != null) 'recent_activity': activity,
+    'attention': {
+      'drafts': drafts,
+      if (dueSoon != null) 'expiries_due_soon': dueSoon,
+      if (failing != null) 'currency_failing': failing,
+      'unlinked_flights': _unlinkedFlights(db),
+    },
+    'logbook': _logbookFacts(db, readonly: readonly),
+  };
+}
+
+/// Flights with no aircraft linked, which is the number a link pass works
+/// through.
+int _unlinkedFlights(FalconDb db) {
+  final owner = _ownerClause(db, 'flights', includeShared: false);
+  final rows =
+      db.query('SELECT COUNT(*) AS total FROM flights WHERE aircraft_id IS NULL'
+          '${owner.isEmpty ? '' : ' AND $owner'}');
+  return rows.isEmpty ? 0 : asInt(rows.first['total']) ?? 0;
+}
+
+/// The fleet line: how many aircraft the pilot keeps and the type with the most
+/// time on it, the same totals `list_aircraft` and `entity_totals` report. Null
+/// when there is no aircraft row, and the type is absent when no flight has a
+/// complete time, because a zero there would be a claim about an empty fleet.
+Map<String, dynamic>? _fleetSummary(FalconDb db) {
+  if (!db.hasTable('aircraft')) return null;
+  final owner = _ownerClause(db, 'aircraft', includeShared: false);
+  final where = ['archived = 0', if (owner.isNotEmpty) owner];
+  final rows =
+      db.query('SELECT COUNT(*) AS total FROM aircraft${_whereSql(where)}');
+  final aircraft = rows.isEmpty ? 0 : asInt(rows.first['total']) ?? 0;
+  if (aircraft == 0) return null;
+  final top = readEntityTotals(
+    db,
+    type: 'type',
+    sort: defaultEntityTotalSort,
+    limit: 1,
+    offset: 0,
+    includeSimulator: true,
+    ownerClause:
+        _ownerClause(db, 'flights', includeShared: false, prefix: 'flights.'),
+  ).entities;
+  return {
+    'aircraft': aircraft,
+    if (top.isNotEmpty) 'top_type': top.first['aircraft_type'],
+    if (top.isNotEmpty)
+      'top_type_hours': _hours(asInt(top.first['minutes']) ?? 0),
+  };
+}
+
+/// When the last flight was, and how long ago that is in whole days. Null when
+/// there is no flight to date.
+Map<String, dynamic>? _recentActivity(FalconDb db, DateTime now) {
+  final owner = _ownerClause(db, 'flights', includeShared: false);
+  final rows = db.query('SELECT MAX(date) AS last FROM flights'
+      '${owner.isEmpty ? '' : ' WHERE $owner'}');
+  final epoch = rows.isEmpty ? null : asInt(rows.first['last']);
+  if (epoch == null) return null;
+  final last = DateTime.fromMillisecondsSinceEpoch(epoch * 1000);
+  return {
+    'last_flight_date': formatCalendarDate(last),
+    'days_since_last_flight': DateTime(now.year, now.month, now.day)
+        .difference(DateTime(last.year, last.month, last.day))
+        .inDays,
+  };
+}
+
+/// Document expiries that are due soon or overdue, the rows the app shows in red
+/// or orange, soonest first: the same status `list_expiries` reports, from the
+/// same thresholds and the same day count.
+///
+/// Null when the database has no expiries table, when it holds no local row, or
+/// when nothing is due soon, so a logbook with nothing expiring says nothing
+/// about expiries rather than printing an empty list.
+List<Map<String, dynamic>>? _expiriesDueSoon(FalconDb db, DateTime now) {
+  if (!db.hasTable('expiries')) return null;
+  final owner = _ownerClause(db, 'expiries', includeShared: false);
+  final rows = db.query('SELECT id, name, due_date FROM expiries'
+      '${owner.isEmpty ? '' : ' WHERE $owner'} ORDER BY due_date, id');
+  if (rows.isEmpty) return null;
+  final thresholds = readExpiryThresholds(db);
+  final soon = <Map<String, dynamic>>[];
+  for (final row in rows) {
+    final due = _localDate(row['due_date']);
+    if (due == null) continue;
+    final days = daysUntilDue(due, now);
+    final status = expiryStatusForDays(days,
+        greenThreshold: thresholds.green, orangeThreshold: thresholds.orange);
+    if (status == 'green') continue;
+    soon.add({
+      'name': row['name'],
+      'due_date': formatCalendarDate(due),
+      'days_remaining': days,
+    });
+    if (soon.length == _overviewAttentionCap) break;
+  }
+  return soon.isEmpty ? null : soon;
+}
+
+/// The pilot's own currency rules that need attention, in table order: the same
+/// rules `currency_status` computes, and the same `is_exceeded` meaning, which is
+/// being short of a requirement or over a limit.
+///
+/// Null when the database has no currency table, holds no rule, or every rule is
+/// satisfied.
+List<Map<String, dynamic>>? _currencyFailing(FalconDb db, DateTime now) {
+  if (!db.hasTable('user_currency')) return null;
+  final rows =
+      db.query('SELECT id, title, metric, period, threshold, type FROM '
+          'user_currency ORDER BY rowid');
+  final failing = <Map<String, dynamic>>[];
+  for (final row in rows) {
+    // A rule with an unknown metric carries an error instead of a verdict, so
+    // it is not one of these: `currency_status` is where it is reported.
+    final rule = computeCurrencyRule(db, row, now);
+    if (rule['is_exceeded'] != true) continue;
+    failing.add({
+      'title': rule['title'],
+      'period': rule['period'],
+      'current': rule['current'],
+      'threshold': rule['threshold'],
+    });
+    if (failing.length == _overviewAttentionCap) break;
+  }
+  return failing.isEmpty ? null : failing;
+}
+
+/// Who the logbook belongs to and what it is: the pilot name and country from the
+/// settings row, then the schema version and the mode. The settings keys are
+/// left out when the app has never written that row, which a fresh database has
+/// not: a name is never invented.
+Map<String, dynamic> _logbookFacts(FalconDb db, {required bool readonly}) {
+  final facts = <String, dynamic>{};
+  if (db.hasTable('flights_settings')) {
+    final columns = db.columnsOf('flights_settings');
+    final wanted = [
+      if (columns.contains('pilot_name')) 'pilot_name',
+      if (columns.contains('logbook_country')) 'logbook_country',
+    ];
+    final rows = wanted.isEmpty
+        ? const <Map<String, dynamic>>[]
+        : db.query('SELECT ${wanted.join(', ')} FROM flights_settings LIMIT 1');
+    if (rows.isNotEmpty) {
+      final name = asText(rows.first['pilot_name']);
+      final country = asText(rows.first['logbook_country']);
+      if (name != null) facts['pilot_name'] = name;
+      if (country != null) facts['country'] = country;
+    }
+  }
+  facts['schema_version'] = db.schemaVersion;
+  facts['readonly'] = readonly;
+  return facts;
+}
+
+// ============================================================
+// Help catalogue
+// ============================================================
+
+/// One capability group in `falcon_help`: a headline a pilot would say, the
+/// questions in the pilot's voice, and the tools the group needs. A group is
+/// printed only when every tool it needs is registered, so read-only mode has no
+/// write group and a build missing a tool says nothing about it.
+typedef _HelpGroup = ({
+  String headline,
+  List<String> questions,
+  List<String> tools,
+});
+
+/// The groups, in the order a pilot meets them: numbers first, then the awkward
+/// questions, then the write groups, then the overview itself. Seven at most,
+/// which is what fits in one answer a pilot reads.
+const List<_HelpGroup> _helpGroups = [
+  (
+    headline: 'Get the numbers out',
+    questions: [
+      'How many hours did I fly last year?',
+      'What type have I flown most, and how much time is on it?',
+    ],
+    tools: ['logbook_stats', 'entity_totals'],
+  ),
+  (
+    headline: 'Find a flight, and what is on it',
+    questions: [
+      'Which flights did I operate into Queenstown?',
+      'Show me my last flight in detail.',
+    ],
+    tools: ['search_flights', 'get_flight'],
+  ),
+  (
+    headline: 'Find what is missing',
+    questions: [
+      'Which flights are missing block times?',
+      'Do I have the same crew member saved twice?',
+    ],
+    tools: ['find_missing_times', 'dedupe_crew'],
+  ),
+  (
+    headline: 'Is it still current?',
+    questions: [
+      'Is my medical still valid?',
+      'Am I current to carry passengers at night?',
+    ],
+    tools: ['list_expiries', 'currency_status'],
+  ),
+  (
+    headline: 'Draft what is ahead',
+    questions: [
+      'Draft next month\'s roster into my logbook.',
+      'Save the route I fly every week.',
+    ],
+    tools: ['create_flight', 'add_saved_route'],
+  ),
+  (
+    headline: 'Fix a mistake',
+    questions: [
+      'The aircraft on last Tuesday\'s flight is wrong.',
+      'Delete the duplicate flight from 3 May.',
+    ],
+    tools: ['update_flight', 'delete_flight'],
+  ),
+  (
+    headline: 'Ask me what I can do',
+    questions: [
+      'What can you help me with?',
+      'How does my logbook look?',
+    ],
+    tools: ['logbook_overview'],
+  ),
+];
+
+/// `falcon_help` for this connection: one line of orientation, at most seven
+/// groups in the pilot's language, then the rules. [tools] is what this
+/// connection registered, so the catalogue is generated from the catalog rather
+/// than hand-written, and nothing here is advertised that cannot be called.
+String _falconHelpText({required Set<String> tools, required bool readonly}) {
+  final text = StringBuffer()
+    ..writeln('You are working in the pilot\'s own Falcon logbook. Falcon is a '
+        'pilot logbook on this computer, and you read the database the desktop '
+        'app writes. ${readonly ? 'You can look, not change anything.' : 'Writes are on: you can create and change rows, and every write is recorded.'}')
+    ..writeln()
+    ..writeln('What the pilot can ask for:');
+  for (final group in _helpGroups) {
+    if (!group.tools.every(tools.contains)) continue;
+    text.writeln('- ${group.headline}');
+    for (final question in group.questions) {
+      text.writeln('  "$question"');
+    }
+  }
+  text
+    ..writeln()
+    ..writeln('Rules:');
+  if (tools.contains('logbook_overview')) {
+    text.writeln('- A vague question starts with logbook_overview: answer from '
+        'its own numbers, then offer three concrete next steps drawn from what '
+        'is non-zero in its attention list.');
+  }
+  text
+    ..writeln(
+        '- An empty or brand new logbook is said so warmly, with the three '
+        'things that would fill it: import an old logbook, draft a roster, add a '
+        'first flight.')
+    ..writeln('- Never invent an aircraft, a registration, a time or a date. '
+        'Confirm before a write.')
+    ..writeln('- When something is not configured, say so instead of guessing.')
+    ..writeln('- When you need a decision, ask the pilot to pick from a list.')
+    ..write('- Answer in the pilot\'s numbers, not in tool names.');
+  return text.toString();
+}
+
+/// A prompt as the single user message every prompt here sends.
+GetPromptResult _promptResult(String text) => GetPromptResult(
+      messages: [
+        PromptMessage(
+          role: PromptMessageRole.user,
+          content: TextContent(text: text),
+        ),
+      ],
+    );
+
+// ============================================================
 // Server
 // ============================================================
+
+/// An [McpServer] that remembers the tools it registered.
+///
+/// `falcon_help` is generated from this set, so the catalogue describes this
+/// connection as it stands: read-only mode registers no write tool, so no write
+/// is advertised, and a build with a tool missing says nothing about it. A
+/// hand-written list would drift the moment either changed, with nothing failing.
+class _FalconServer extends McpServer {
+  _FalconServer(super.serverInfo, {super.options});
+
+  /// Every tool name registered so far, in registration order.
+  final Set<String> toolNames = <String>{};
+
+  @override
+  RegisteredTool registerTool(
+    String name, {
+    String? title,
+    String? description,
+    ToolInputSchema? inputSchema,
+    ToolOutputSchema? outputSchema,
+    ToolAnnotations? annotations,
+    Map<String, dynamic>? meta,
+    required ToolFunction callback,
+  }) {
+    toolNames.add(name);
+    return super.registerTool(
+      name,
+      title: title,
+      description: description,
+      inputSchema: inputSchema,
+      outputSchema: outputSchema,
+      annotations: annotations,
+      meta: meta,
+      callback: callback,
+    );
+  }
+
+  @override
+  RegisteredStatelessTool registerStatelessTool(
+    String name, {
+    String? title,
+    String? description,
+    ToolInputSchema? inputSchema,
+    ToolOutputSchema? outputSchema,
+    JsonSchema? outputJsonSchema,
+    ToolAnnotations? annotations,
+    Map<String, dynamic>? meta,
+    required StatelessToolFunction callback,
+  }) {
+    toolNames.add(name);
+    return super.registerStatelessTool(
+      name,
+      title: title,
+      description: description,
+      inputSchema: inputSchema,
+      outputSchema: outputSchema,
+      outputJsonSchema: outputJsonSchema,
+      annotations: annotations,
+      meta: meta,
+      callback: callback,
+    );
+  }
+}
 
 Future<void> runServer(String dbPath, {bool readonly = true}) async {
   final db = openDb(dbPath, readonly: readonly);
@@ -1735,7 +2162,7 @@ Future<void> runServer(String dbPath, {bool readonly = true}) async {
 
   final auditor = _Auditor(dbPath);
 
-  final server = McpServer(
+  final server = _FalconServer(
     const Implementation(name: 'falcon_mcp', version: serverVersion),
     options: const McpServerOptions(
       capabilities: ServerCapabilities(
@@ -2436,18 +2863,7 @@ Future<void> runServer(String dbPath, {bool readonly = true}) async {
         final owner = _ownerClause(db, 'flights',
             includeShared: asBool(args[_includeSharedKey]) ?? false);
         if (owner.isNotEmpty) where.add(owner);
-        final sql = 'SELECT COUNT(*) AS flights, '
-            'COALESCE(SUM(CASE WHEN total_time IS NOT NULL THEN 1 ELSE 0 END), 0) AS flights_complete, '
-            'COALESCE(SUM(CASE WHEN total_time IS NULL THEN 1 ELSE 0 END), 0) AS drafts, '
-            'COALESCE(SUM(CASE WHEN total_time = 0 THEN 1 ELSE 0 END), 0) AS zero_time, '
-            'COALESCE(SUM(total_time), 0) AS total_minutes, '
-            'COALESCE(SUM(night_time), 0) AS night_minutes, '
-            'COALESCE(SUM(day_time), 0) AS day_minutes, '
-            'COALESCE(SUM(landings), 0) AS landings, '
-            'COALESCE(SUM(takeoffs), 0) AS takeoffs '
-            'FROM flights${_whereSql(where)}';
-        final rows = db.query(sql, params);
-        final stats = rows.isEmpty ? <String, dynamic>{} : rows.first;
+        final stats = _flightAggregate(db, where, params);
         // The simulator split is reported whether or not it is counted above,
         // so a caller can always say how much of the logbook is in a device.
         final simWhere = [...window.where, 'is_simulator = 1'];
@@ -2467,6 +2883,41 @@ Future<void> runServer(String dbPath, {bool readonly = true}) async {
           'range': _rangeOf(window),
           'units': _units,
         });
+      } on _ToolError catch (error) {
+        return _failWith(error);
+      } catch (error) {
+        return _failWith(_asToolError(error));
+      }
+    },
+  );
+
+  // The first answer, and the opening of every later one that starts with "my
+  // logbook": one small object of numbers with no rows behind it. `falcon_help`
+  // and the prompts point here, and it stays readable in read-only mode because
+  // it writes nothing.
+  server.registerTool(
+    'logbook_overview',
+    description:
+        'The logbook in one small payload: flights, hours, drafts, the last N '
+        'days, the fleet, the last flight and what needs attention, then the '
+        'pilot name and country. A key whose data is not there is left out, '
+        'never zeroed, and no flight rows come back. Local rows only.',
+    inputSchema: JsonSchema.object(properties: {
+      'days': JsonSchema.integer(
+          minimum: 1,
+          maximum: 3650,
+          description:
+              'Window for recent, counted back from today. Default 90, '
+              'maximum 3650.'),
+    }),
+    annotations: readOnlyAnnotations,
+    callback: (args, extra) async {
+      try {
+        _rejectUnknown(args, {'days'}, tool: 'logbook_overview');
+        final days = asInt(args['days']) ?? 90;
+        if (days < 1) return _fail('days must be >= 1', field: 'days');
+        return _ok(_logbookOverview(db,
+            days: days, readonly: readonly, now: DateTime.now()));
       } on _ToolError catch (error) {
         return _failWith(error);
       } catch (error) {
@@ -4378,7 +4829,7 @@ Future<void> runServer(String dbPath, {bool readonly = true}) async {
                 'Falcon MCP server ($writeMode): a local Falcon pilot logbook (SQLite).\n'
                 'Tools cover flights, aircraft, airports, crew, saved routes, expiries, currency, stats, settings, logs'
                 '${readonly ? '' : ', and writes'}.\n'
-                'Use the falcon_help prompt for the tool list and falcon://conventions for field semantics.',
+                'Use the falcon_help prompt for what it can do and falcon://conventions for field semantics.',
           ),
         ],
       );
@@ -4467,40 +4918,68 @@ Future<void> runServer(String dbPath, {bool readonly = true}) async {
   server.registerPrompt(
     'falcon_help',
     description:
-        'How to use the Falcon MCP server: available tools and example questions.',
-    callback: (args, extra) async {
-      final writeTools = readonly
-          ? 'Write tools are disabled because this server runs in read-only mode.\n'
-          : 'Write tools: create_flight, update_flight, delete_flight, add_aircraft, update_aircraft, '
-              'delete_aircraft, add_crew, update_crew, delete_crew, add_custom_airport, update_custom_airport, '
-              'delete_custom_airport, add_saved_route, update_saved_route, delete_saved_route, '
-              'update_flight_settings.\n'
-              'Writes apply immediately; each one is recorded in an audit log next to the database.\n';
-      return GetPromptResult(
-        messages: [
-          PromptMessage(
-            role: PromptMessageRole.user,
-            content: TextContent(
-              text: 'You have access to the Falcon MCP server, which reads'
-                  '${readonly ? '' : ' and edits'} a local Falcon pilot logbook (SQLite).\n\n'
-                  'Read tools: db_info, get_schema, list_flights, get_flight, search_flights, list_aircraft, '
-                  'get_aircraft, list_airports, list_custom_airports, list_crew, list_saved_routes, logbook_stats, '
-                  'entity_totals, list_expiries, currency_status, '
-                  'get_flight_settings, get_app_settings, get_general_settings, get_settings, '
-                  'get_recent_logs, find_missing_times, dedupe_crew, ask_user.\n'
-                  '$writeTools\n'
-                  'When you need a decision from the pilot, such as which aircraft, which legs or whether to go '
-                  'ahead, call ask_user: the pilot picks from a list instead of typing an answer to a question you '
-                  'described.\n'
-                  'Call get_schema for table names and column counts, pass table for one table\'s columns, and read the falcon://conventions resource for field semantics (dates, minutes, registration format, draft rule).\n'
-                  'Example questions: "How many hours did I fly last year?", "List flights into YSSY in 2025", '
-                  '"Are there flights missing block times?", "Add a flight today in VH-XZO from YSSY to NZQN".\n'
-                  'Always confirm destructive or bulk operations with the user first.',
-            ),
-          ),
-        ],
-      );
-    },
+        'What this server can do for a pilot, grouped by task, and the rules it '
+        'follows.',
+    callback: (args, extra) async => _promptResult(
+        _falconHelpText(tools: server.toolNames, readonly: readonly)),
+  );
+
+  // A vague first question is the moment the pilot decides whether this was
+  // worth installing, so it gets the pilot's own numbers and three concrete next
+  // steps rather than a menu.
+  server.registerPrompt(
+    'what_can_you_do',
+    description: 'The pilot\'s own numbers, then three concrete next steps.',
+    callback: (args, extra) async => _promptResult(
+      'Call logbook_overview, then answer from the pilot\'s own numbers: '
+      'flights, hours, what the recent window holds, the fleet and the last '
+      'flight, in one or two sentences.\n'
+      'Then offer exactly three concrete next steps, taken from the parts of '
+      'attention that are not zero: drafts to finish, expiries due soon, a '
+      'currency rule that needs attention, flights with no aircraft. Name '
+      'the numbers behind each one.\n'
+      'If the logbook is empty, or nothing in attention needs work, say so '
+      'warmly and offer the three things that would fill it: import an old '
+      'logbook, draft a roster, add a first flight.\n'
+      'Do not list tools, and do not describe the server.',
+    ),
+  );
+
+  // The periodic check a pilot does before a flight review, in one pass.
+  server.registerPrompt(
+    'logbook_review',
+    description:
+        'A guided periodic check: gaps, duplicates, expiries, currency.',
+    callback: (args, extra) async => _promptResult(
+      'Walk the pilot through a check of their logbook, in this order, one '
+      'step at a time and with the count for each:\n'
+      '1. find_missing_times: drafts and missing or odd day/night splits.\n'
+      '2. dedupe_crew: the same crew member saved twice.\n'
+      '3. data_quality_report: the rest of the defects, including flights '
+      'with no aircraft linked.\n'
+      '4. list_expiries: documents due or overdue.\n'
+      '5. currency_status: the rules that need attention.\n'
+      'Report each finding in one sentence with the number and the one or '
+      'two rows that matter, then ask which to fix first. Never say a check '
+      'passed without having called it, and never invent a row.',
+    ),
+  );
+
+  // "Am I current?" answered from the pilot's own rules, not a generic one.
+  server.registerPrompt(
+    'currency_check',
+    description:
+        'The pilot\'s own currency rules, and what is short by how much.',
+    callback: (args, extra) async => _promptResult(
+      'Call currency_status and answer for each rule the pilot has '
+      'configured: what it requires, the current value against the '
+      'threshold, the window, and how much is short (remaining) or over '
+      '(over_by).\n'
+      'A metric with no rule is not a failure: say which ones have no rule '
+      'rather than inventing a pass, and offer the raw total currency_status '
+      'answers with metric and no rule.\n'
+      'End with the rule that needs attention soonest, and by how much.',
+    ),
   );
 
   await server.connect(StdioServerTransport());

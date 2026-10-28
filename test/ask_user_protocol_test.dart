@@ -57,7 +57,10 @@ void main() {
     final help = await server.send('prompts/get', {'name': 'falcon_help'});
     final messages = (help['result'] as Map)['messages'] as List;
     final text = ((messages.single as Map)['content'] as Map)['text'] as String;
-    expect(text, contains('ask_user'));
+    // The rewritten help speaks to a pilot, so ask_user appears as the thing it
+    // does, a list to pick from, never as a tool name.
+    expect(text, contains('pick from a list'));
+    expect(text, isNot(contains('ask_user')));
     // The prompt is read by a pilot, so it must not name the protocol.
     expect(text, isNot(contains('InputRequired')));
     expect(text, isNot(contains('elicitation')));
