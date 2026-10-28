@@ -1714,18 +1714,23 @@ Future<void> runServer(String dbPath, {bool readonly = true}) async {
             {'include_past', 'due_within_days', 'limit', _includeSharedKey},
             tool: 'list_expiries');
         if (!db.hasTable('expiries')) {
-          return _fail('This database (schema ${db.schemaVersion}) has no '
-              'expiries table');
+          return _fail(
+              'This database (schema ${db.schemaVersion}) has no '
+              'expiries table',
+              code: 'not_found',
+              field: 'expiries');
         }
         final includePast = asBool(args['include_past']) ?? true;
         final rawDays = args['due_within_days'];
         final dueWithinDays = rawDays == null ? null : asInt(rawDays);
         if (rawDays != null && (dueWithinDays == null || dueWithinDays < 0)) {
-          return _fail('due_within_days must be a whole number of days, 0 or '
-              'more (got "$rawDays")');
+          return _fail(
+              'due_within_days must be a whole number of days, 0 or '
+              'more (got "$rawDays")',
+              field: 'due_within_days');
         }
         final limit = asInt(args['limit']) ?? 100;
-        if (limit < 1) return _fail('limit must be >= 1');
+        if (limit < 1) return _fail('limit must be >= 1', field: 'limit');
 
         final thresholds = readExpiryThresholds(db);
         final today = DateTime.now();
@@ -1772,7 +1777,7 @@ Future<void> runServer(String dbPath, {bool readonly = true}) async {
       } on _ToolError catch (error) {
         return _failWith(error);
       } catch (error) {
-        return _fail('list_expiries failed: $error');
+        return _failWith(_asToolError(error));
       }
     },
   );
@@ -1860,24 +1865,33 @@ Future<void> runServer(String dbPath, {bool readonly = true}) async {
       try {
         _rejectUnknown(args, {'metric', 'period'}, tool: 'currency_status');
         if (!db.hasTable('user_currency')) {
-          return _fail('This database (schema ${db.schemaVersion}) has no '
-              'user_currency table');
+          return _fail(
+              'This database (schema ${db.schemaVersion}) has no '
+              'user_currency table',
+              code: 'not_found',
+              field: 'user_currency');
         }
         final metric = asText(args['metric']);
         if (metric != null && !currencyMetrics.contains(metric)) {
           return _fail(
-              'metric must be one of ${currencyMetrics.join(', ')} (got "$metric")');
+              'metric must be one of ${currencyMetrics.join(', ')} (got '
+              '"$metric")',
+              field: 'metric');
         }
         final rawPeriod = asText(args['period']);
         final period = rawPeriod ?? defaultCurrencyPeriod;
         if (!currencyPeriods.contains(period)) {
-          return _fail('period must be one of ${currencyPeriods.join(', ')} '
-              '(got "$period")');
+          return _fail(
+              'period must be one of ${currencyPeriods.join(', ')} '
+              '(got "$period")',
+              field: 'period');
         }
         if (rawPeriod != null && metric == null) {
-          return _fail('period only applies with metric: pass metric (one of '
+          return _fail(
+              'period only applies with metric: pass metric (one of '
               '${currencyMetrics.join(', ')}) to ask about a metric, or omit '
-              'both for the configured rules');
+              'both for the configured rules',
+              field: 'period');
         }
 
         final now = DateTime.now();
@@ -1903,7 +1917,7 @@ Future<void> runServer(String dbPath, {bool readonly = true}) async {
       } on _ToolError catch (error) {
         return _failWith(error);
       } catch (error) {
-        return _fail('currency_status failed: $error');
+        return _failWith(_asToolError(error));
       }
     },
   );

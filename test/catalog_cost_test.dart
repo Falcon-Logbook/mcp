@@ -1,6 +1,7 @@
 import 'dart:convert';
 import 'dart:io';
 
+import 'package:sqlite3/sqlite3.dart' as sqlite;
 import 'package:test/test.dart';
 
 import 'support/harness.dart';
@@ -87,6 +88,22 @@ void main() {
   }
 
   int bytesOf(String text) => utf8.encode(text).length;
+
+  /// Runs [body] while a second connection holds `BEGIN EXCLUSIVE` on the
+  /// fixture, the way the desktop app holds the file while it writes: until
+  /// [body] ends, every statement the server attempts waits out its busy
+  /// timeout and then fails with SQLITE_BUSY. Start the server first, because
+  /// it reads the schema version when it opens the file.
+  Future<void> whileLocked(Future<void> Function() body) async {
+    final lock = sqlite.sqlite3.open(dbPath);
+    lock.execute('BEGIN EXCLUSIVE');
+    try {
+      await body();
+    } finally {
+      lock.execute('ROLLBACK');
+      lock.dispose();
+    }
+  }
 
   group('get_schema', () {
     test('names and column counts by default, one table on request', () async {
@@ -485,5 +502,84 @@ void main() {
       final envelope = errorOf(await server.call('db_info', {'db': 'x'}));
       expect(envelope.keys.toSet(), {'error', 'field', 'tool', 'detail'});
     });
+
+    test('a missing table is not_found and names the field', () async {
+      // A logbook written by an older schema, or one the user has never opened
+      // the expiry or currency page on, has no such table. That is a missing
+      // thing, not a bad value.
+      withFixtureDb(dbPath, (db) {
+        db.execute('DROP TABLE expiries');
+        db.execute('DROP TABLE user_currency');
+      });
+      final server = await start();
+
+      for (final (tool, field) in [
+        ('list_expiries', 'expiries'),
+        ('currency_status', 'user_currency'),
+      ]) {
+        final envelope = errorOf(await server.call(tool, {}));
+        expect(envelope['error'], 'not_found', reason: tool);
+        expect(envelope['field'], field, reason: tool);
+        expect(envelope['detail'], contains('has no $field table'));
+      }
+    });
+
+    test('a locked database is a busy envelope, not SQLite text', () async {
+      final server = await start();
+
+      await whileLocked(() async {
+        for (final tool in ['list_expiries', 'currency_status']) {
+          final result = await server.call(tool, {});
+          final envelope = errorOf(result);
+
+          expect(envelope['error'], 'busy', reason: tool);
+          expect(envelope['detail'],
+              'the database is locked by another process; retry in a moment',
+              reason: tool);
+          expect(envelope.keys.toSet(), {'error', 'detail'},
+              reason: 'a busy database names no field and no tool');
+
+          // The exact text SQLite produces carries the statement it was
+          // preparing, and a caller can act on none of it.
+          final text = '${result.payload}';
+          expect(text, isNot(contains('SqliteException')), reason: tool);
+          expect(text, isNot(contains('Causing statement')), reason: tool);
+          expect(text, isNot(contains('SELECT')), reason: tool);
+          expect(bytesOf(text), lessThan(200),
+              reason: '$tool costs ${bytesOf(text)} B while locked');
+        }
+      });
+    }, timeout: const Timeout(Duration(minutes: 2)));
+
+    test('no read tool leaks SQLite text or SQL when the database is locked',
+        () async {
+      // The guard for the whole class rather than the two tools that leaked: a
+      // tool added later that pipes a caught exception into `_fail` fails here.
+      final server = await start();
+
+      await whileLocked(() async {
+        for (final (tool, args) in [
+          ('list_flights', <String, dynamic>{}),
+          ('get_flight', {'id': 'fl-1'}),
+          ('search_flights', {'query': 'YSSY'}),
+          ('find_missing_times', <String, dynamic>{}),
+          ('logbook_stats', <String, dynamic>{}),
+          ('list_aircraft', <String, dynamic>{}),
+          ('list_expiries', <String, dynamic>{}),
+          ('currency_status', <String, dynamic>{}),
+          ('get_schema', <String, dynamic>{}),
+          ('db_info', <String, dynamic>{}),
+        ]) {
+          final result = await server.call(tool, args);
+          final text = '${result.payload}';
+
+          expect(text, isNot(contains('SqliteException')), reason: tool);
+          expect(text, isNot(contains('Causing statement')), reason: tool);
+          expect(text, isNot(contains('SELECT')), reason: tool);
+          expect(text, isNot(contains('sqlite_master')), reason: tool);
+          expect(errorOf(result)['error'], 'busy', reason: tool);
+        }
+      });
+    }, timeout: const Timeout(Duration(minutes: 3)));
   });
 }
