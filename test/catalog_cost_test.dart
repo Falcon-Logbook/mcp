@@ -274,30 +274,35 @@ void main() {
 
       // #8's expiry and currency reads add 2,702 B (`list_expiries` 1,295 and
       // `currency_status` 1,405, schemas included), taking this from 11,713 B
-      // to 14,415 B. The bound was 15 KiB (15,360 B), 945 B of room, the same
-      // figure response_shaping_test uses. #6 adds `ask_user` at 973 B for
-      // 15,389 B, so the bound moves with it to 16 KiB (16,384 B): 995 B of
-      // room, which is that same ~1 KB.
+      // to 14,415 B. Slice 2 adds 2,344 B (`entity_totals`, `get_settings` and
+      // the two list separators), the flights_complete rename 55 B, and #6's
+      // `ask_user` 888 B; enum values on entity_totals' type and sort plus its
+      // offset argument add 138 B. The bound is the measurement plus 1,024 B.
+      // The headroom is for wording, not for tools: a new tool or a
+      // description that grows materially is hundreds of bytes and trips this,
+      // while wording that fixes a sentence does not, so the next author does
+      // not have to raise the figure to edit a phrase. Raising it is still a
+      // deliberate act with a new measurement.
       final readOnly =
           bytesOf(jsonEncode((await reader.send('tools/list', {}))['result']));
-      expect(readOnly, lessThan(16384),
-          reason: 'the read-only catalog costs $readOnly B, '
-              'and 16 KiB is 16,384 B');
+      expect(readOnly, lessThanOrEqualTo(18936),
+          reason: 'the read-only catalog costs $readOnly B, against 17,912 B '
+              'measured plus 1,024 B of wording headroom');
 
       // Issue #11 sets 22 KiB here, measured when the two flight write schemas
       // were 5.9 KB together. Validation in #15 grew them to 7.3 KB by adding
       // the bounds, formats and draft rule that the write tests pin, so the
       // figure is out of reach without deleting typed properties or that text.
-      // This is the reachable number: 27,254 B before the bound, about 800 B
-      // under the pre-slice 28,063 B. #8's two read tools add the same 2,702 B
-      // for 29,956 B, so the bound was 30 KiB (30,720 B): 764 B of room. #6's
-      // `ask_user` adds its 973 B again, to 30,930 B, so the bound is 31 KiB
-      // (31,744 B): 814 B of room, the same guard at 800 B instead of 764.
+      // This is the reachable number: the read tools are in both catalogs, so
+      // slice 2's 2,344 B, the 55 B rename and #6's `ask_user` at 973 B take
+      // this from 29,956 B to 33,428 B, and the 138 B of enum values and
+      // offset take it to 33,566 B measured. Same rule as above: measured plus
+      // 1,024 B, so wording has room and a tool does not.
       final writeMode =
           bytesOf(jsonEncode((await writer.send('tools/list', {}))['result']));
-      expect(writeMode, lessThan(31744),
-          reason: 'the write-mode catalog costs $writeMode B, '
-              'and 31 KiB is 31,744 B');
+      expect(writeMode, lessThanOrEqualTo(34590),
+          reason: 'the write-mode catalog costs $writeMode B, against '
+              '33,566 B measured plus 1,024 B of wording headroom');
     });
   });
 
@@ -571,6 +576,8 @@ void main() {
           ('list_aircraft', <String, dynamic>{}),
           ('list_expiries', <String, dynamic>{}),
           ('currency_status', <String, dynamic>{}),
+          ('entity_totals', {'type': 'aircraft'}),
+          ('get_settings', {'table': 'app_settings'}),
           ('get_schema', <String, dynamic>{}),
           ('db_info', <String, dynamic>{}),
         ]) {

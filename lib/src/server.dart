@@ -9,6 +9,7 @@ import 'currency.dart';
 import 'db.dart';
 import 'expiry.dart';
 import 'route.dart';
+import 'totals.dart';
 import 'util.dart';
 
 // ============================================================
@@ -184,6 +185,21 @@ const _timeFormats = {'hhmm', 'decimal1', 'decimal2'};
 const _calculateTimeModes = {'utc', 'local', 'time', 'hobbsTacho'};
 const _crewRoles = {'pilotInCommand', 'copilot', 'student'};
 
+/// The single-row settings tables `get_settings` answers for, alphabetical. The
+/// app has nine settings tables; `aircraft_type_settings` is keyed by
+/// `(type, owner_id)` rather than being a singleton, so it is not here. This list
+/// is the allowlist: a table name reaches SQL only through it.
+const List<String> _settingsTables = [
+  'aircraft_settings',
+  'app_settings',
+  'crew_settings',
+  'expiry_settings',
+  'flights_settings',
+  'general_settings',
+  'routes_settings',
+  'sidebar_settings',
+];
+
 /// Columns that hold a duration in whole minutes.
 const Set<String> _minuteColumns = {
   'total_time',
@@ -283,6 +299,11 @@ JsonSchema get _missingTimesLimitSchema => JsonSchema.integer(
 /// The `limit` argument on `get_recent_logs`. A log response is a diagnostic
 /// aid, so the page is small: 20 entries by default, 200 at most.
 JsonSchema get _logLimitSchema => JsonSchema.integer(
+    minimum: 1, maximum: 200, description: 'Default 20, maximum 200.');
+
+/// The `limit` argument on `entity_totals`: 20 groups by default, 200 at most,
+/// enough for a fleet and still cheaper than the flight rows it summarises.
+JsonSchema get _entityTotalLimitSchema => JsonSchema.integer(
     minimum: 1, maximum: 200, description: 'Default 20, maximum 200.');
 
 /// How much of a log message a projection carries. A log entry can hold a
@@ -705,10 +726,13 @@ String _whereSql(List<String> where) =>
     where.isEmpty ? '' : ' WHERE ${where.join(' AND ')}';
 
 /// The app's local-rows rule: `owner_id` NULL or `'local'`. Empty when shared
-/// rows are requested or the table has no owner column.
-String _ownerClause(FalconDb db, String table, {required bool includeShared}) =>
+/// rows are requested or the table has no owner column. [prefix] qualifies the
+/// column for a query that joins another table carrying an owner_id, where a
+/// bare name would be ambiguous.
+String _ownerClause(FalconDb db, String table,
+        {required bool includeShared, String prefix = ''}) =>
     !includeShared && db.columnsOf(table).contains('owner_id')
-        ? "(owner_id IS NULL OR owner_id = 'local')"
+        ? "(${prefix}owner_id IS NULL OR ${prefix}owner_id = 'local')"
         : '';
 
 /// Total rows matching the same WHERE, and whether the page leaves more
@@ -935,16 +959,11 @@ DateTime? _localDate(Object? value) => switch (value) {
       _ => null,
     };
 
-/// Display registration the app would show: country code plus registration,
-/// unless the stored value already carries the country code.
-String _displayRegistration(String? countryCode, String registration) {
-  final code = (countryCode ?? '').trim();
-  if (code.isEmpty ||
-      registration.toUpperCase().startsWith(code.toUpperCase())) {
-    return registration;
-  }
-  return '$code-$registration';
-}
+/// Display registration the app would show: the one rule [displayRegistration]
+/// writes, kept as a non-null wrapper for the matcher, which has already
+/// skipped a blank registration.
+String _displayRegistration(String? countryCode, String registration) =>
+    displayRegistration(countryCode, registration) ?? registration;
 
 /// Every aircraft whose stored registration or display form normalises to the
 /// same key as [registration], active rows only when any are active.
@@ -2267,6 +2286,110 @@ Future<void> runServer(String dbPath, {bool readonly = true}) async {
   );
 
   server.registerTool(
+    'entity_totals',
+    description:
+        'Per-entity totals: minutes and the number of complete flights per '
+        'aircraft, crew member, aircraft type or registration, rather than the '
+        'flight rows behind them. Grouping follows the app: aircraft and crew '
+        'group on the link, type on the linked aircraft\'s type, registration on '
+        'the flight\'s registration text, so a flight with no aircraft link '
+        'counts under registration only. Drafts have no total time, so they are '
+        'in neither number, and an entity with no complete flight is not listed: '
+        'flights_complete is the same number logbook_stats calls by that name, '
+        'where its flights counts every row including drafts. Simulator flights '
+        'are included unless include_simulator is false. '
+        'Sorted by minutes unless sort says otherwise; count, total, has_more '
+        'and offset page through the groups the way the flight lists do. Local '
+        'rows only unless include_shared is true.',
+    inputSchema: JsonSchema.object(properties: {
+      'type': JsonSchema.string(
+          enumValues: entityTotalDimensions,
+          description: 'What to group by.'),
+      'sort': JsonSchema.string(
+          enumValues: entityTotalSorts,
+          description: 'minutes and flights_complete order descending, label '
+              'alphabetically. Default $defaultEntityTotalSort.'),
+      'limit': _entityTotalLimitSchema,
+      'offset': JsonSchema.integer(minimum: 0),
+      'include_simulator': JsonSchema.boolean(
+          description:
+              'Include simulator flights in both numbers. Default true, '
+              'as the app does.'),
+      _includeSharedKey: JsonSchema.boolean(
+          description:
+              'Include rows owned by another device or account. Default false.'),
+    }, required: [
+      'type'
+    ]),
+    annotations: readOnlyAnnotations,
+    callback: (args, extra) async {
+      try {
+        _rejectUnknown(
+            args,
+            {
+              'type',
+              'sort',
+              'limit',
+              'offset',
+              'include_simulator',
+              _includeSharedKey
+            },
+            tool: 'entity_totals');
+        final rawType = args['type'];
+        final type = asText(rawType);
+        if (type == null || !entityTotalDimensions.contains(type)) {
+          return _fail(
+              'type must be one of ${entityTotalDimensions.join(', ')} '
+              '(got "$rawType")',
+              field: 'type');
+        }
+        final rawSort = args['sort'];
+        final sort = asText(rawSort) ?? defaultEntityTotalSort;
+        if (!entityTotalSorts.contains(sort)) {
+          return _fail(
+              'sort must be one of ${entityTotalSorts.join(', ')} '
+              '(got "$rawSort")',
+              field: 'sort');
+        }
+        final limit = asInt(args['limit']) ?? 20;
+        if (limit < 1) return _fail('limit must be >= 1', field: 'limit');
+        final offset = asInt(args['offset']) ?? 0;
+        if (offset < 0) return _fail('offset must be >= 0', field: 'offset');
+        final includeSimulator = asBool(args['include_simulator']) ?? true;
+        // Qualified for the joins this query makes: crew_members and aircraft
+        // carry an owner_id too.
+        final owner = _ownerClause(db, 'flights',
+            includeShared: asBool(args[_includeSharedKey]) ?? false,
+            prefix: 'flights.');
+        final totals = readEntityTotals(
+          db,
+          type: type,
+          sort: sort,
+          limit: limit,
+          offset: offset,
+          includeSimulator: includeSimulator,
+          ownerClause: owner,
+        );
+        return _ok({
+          'type': type,
+          'sort': sort,
+          'include_simulator': includeSimulator,
+          'count': totals.entities.length,
+          'total': totals.total,
+          'has_more': offset + totals.entities.length < totals.total,
+          'offset': offset,
+          'units': _units,
+          'entities': totals.entities,
+        });
+      } on _ToolError catch (error) {
+        return _failWith(error);
+      } catch (error) {
+        return _failWith(_asToolError(error));
+      }
+    },
+  );
+
+  server.registerTool(
     'currency_status',
     description:
         'The pilot\'s currency rules, computed as the app\'s currency page '
@@ -2400,6 +2523,49 @@ Future<void> runServer(String dbPath, {bool readonly = true}) async {
       try {
         _rejectUnknown(args, const {}, tool: 'get_general_settings');
         final rows = db.query('SELECT * FROM general_settings LIMIT 1');
+        return _ok(rows.isEmpty ? <String, dynamic>{} : rows.first);
+      } on _ToolError catch (error) {
+        return _failWith(error);
+      } catch (error) {
+        return _failWith(_asToolError(error));
+      }
+    },
+  );
+
+  server.registerTool(
+    'get_settings',
+    description:
+        'Get one settings table\'s row: ${_settingsTables.join(', ')}. Each holds '
+        'a single row, and a fresh database has none until the app opens that '
+        'screen, so an empty table answers {} rather than an error. Never '
+        'creates the row. aircraft_type_settings is keyed by aircraft type '
+        'rather than being a singleton, so it is not here.',
+    inputSchema: JsonSchema.object(properties: {
+      'table': JsonSchema.string(
+          description: 'Settings table to read, one of the names above.'),
+    }, required: [
+      'table'
+    ]),
+    annotations: readOnlyAnnotations,
+    callback: (args, extra) async {
+      try {
+        _rejectUnknown(args, {'table'}, tool: 'get_settings');
+        final raw = args['table'];
+        final table = asText(raw);
+        if (table == null || !_settingsTables.contains(table)) {
+          return _fail(
+              'table must be one of ${_settingsTables.join(', ')} (got "$raw")',
+              field: 'table');
+        }
+        if (!db.hasTable(table)) {
+          return _fail(
+              'This database (schema ${db.schemaVersion}) has no $table table',
+              code: 'not_found',
+              field: 'table');
+        }
+        // The same read the app's settings getters make: the first row, and
+        // nothing inserted when there is none.
+        final rows = db.query('SELECT * FROM $table LIMIT 1');
         return _ok(rows.isEmpty ? <String, dynamic>{} : rows.first);
       } on _ToolError catch (error) {
         return _failWith(error);
@@ -3319,6 +3485,8 @@ Future<void> runServer(String dbPath, {bool readonly = true}) async {
                 '- is_simulator and is_ifr are stored as 0/1 and rendered as true or false, as are archived and the aircraft flags (multi_engine, ifr, complex, pressurised, tailwheel, simulator, helicopter, float_plane).\n'
                 '- Expiry status is computed at read time, never stored: whole local days from today to due_date, below the orange threshold is red (which includes today and every overdue day), below the green threshold is orange, green above it. Thresholds come from expiry_settings (a local row first, then the newest), or 90 and 30 days when that table has no row. list_expiries includes overdue rows by default.\n'
                 '- Currency thresholds are HOURS for the four time metrics, because the app divides those values by 60, and counts for the other four. is_exceeded means the rule needs attention: for a requirement that is being below the threshold, for a limit it is reaching it. currency_status reproduces the app\'s currency page, which applies no owner filter and counts drafts as flights, so its numbers can mix owners on a synced logbook.\n'
+                '- entity_totals.flights_complete counts COMPLETE flights, because it counts the rows its minutes come from; logbook_stats.flights counts every row including drafts, and its flights_complete is the same number. Aircraft and type group on flights.aircraft_id and crew groups on flights.crew_member_id, so a flight that only carries registration text is in the registration group alone. It pages with limit, offset, count, total and has_more like the flight lists, and the registration it reports for an aircraft is the app\'s display form (country code and tail joined, without doubling a tail that already carries the code).\n'
+                '- get_settings reads one allowlisted single-row settings table at a time (aircraft_settings, app_settings, crew_settings, expiry_settings, flights_settings, general_settings, routes_settings, sidebar_settings) and returns {} when the app has never written that row, which means the app defaults apply; it never creates the row. aircraft_type_settings is keyed by type, not a singleton, and is not readable here.\n'
                 '- Deleting a flight, aircraft, crew member or custom airport also records a sync tombstone when a Postgres sync provider has been used, so the deletion propagates.\n'
                 '- A field means the same thing wherever it appears: create_flight and update_flight take the same flight fields with the same types and limits, the per-field notes are written once on create_flight, and what a field means is written here.\n'
                 '- Use get_schema for table names and their column counts; pass table for one table\'s columns, and detail: "full" for its default and pk columns too.\n'
@@ -3375,9 +3543,9 @@ Future<void> runServer(String dbPath, {bool readonly = true}) async {
                   '${readonly ? '' : ' and edits'} a local Falcon pilot logbook (SQLite).\n\n'
                   'Read tools: db_info, get_schema, list_flights, get_flight, search_flights, list_aircraft, '
                   'get_aircraft, list_airports, list_custom_airports, list_crew, list_saved_routes, logbook_stats, '
-                  'list_expiries, currency_status, '
-                  'get_flight_settings, get_app_settings, get_general_settings, get_recent_logs, '
-                  'find_missing_times, dedupe_crew, ask_user.\n'
+                  'entity_totals, list_expiries, currency_status, '
+                  'get_flight_settings, get_app_settings, get_general_settings, get_settings, '
+                  'get_recent_logs, find_missing_times, dedupe_crew, ask_user.\n'
                   '$writeTools\n'
                   'When you need a decision from the pilot, such as which aircraft, which legs or whether to go '
                   'ahead, call ask_user: the pilot picks from a list instead of typing an answer to a question you '

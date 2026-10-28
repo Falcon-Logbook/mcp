@@ -7,4 +7,5 @@ export 'src/questions.dart';
 export 'src/route.dart';
 export 'src/server.dart';
 export 'src/sqlite_loader.dart';
+export 'src/totals.dart';
 export 'src/util.dart';
