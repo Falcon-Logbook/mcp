@@ -1,6 +1,7 @@
 import 'dart:convert';
 
 import 'package:mcp_dart/mcp_dart.dart';
+import 'package:sqlite3/sqlite3.dart' show SqliteException;
 
 import 'config.dart';
 import 'currency.dart';
@@ -24,21 +25,25 @@ class _Column {
   final num? max;
   final String? note;
 
-  JsonSchema get schema => switch (kind) {
-        _Kind.text => JsonSchema.string(description: note),
+  /// How this column is advertised to a client. [notes] false keeps the type,
+  /// the bounds and the format and drops the prose, for the second tool that
+  /// would otherwise carry the same note again.
+  JsonSchema schema({bool notes = true}) => switch (kind) {
+        _Kind.text => JsonSchema.string(description: notes ? note : null),
         _Kind.integer => JsonSchema.integer(
-            description: note,
+            description: notes ? note : null,
             minimum: min?.toInt(),
             maximum: max?.toInt(),
           ),
-        _Kind.real =>
-          JsonSchema.number(description: note, minimum: min, maximum: max),
-        _Kind.boolean => JsonSchema.boolean(description: note),
-        _Kind.date => JsonSchema.string(description: note, format: 'date'),
+        _Kind.real => JsonSchema.number(
+            description: notes ? note : null, minimum: min, maximum: max),
+        _Kind.boolean => JsonSchema.boolean(description: notes ? note : null),
+        _Kind.date =>
+          JsonSchema.string(description: notes ? note : null, format: 'date'),
         // No pattern: the shapes accepted are wider than any single regex a
         // client could read, and the SDK enforces a pattern before the tool
         // runs, which would turn a valid 930 into a validation failure.
-        _Kind.clock => JsonSchema.string(description: note),
+        _Kind.clock => JsonSchema.string(description: notes ? note : null),
       };
 }
 
@@ -252,6 +257,22 @@ JsonSchema get _flightLimitSchema => JsonSchema.integer(
 JsonSchema get _missingTimesLimitSchema => JsonSchema.integer(
     minimum: 1, maximum: 200, description: 'Default 200, maximum 200.');
 
+/// The `limit` argument on `get_recent_logs`. A log response is a diagnostic
+/// aid, so the page is small: 20 entries by default, 200 at most.
+JsonSchema get _logLimitSchema => JsonSchema.integer(
+    minimum: 1, maximum: 200, description: 'Default 20, maximum 200.');
+
+/// How much of a log message a projection carries. A log entry can hold a
+/// multi-kilobyte message and a multi-kilobyte stack trace, neither of which is
+/// worth 10k tokens, and the full text is in the app.
+const int _logMessageLimit = 500;
+
+/// [text] cut to [_logMessageLimit] characters, with an ellipsis when it was
+/// longer, so a caller can tell a short message from a truncated one.
+String _truncateMessage(String text) => text.length <= _logMessageLimit
+    ? text
+    : '${text.substring(0, _logMessageLimit - 3)}...';
+
 /// Arguments that select the date window, shared by every filtered read.
 const Set<String> _dateFilterKeys = {'date_from', 'date_to', 'period'};
 
@@ -269,12 +290,20 @@ const Set<String> _flightFilterKeys = {
 // ============================================================
 
 /// A problem the caller can fix. Reported as an MCP tool error, not a crash.
+///
+/// [code] is a token a caller can branch on, [field] is the argument at fault,
+/// and [tool] is named when several tools could have refused. [detail] is one
+/// sentence: no SQL, no file path, no database text.
 class _ToolError implements Exception {
-  _ToolError(this.message);
-  final String message;
+  _ToolError(this.detail, {this.code = 'invalid_value', this.field, this.tool});
+
+  final String detail;
+  final String code;
+  final String? field;
+  final String? tool;
 
   @override
-  String toString() => message;
+  String toString() => detail;
 }
 
 /// A tool result as compact JSON: a client can pretty-print for a human, and an
@@ -284,8 +313,62 @@ TextContent _jsonContent(Object? value) => TextContent(text: jsonEncode(value));
 CallToolResult _ok(Object? value) =>
     CallToolResult.fromContent([_jsonContent(value)]);
 
-CallToolResult _fail(String message) =>
-    CallToolResult(content: [TextContent(text: message)], isError: true);
+/// A failed call as the envelope an agent can act on: a stable error code, the
+/// field at fault, and one short sentence. Same encoding as a successful
+/// result, so a caller parses one shape either way.
+CallToolResult _fail(
+  String detail, {
+  String code = 'invalid_value',
+  String? field,
+  String? tool,
+}) =>
+    CallToolResult(
+      content: [
+        _jsonContent({
+          'error': code,
+          if (field != null) 'field': field,
+          if (tool != null) 'tool': tool,
+          'detail': detail,
+        }),
+      ],
+      isError: true,
+    );
+
+/// [error] as a failed call, keeping the code, field and tool it was raised
+/// with so the message does not have to repeat them in prose.
+CallToolResult _failWith(_ToolError error) => _fail(
+      error.detail,
+      code: error.code,
+      field: error.field,
+      tool: error.tool,
+    );
+
+/// Anything thrown inside a callback as a [_ToolError].
+///
+/// Database text is never passed through: a [SqliteException] carries the SQL
+/// statement and the database path, and an agent can act on none of it. The
+/// primary result code says what kind of failure it was, which is all a caller
+/// needs to decide whether a retry or a different value will help.
+_ToolError _asToolError(Object error) {
+  if (error is _ToolError) return error;
+  if (error is SqliteException) {
+    return switch (error.resultCode) {
+      19 => _ToolError(
+          'the database refused the row: a duplicate, a missing link or a '
+          'value outside its allowed set',
+          code: 'constraint',
+        ),
+      5 || 6 => _ToolError(
+          'the database is locked by another process; retry in a moment',
+          code: 'busy',
+        ),
+      _ => _ToolError('the database could not complete the request',
+          code: 'internal'),
+    };
+  }
+  return _ToolError('the server could not complete the request',
+      code: 'internal');
+}
 
 /// Coerces a JSON argument to the SQLite value for [column].
 Object? _coerce(_Column column, Object? raw) {
@@ -300,27 +383,36 @@ Object? _coerce(_Column column, Object? raw) {
         if (alias != null) {
           throw _ToolError(
               '${column.name} must be an integer number of minutes; '
-              'use $alias to pass hours');
+              'use $alias to pass hours',
+              field: column.name);
         }
-        throw _ToolError(_minuteColumns.contains(column.name)
-            ? '${column.name} must be an integer number of minutes'
-            : '${column.name} must be an integer');
+        throw _ToolError(
+            _minuteColumns.contains(column.name)
+                ? '${column.name} must be an integer number of minutes'
+                : '${column.name} must be an integer',
+            field: column.name);
       }
       _checkRange(column, value);
       return value;
     case _Kind.real:
       final value = asDouble(raw);
-      if (value == null) throw _ToolError('${column.name} must be a number');
+      if (value == null) {
+        throw _ToolError('${column.name} must be a number', field: column.name);
+      }
       _checkRange(column, value);
       return value;
     case _Kind.boolean:
       final value = asBool(raw);
-      if (value == null) throw _ToolError('${column.name} must be a boolean');
+      if (value == null) {
+        throw _ToolError('${column.name} must be a boolean',
+            field: column.name);
+      }
       return value ? 1 : 0;
     case _Kind.date:
       final value = dateToEpoch(raw);
       if (value == null) {
-        throw _ToolError('${column.name} must be a date such as 2026-10-27');
+        throw _ToolError('${column.name} must be a date such as 2026-10-27',
+            field: column.name);
       }
       return value;
     case _Kind.clock:
@@ -328,7 +420,8 @@ Object? _coerce(_Column column, Object? raw) {
       if (value == null) {
         throw _ToolError(
             '${column.name} must be a 24-hour clock time: 9, 930, 9:30, '
-            '09:30 or 0930 (got "$raw")');
+            '09:30 or 0930 (got "$raw")',
+            field: column.name);
       }
       return value;
   }
@@ -337,11 +430,13 @@ Object? _coerce(_Column column, Object? raw) {
 void _checkRange(_Column column, num value) {
   if (column.min != null && value < column.min!) {
     throw _ToolError(
-        '${column.name} must be >= ${column.min}${_unitSuffix(column)}');
+        '${column.name} must be >= ${column.min}${_unitSuffix(column)}',
+        field: column.name);
   }
   if (column.max != null && value > column.max!) {
     throw _ToolError(
-        '${column.name} must be <= ${column.max}${_unitSuffix(column)}');
+        '${column.name} must be <= ${column.max}${_unitSuffix(column)}',
+        field: column.name);
   }
 }
 
@@ -355,8 +450,10 @@ String _unitSuffix(_Column column) {
   return ' minutes';
 }
 
-Map<String, JsonSchema> _propertiesOf(List<_Column> columns) => {
-      for (final column in columns) column.name: column.schema,
+Map<String, JsonSchema> _propertiesOf(List<_Column> columns,
+        {bool notes = true}) =>
+    {
+      for (final column in columns) column.name: column.schema(notes: notes),
     };
 
 Set<String> _fieldNames(List<_Column> columns,
@@ -373,15 +470,54 @@ List<_Column> _supported(FalconDb db, String table, List<_Column> columns) {
   ];
 }
 
+/// Every table with its column count: the cheap answer to "what is in this
+/// database" that an agent needs before asking about one table. Describing all
+/// 21 tables costs 33 KB, more than the whole read-only catalog, so nothing
+/// returns every table's columns at once.
+List<Map<String, Object>> _tableCounts(FalconDb db) => [
+      for (final table in db.tables)
+        {'name': table, 'columns': db.columnsOf(table).length},
+    ];
+
+/// One table's columns. The default form is what a write needs: a name, a type
+/// and whether it is nullable. [full] adds the default value and the
+/// primary-key flag, which is what a schema diff wants and a write does not.
+List<Map<String, dynamic>> _columnInfo(FalconDb db, String table,
+        {required bool full}) =>
+    [
+      for (final column in db.tableInfo(table))
+        {
+          'name': column['name'],
+          'type': column['type'],
+          'notnull': column['notnull'],
+          if (full) 'default': column['default'],
+          if (full) 'pk': column['pk'],
+        },
+    ];
+
+/// [names] as one line, capped at eight so a typo error stays small: the first
+/// eight alphabetically, then how many were left out. A caller who mistyped one
+/// field needs to know the field is wrong and roughly what is accepted, not all
+/// 44 names.
+String _acceptedList(Iterable<String> names) {
+  final sorted = names.toList()..sort();
+  if (sorted.length <= 8) return sorted.join(', ');
+  return '${sorted.take(8).join(', ')} and ${sorted.length - 8} more';
+}
+
 /// Rejects argument names this server does not write, so a stale field name
-/// fails loudly instead of being silently dropped.
-void _rejectUnknown(Map<String, dynamic> args, Set<String> allowed) {
+/// fails loudly instead of being silently dropped. [tool] is named because an
+/// agent that called three tools in a row needs to know which one refused.
+void _rejectUnknown(Map<String, dynamic> args, Set<String> allowed,
+    {required String tool}) {
   final unknown = args.keys.where((key) => !allowed.contains(key)).toList()
     ..sort();
   if (unknown.isEmpty) return;
   throw _ToolError(
-    'Unknown field(s): ${unknown.join(', ')}. '
-    'Supported fields: ${allowed.toList()..sort()}',
+    'accepts ${_acceptedList(allowed)}',
+    code: 'unknown_field',
+    field: unknown.first,
+    tool: tool,
   );
 }
 
@@ -446,7 +582,8 @@ DateTime? _readDate(Map<String, dynamic> args, String name) {
   final date = parseCalendarDate(raw);
   if (date == null) {
     throw _ToolError(
-        '$name must be $dateFormatHint, for example 2025-01-31 (got "$raw")');
+        '$name must be $dateFormatHint, for example 2025-01-31 (got "$raw")',
+        field: name);
   }
   return date;
 }
@@ -462,7 +599,8 @@ _DateWindow _flightDateFilter(Map<String, dynamic> args,
 
   if (period != null &&
       (args['date_from'] != null || args['date_to'] != null)) {
-    throw _ToolError('Use either period or date_from/date_to, not both.');
+    throw _ToolError('Use either period or date_from/date_to, not both.',
+        field: 'period');
   }
 
   DateTime? from;
@@ -471,7 +609,8 @@ _DateWindow _flightDateFilter(Map<String, dynamic> args,
     final resolved = resolveDatePreset(period, now: now);
     if (resolved == null) {
       throw _ToolError(
-          'period must be one of ${datePresets.join(', ')} (got "$period")');
+          'period must be one of ${datePresets.join(', ')} (got "$period")',
+          field: 'period');
     }
     from = resolved.from;
     to = resolved.to;
@@ -479,8 +618,10 @@ _DateWindow _flightDateFilter(Map<String, dynamic> args,
     from = _readDate(args, 'date_from');
     to = _readDate(args, 'date_to');
     if (from != null && to != null && from.isAfter(to)) {
-      throw _ToolError('date_from (${formatCalendarDate(from)}) must not be '
-          'after date_to (${formatCalendarDate(to)})');
+      throw _ToolError(
+          'date_from (${formatCalendarDate(from)}) must not be '
+          'after date_to (${formatCalendarDate(to)})',
+          field: 'date_from');
     }
   }
 
@@ -577,11 +718,12 @@ CallToolResult _runWrite(
     auditor.record(tool, args, id: id?.toString());
     return _ok(result);
   } on _ToolError catch (error) {
-    auditor.record(tool, args, error: error.message);
-    return _fail(error.message);
+    auditor.record(tool, args, error: error.detail);
+    return _failWith(error);
   } catch (error) {
-    auditor.record(tool, args, error: error.toString());
-    return _fail('$tool failed: $error');
+    final failure = _asToolError(error);
+    auditor.record(tool, args, error: failure.detail);
+    return _failWith(failure);
   }
 }
 
@@ -663,11 +805,14 @@ Map<String, dynamic> _minutesFromHours(Map<String, dynamic> args) {
     if (!out.containsKey(alias)) continue;
     if (out[entry.key] != null) {
       throw _ToolError(
-          'Supply either ${entry.key} (minutes) or $alias (hours), not both.');
+          'Supply either ${entry.key} (minutes) or $alias (hours), not both.',
+          field: alias);
     }
     final hours = asDouble(out.remove(alias));
-    if (hours == null) throw _ToolError('$alias must be a number of hours');
-    if (hours < 0) throw _ToolError('$alias must be >= 0');
+    if (hours == null) {
+      throw _ToolError('$alias must be a number of hours', field: alias);
+    }
+    if (hours < 0) throw _ToolError('$alias must be >= 0', field: alias);
     out[entry.key] = (hours * 60).round();
   }
   return out;
@@ -679,32 +824,45 @@ Map<String, dynamic> _minutesFromHours(Map<String, dynamic> args) {
 void _applyDraft(Map<String, dynamic> fields, Map<String, dynamic> args) {
   if (!args.containsKey('draft')) return;
   final draft = asBool(args['draft']);
-  if (draft == null) throw _ToolError('draft must be true or false');
+  if (draft == null) {
+    throw _ToolError('draft must be true or false', field: 'draft');
+  }
   if (!draft) return;
   if (fields.containsKey('total_time')) {
     throw _ToolError(
         'Supply either total_time or draft: true, not both. draft: true clears '
-        'total_time and makes the flight a draft.');
+        'total_time and makes the flight a draft.',
+        field: 'draft');
   }
   fields['total_time'] = null;
 }
 
 /// Input schema for the flight write tools: the live columns, the `_hours`
 /// aliases for the duration fields this database has, and `draft`.
-Map<String, JsonSchema> _flightWriteProperties(FalconDb db) {
+///
+/// A field means the same thing on a create and on an update, so the per-column
+/// notes are written once, on `create_flight`. `update_flight` passes [notes]
+/// false and carries the same names, types, bounds and formats without the
+/// prose: that is what a caller plans a call from, and paying for the same
+/// explanations twice is the catalog's largest avoidable cost.
+Map<String, JsonSchema> _flightWriteProperties(FalconDb db,
+    {required bool notes}) {
   final available = db.columnsOf('flights').toSet();
   return {
-    ..._propertiesOf(_supported(db, 'flights', _flightColumns)),
+    ..._propertiesOf(_supported(db, 'flights', _flightColumns), notes: notes),
     for (final entry in _hoursAliases.entries)
       if (available.contains(entry.key))
         entry.value: JsonSchema.number(
           minimum: 0,
-          description: 'Hours, converted to ${entry.key} minutes.',
+          description:
+              notes ? 'Hours, converted to ${entry.key} minutes.' : null,
         ),
     'draft': JsonSchema.boolean(
-      description: 'true clears total_time, which is what makes a flight a '
-          'draft. Cannot be combined with total_time. Clients cannot send a '
-          'null total_time, so this is the only way to clear a time.',
+      description: notes
+          ? 'true clears total_time, which is what makes a flight a draft. '
+              'Cannot be combined with total_time. Clients cannot send a '
+              'null total_time, so this is the only way to clear a time.'
+          : 'true clears total_time, making the flight a draft.',
     ),
   };
 }
@@ -715,19 +873,22 @@ Map<String, JsonSchema> _flightWriteProperties(FalconDb db) {
 const Set<String> _splitFields = {'total_time', 'day_time', 'night_time'};
 
 /// Builds the column/value map for a flight from tool arguments, deriving the
-/// aircraft and crew foreign keys the app expects.
+/// aircraft and crew foreign keys the app expects. [tool] is the write tool
+/// that asked, so an unknown field names the tool that refused it.
 ({Map<String, Object?> values, List<String> warnings}) _flightValues(
   FalconDb db,
-  Map<String, dynamic> args,
-) {
+  Map<String, dynamic> args, {
+  required String tool,
+}) {
   final values = <String, Object?>{};
   final warnings = <String>[];
   _rejectUnknown(args,
-      _fieldNames(_flightColumns, {'id', ..._hoursAliases.values, 'draft'}));
+      _fieldNames(_flightColumns, {'id', ..._hoursAliases.values, 'draft'}),
+      tool: tool);
   final fields = _minutesFromHours(args);
   _applyDraft(fields, args);
   if (fields.containsKey('date') && asText(fields['date']) == null) {
-    throw _ToolError('date cannot be empty');
+    throw _ToolError('date cannot be empty', field: 'date');
   }
   final columns = <String>[];
   final raw = <Object?>[];
@@ -744,7 +905,8 @@ const Set<String> _splitFields = {'total_time', 'day_time', 'night_time'};
     throw _ToolError(
         'total_time must be at least 1 minute: the app stores 0 as a complete '
         'flight with no duration, not a draft. Pass draft: true to clear the '
-        'time.');
+        'time.',
+        field: 'total_time');
   }
 
   if (fields.containsKey('aircraft_registration')) {
@@ -769,7 +931,8 @@ const Set<String> _splitFields = {'total_time', 'day_time', 'night_time'};
     if (aircraftId != null &&
         db.query(
             'SELECT id FROM aircraft WHERE id = ?', [aircraftId]).isEmpty) {
-      throw _ToolError('Aircraft not found: $aircraftId');
+      throw _ToolError('Aircraft not found: $aircraftId',
+          code: 'not_found', field: 'aircraft_id');
     }
     values['aircraft_id'] = aircraftId;
   }
@@ -788,7 +951,8 @@ const Set<String> _splitFields = {'total_time', 'day_time', 'night_time'};
     if (crewId != null &&
         db.query(
             'SELECT id FROM crew_members WHERE id = ?', [crewId]).isEmpty) {
-      throw _ToolError('Crew member not found: $crewId');
+      throw _ToolError('Crew member not found: $crewId',
+          code: 'not_found', field: 'crew_member_id');
     }
     values['crew_member_id'] = crewId;
   }
@@ -802,6 +966,7 @@ const Set<String> _splitFields = {'total_time', 'day_time', 'night_time'};
     if (value is String && value.isNotEmpty && !entry.value.contains(value)) {
       throw _ToolError(
         '${entry.key} must be one of ${entry.value.join(', ')} (got "$value")',
+        field: entry.key,
       );
     }
   }
@@ -975,7 +1140,8 @@ String _createId(FalconDb db, String table, Map<String, dynamic> args) {
         'be pushed to the cloud.');
   }
   if (db.query('SELECT id FROM $table WHERE id = ?', [requested]).isNotEmpty) {
-    throw _ToolError('A $table row with id $requested already exists.');
+    throw _ToolError('A $table row with id $requested already exists.',
+        code: 'constraint', field: 'id');
   }
   return requested;
 }
@@ -1040,7 +1206,7 @@ Future<void> runServer(String dbPath, {bool readonly = true}) async {
     annotations: readOnlyAnnotations,
     callback: (args, extra) async {
       try {
-        _rejectUnknown(args, const {});
+        _rejectUnknown(args, const {}, tool: 'db_info');
         return _ok({
           'path': dbPath,
           'schemaVersion': version,
@@ -1049,38 +1215,52 @@ Future<void> runServer(String dbPath, {bool readonly = true}) async {
           'tables': db.tables,
         });
       } on _ToolError catch (error) {
-        return _fail(error.message);
+        return _failWith(error);
       } catch (error) {
-        return _fail('db_info failed: $error');
+        return _failWith(_asToolError(error));
       }
     },
   );
 
-  List<Map<String, dynamic>> describeTable(String table) => db.tableInfo(table);
-
   server.registerTool(
     'get_schema',
     description:
-        'Describe database tables and columns (name, type, nullability, default, PK). Optionally filter to one table.',
+        'List table names with a column count. Pass table for that table\'s '
+        'columns (name, type, notnull), and add detail: "full" for default and '
+        'pk as well. Columns of every table at once are never returned.',
     inputSchema: JsonSchema.object(properties: {
-      'table':
-          JsonSchema.string(description: 'Table name. Omit for all tables.'),
+      'table': JsonSchema.string(
+          description:
+              'Table name. Omit to list table names and their column counts.'),
+      'detail': JsonSchema.string(
+          description:
+              'full: include a table\'s default and pk columns too. Needs table.'),
     }),
     annotations: readOnlyAnnotations,
     callback: (args, extra) async {
       try {
-        _rejectUnknown(args, {'table'});
+        _rejectUnknown(args, {'table', 'detail'}, tool: 'get_schema');
         final only = asText(args['table']);
-        if (only != null && !db.hasTable(only)) {
-          return _fail(
-              'Unknown table: $only. Known tables: ${db.tables.join(', ')}');
+        final detail = asText(args['detail']);
+        if (detail != null && detail != 'full') {
+          return _fail('detail must be full (got "$detail")', field: 'detail');
         }
-        final tables = only != null ? [only] : db.tables;
-        return _ok({for (final table in tables) table: describeTable(table)});
+        if (only == null) {
+          if (detail != null) {
+            return _fail('detail: full needs a table; one table at a time',
+                field: 'table');
+          }
+          return _ok({'tables': _tableCounts(db)});
+        }
+        if (!db.hasTable(only)) {
+          return _fail('no table named $only; db_info lists the tables',
+              code: 'not_found', field: 'table');
+        }
+        return _ok({only: _columnInfo(db, only, full: detail != null)});
       } on _ToolError catch (error) {
-        return _fail(error.message);
+        return _failWith(error);
       } catch (error) {
-        return _fail('get_schema failed: $error');
+        return _failWith(_asToolError(error));
       }
     },
   );
@@ -1109,19 +1289,22 @@ Future<void> runServer(String dbPath, {bool readonly = true}) async {
     annotations: readOnlyAnnotations,
     callback: (args, extra) async {
       try {
-        _rejectUnknown(args, {
-          'limit',
-          'offset',
-          'full',
-          'aircraft_registration',
-          'flight_type',
-          'crew_members_name',
-          ..._flightFilterKeys,
-        });
+        _rejectUnknown(
+            args,
+            {
+              'limit',
+              'offset',
+              'full',
+              'aircraft_registration',
+              'flight_type',
+              'crew_members_name',
+              ..._flightFilterKeys,
+            },
+            tool: 'list_flights');
         final limit = asInt(args['limit']) ?? 20;
-        if (limit < 1) return _fail('limit must be >= 1');
+        if (limit < 1) return _fail('limit must be >= 1', field: 'limit');
         final offset = asInt(args['offset']) ?? 0;
-        if (offset < 0) return _fail('offset must be >= 0');
+        if (offset < 0) return _fail('offset must be >= 0', field: 'offset');
         final full = asBool(args['full']) ?? false;
         final window = _flightDateFilter(args, now: DateTime.now());
         final where = [...window.where];
@@ -1157,9 +1340,9 @@ Future<void> runServer(String dbPath, {bool readonly = true}) async {
           'flights': [for (final row in rows) _flightView(row, full: full)],
         });
       } on _ToolError catch (error) {
-        return _fail(error.message);
+        return _failWith(error);
       } catch (error) {
-        return _fail('list_flights failed: $error');
+        return _failWith(_asToolError(error));
       }
     },
   );
@@ -1182,21 +1365,23 @@ Future<void> runServer(String dbPath, {bool readonly = true}) async {
     annotations: readOnlyAnnotations,
     callback: (args, extra) async {
       try {
-        _rejectUnknown(args, {'id', _includeSharedKey});
+        _rejectUnknown(args, {'id', _includeSharedKey}, tool: 'get_flight');
         final id = asText(args['id']);
-        if (id == null) return _fail('Missing or invalid id');
+        if (id == null) return _fail('Missing or invalid id', field: 'id');
         final owner = _ownerClause(db, 'flights',
             includeShared: asBool(args[_includeSharedKey]) ?? false);
         final rows = db.query(
             'SELECT * FROM flights WHERE id = ?'
             '${owner.isEmpty ? '' : ' AND $owner'}',
             [id]);
-        if (rows.isEmpty) return _fail('Flight not found: $id');
+        if (rows.isEmpty) {
+          return _fail('Flight not found: $id', code: 'not_found', field: 'id');
+        }
         return _ok({...rows.first, 'units': _units});
       } on _ToolError catch (error) {
-        return _fail(error.message);
+        return _failWith(error);
       } catch (error) {
-        return _fail('get_flight failed: $error');
+        return _failWith(_asToolError(error));
       }
     },
   );
@@ -1226,19 +1411,24 @@ Future<void> runServer(String dbPath, {bool readonly = true}) async {
     annotations: readOnlyAnnotations,
     callback: (args, extra) async {
       try {
-        _rejectUnknown(args, {
-          'query',
-          'limit',
-          'offset',
-          'full',
-          ..._flightFilterKeys,
-        });
+        _rejectUnknown(
+            args,
+            {
+              'query',
+              'limit',
+              'offset',
+              'full',
+              ..._flightFilterKeys,
+            },
+            tool: 'search_flights');
         final text = asText(args['query']);
-        if (text == null) return _fail('Missing or invalid query');
+        if (text == null) {
+          return _fail('Missing or invalid query', field: 'query');
+        }
         final limit = asInt(args['limit']) ?? 20;
-        if (limit < 1) return _fail('limit must be >= 1');
+        if (limit < 1) return _fail('limit must be >= 1', field: 'limit');
         final offset = asInt(args['offset']) ?? 0;
-        if (offset < 0) return _fail('offset must be >= 0');
+        if (offset < 0) return _fail('offset must be >= 0', field: 'offset');
         final full = asBool(args['full']) ?? false;
         final like = '%${escapeLike(text)}%';
         final window = _flightDateFilter(args, now: DateTime.now());
@@ -1275,9 +1465,9 @@ Future<void> runServer(String dbPath, {bool readonly = true}) async {
           'flights': [for (final row in rows) _flightView(row, full: full)],
         });
       } on _ToolError catch (error) {
-        return _fail(error.message);
+        return _failWith(error);
       } catch (error) {
-        return _fail('search_flights failed: $error');
+        return _failWith(_asToolError(error));
       }
     },
   );
@@ -1297,7 +1487,8 @@ Future<void> runServer(String dbPath, {bool readonly = true}) async {
     annotations: readOnlyAnnotations,
     callback: (args, extra) async {
       try {
-        _rejectUnknown(args, {'include_archived', _includeSharedKey, 'limit'});
+        _rejectUnknown(args, {'include_archived', _includeSharedKey, 'limit'},
+            tool: 'list_aircraft');
         final include = asBool(args['include_archived']) ?? false;
         final limit = asInt(args['limit']) ?? 200;
         final owner = _ownerClause(db, 'aircraft',
@@ -1312,9 +1503,9 @@ Future<void> runServer(String dbPath, {bool readonly = true}) async {
             [limit]);
         return _ok({'count': rows.length, 'aircraft': rows});
       } on _ToolError catch (error) {
-        return _fail(error.message);
+        return _failWith(error);
       } catch (error) {
-        return _fail('list_aircraft failed: $error');
+        return _failWith(_asToolError(error));
       }
     },
   );
@@ -1334,21 +1525,24 @@ Future<void> runServer(String dbPath, {bool readonly = true}) async {
     annotations: readOnlyAnnotations,
     callback: (args, extra) async {
       try {
-        _rejectUnknown(args, {'id', _includeSharedKey});
+        _rejectUnknown(args, {'id', _includeSharedKey}, tool: 'get_aircraft');
         final id = asText(args['id']);
-        if (id == null) return _fail('Missing or invalid id');
+        if (id == null) return _fail('Missing or invalid id', field: 'id');
         final owner = _ownerClause(db, 'aircraft',
             includeShared: asBool(args[_includeSharedKey]) ?? false);
         final rows = db.query(
             'SELECT * FROM aircraft WHERE id = ?'
             '${owner.isEmpty ? '' : ' AND $owner'}',
             [id]);
-        if (rows.isEmpty) return _fail('Aircraft not found: $id');
+        if (rows.isEmpty) {
+          return _fail('Aircraft not found: $id',
+              code: 'not_found', field: 'id');
+        }
         return _ok(rows.first);
       } on _ToolError catch (error) {
-        return _fail(error.message);
+        return _failWith(error);
       } catch (error) {
-        return _fail('get_aircraft failed: $error');
+        return _failWith(_asToolError(error));
       }
     },
   );
@@ -1363,7 +1557,7 @@ Future<void> runServer(String dbPath, {bool readonly = true}) async {
     annotations: readOnlyAnnotations,
     callback: (args, extra) async {
       try {
-        _rejectUnknown(args, {'query', 'limit'});
+        _rejectUnknown(args, {'query', 'limit'}, tool: 'list_airports');
         final limit = asInt(args['limit']) ?? 50;
         final text = asText(args['query']);
         if (text != null) {
@@ -1378,9 +1572,9 @@ Future<void> runServer(String dbPath, {bool readonly = true}) async {
         final rows = db.query('SELECT * FROM airports LIMIT ?', [limit]);
         return _ok({'count': rows.length, 'airports': rows});
       } on _ToolError catch (error) {
-        return _fail(error.message);
+        return _failWith(error);
       } catch (error) {
-        return _fail('list_airports failed: $error');
+        return _failWith(_asToolError(error));
       }
     },
   );
@@ -1398,7 +1592,8 @@ Future<void> runServer(String dbPath, {bool readonly = true}) async {
     annotations: readOnlyAnnotations,
     callback: (args, extra) async {
       try {
-        _rejectUnknown(args, {_includeSharedKey, 'limit'});
+        _rejectUnknown(args, {_includeSharedKey, 'limit'},
+            tool: 'list_custom_airports');
         final limit = asInt(args['limit']) ?? 200;
         final owner = _ownerClause(db, 'custom_airports',
             includeShared: asBool(args[_includeSharedKey]) ?? false);
@@ -1409,9 +1604,9 @@ Future<void> runServer(String dbPath, {bool readonly = true}) async {
             [limit]);
         return _ok({'count': rows.length, 'airports': rows});
       } on _ToolError catch (error) {
-        return _fail(error.message);
+        return _failWith(error);
       } catch (error) {
-        return _fail('list_custom_airports failed: $error');
+        return _failWith(_asToolError(error));
       }
     },
   );
@@ -1431,7 +1626,8 @@ Future<void> runServer(String dbPath, {bool readonly = true}) async {
     annotations: readOnlyAnnotations,
     callback: (args, extra) async {
       try {
-        _rejectUnknown(args, {'include_archived', _includeSharedKey, 'limit'});
+        _rejectUnknown(args, {'include_archived', _includeSharedKey, 'limit'},
+            tool: 'list_crew');
         final include = asBool(args['include_archived']) ?? false;
         final limit = asInt(args['limit']) ?? 200;
         final owner = _ownerClause(db, 'crew_members',
@@ -1446,9 +1642,9 @@ Future<void> runServer(String dbPath, {bool readonly = true}) async {
             [limit]);
         return _ok({'count': rows.length, 'crew': rows});
       } on _ToolError catch (error) {
-        return _fail(error.message);
+        return _failWith(error);
       } catch (error) {
-        return _fail('list_crew failed: $error');
+        return _failWith(_asToolError(error));
       }
     },
   );
@@ -1466,7 +1662,8 @@ Future<void> runServer(String dbPath, {bool readonly = true}) async {
     annotations: readOnlyAnnotations,
     callback: (args, extra) async {
       try {
-        _rejectUnknown(args, {_includeSharedKey, 'limit'});
+        _rejectUnknown(args, {_includeSharedKey, 'limit'},
+            tool: 'list_saved_routes');
         final limit = asInt(args['limit']) ?? 200;
         final owner = _ownerClause(db, 'saved_routes',
             includeShared: asBool(args[_includeSharedKey]) ?? false);
@@ -1477,9 +1674,9 @@ Future<void> runServer(String dbPath, {bool readonly = true}) async {
             [limit]);
         return _ok({'count': rows.length, 'routes': rows});
       } on _ToolError catch (error) {
-        return _fail(error.message);
+        return _failWith(error);
       } catch (error) {
-        return _fail('list_saved_routes failed: $error');
+        return _failWith(_asToolError(error));
       }
     },
   );
@@ -1514,20 +1711,26 @@ Future<void> runServer(String dbPath, {bool readonly = true}) async {
     callback: (args, extra) async {
       try {
         _rejectUnknown(args,
-            {'include_past', 'due_within_days', 'limit', _includeSharedKey});
+            {'include_past', 'due_within_days', 'limit', _includeSharedKey},
+            tool: 'list_expiries');
         if (!db.hasTable('expiries')) {
-          return _fail('This database (schema ${db.schemaVersion}) has no '
-              'expiries table');
+          return _fail(
+              'This database (schema ${db.schemaVersion}) has no '
+              'expiries table',
+              code: 'not_found',
+              field: 'expiries');
         }
         final includePast = asBool(args['include_past']) ?? true;
         final rawDays = args['due_within_days'];
         final dueWithinDays = rawDays == null ? null : asInt(rawDays);
         if (rawDays != null && (dueWithinDays == null || dueWithinDays < 0)) {
-          return _fail('due_within_days must be a whole number of days, 0 or '
-              'more (got "$rawDays")');
+          return _fail(
+              'due_within_days must be a whole number of days, 0 or '
+              'more (got "$rawDays")',
+              field: 'due_within_days');
         }
         final limit = asInt(args['limit']) ?? 100;
-        if (limit < 1) return _fail('limit must be >= 1');
+        if (limit < 1) return _fail('limit must be >= 1', field: 'limit');
 
         final thresholds = readExpiryThresholds(db);
         final today = DateTime.now();
@@ -1572,9 +1775,9 @@ Future<void> runServer(String dbPath, {bool readonly = true}) async {
           'expiries': expiries,
         });
       } on _ToolError catch (error) {
-        return _fail(error.message);
+        return _failWith(error);
       } catch (error) {
-        return _fail('list_expiries failed: $error');
+        return _failWith(_asToolError(error));
       }
     },
   );
@@ -1598,7 +1801,7 @@ Future<void> runServer(String dbPath, {bool readonly = true}) async {
     annotations: readOnlyAnnotations,
     callback: (args, extra) async {
       try {
-        _rejectUnknown(args, _flightFilterKeys);
+        _rejectUnknown(args, _flightFilterKeys, tool: 'logbook_stats');
         final window = _flightDateFilter(args, now: DateTime.now());
         final where = [...window.where];
         final params = [...window.params];
@@ -1624,9 +1827,9 @@ Future<void> runServer(String dbPath, {bool readonly = true}) async {
           'units': _units,
         });
       } on _ToolError catch (error) {
-        return _fail(error.message);
+        return _failWith(error);
       } catch (error) {
-        return _fail('logbook_stats failed: $error');
+        return _failWith(_asToolError(error));
       }
     },
   );
@@ -1660,26 +1863,35 @@ Future<void> runServer(String dbPath, {bool readonly = true}) async {
     annotations: readOnlyAnnotations,
     callback: (args, extra) async {
       try {
-        _rejectUnknown(args, {'metric', 'period'});
+        _rejectUnknown(args, {'metric', 'period'}, tool: 'currency_status');
         if (!db.hasTable('user_currency')) {
-          return _fail('This database (schema ${db.schemaVersion}) has no '
-              'user_currency table');
+          return _fail(
+              'This database (schema ${db.schemaVersion}) has no '
+              'user_currency table',
+              code: 'not_found',
+              field: 'user_currency');
         }
         final metric = asText(args['metric']);
         if (metric != null && !currencyMetrics.contains(metric)) {
           return _fail(
-              'metric must be one of ${currencyMetrics.join(', ')} (got "$metric")');
+              'metric must be one of ${currencyMetrics.join(', ')} (got '
+              '"$metric")',
+              field: 'metric');
         }
         final rawPeriod = asText(args['period']);
         final period = rawPeriod ?? defaultCurrencyPeriod;
         if (!currencyPeriods.contains(period)) {
-          return _fail('period must be one of ${currencyPeriods.join(', ')} '
-              '(got "$period")');
+          return _fail(
+              'period must be one of ${currencyPeriods.join(', ')} '
+              '(got "$period")',
+              field: 'period');
         }
         if (rawPeriod != null && metric == null) {
-          return _fail('period only applies with metric: pass metric (one of '
+          return _fail(
+              'period only applies with metric: pass metric (one of '
               '${currencyMetrics.join(', ')}) to ask about a metric, or omit '
-              'both for the configured rules');
+              'both for the configured rules',
+              field: 'period');
         }
 
         final now = DateTime.now();
@@ -1703,9 +1915,9 @@ Future<void> runServer(String dbPath, {bool readonly = true}) async {
           if (unconfigured != null) 'unconfigured': unconfigured,
         });
       } on _ToolError catch (error) {
-        return _fail(error.message);
+        return _failWith(error);
       } catch (error) {
-        return _fail('currency_status failed: $error');
+        return _failWith(_asToolError(error));
       }
     },
   );
@@ -1717,13 +1929,13 @@ Future<void> runServer(String dbPath, {bool readonly = true}) async {
     annotations: readOnlyAnnotations,
     callback: (args, extra) async {
       try {
-        _rejectUnknown(args, const {});
+        _rejectUnknown(args, const {}, tool: 'get_flight_settings');
         final rows = db.query('SELECT * FROM flights_settings LIMIT 1');
         return _ok(rows.isEmpty ? <String, dynamic>{} : rows.first);
       } on _ToolError catch (error) {
-        return _fail(error.message);
+        return _failWith(error);
       } catch (error) {
-        return _fail('get_flight_settings failed: $error');
+        return _failWith(_asToolError(error));
       }
     },
   );
@@ -1735,13 +1947,13 @@ Future<void> runServer(String dbPath, {bool readonly = true}) async {
     annotations: readOnlyAnnotations,
     callback: (args, extra) async {
       try {
-        _rejectUnknown(args, const {});
+        _rejectUnknown(args, const {}, tool: 'get_app_settings');
         final rows = db.query('SELECT * FROM app_settings LIMIT 1');
         return _ok(rows.isEmpty ? <String, dynamic>{} : rows.first);
       } on _ToolError catch (error) {
-        return _fail(error.message);
+        return _failWith(error);
       } catch (error) {
-        return _fail('get_app_settings failed: $error');
+        return _failWith(_asToolError(error));
       }
     },
   );
@@ -1754,36 +1966,58 @@ Future<void> runServer(String dbPath, {bool readonly = true}) async {
     annotations: readOnlyAnnotations,
     callback: (args, extra) async {
       try {
-        _rejectUnknown(args, const {});
+        _rejectUnknown(args, const {}, tool: 'get_general_settings');
         final rows = db.query('SELECT * FROM general_settings LIMIT 1');
         return _ok(rows.isEmpty ? <String, dynamic>{} : rows.first);
       } on _ToolError catch (error) {
-        return _fail(error.message);
+        return _failWith(error);
       } catch (error) {
-        return _fail('get_general_settings failed: $error');
+        return _failWith(_asToolError(error));
       }
     },
   );
 
   server.registerTool(
     'get_recent_logs',
-    description: 'Read recent log entries for diagnostics.',
+    description:
+        'Read recent log entries for diagnostics, newest first. Each entry is '
+        'timestamp, level, category and the message cut to $_logMessageLimit '
+        'characters; the stack trace is left out unless include_stack is true. '
+        'Default 20 entries, maximum 200.',
     inputSchema: JsonSchema.object(properties: {
-      'limit': JsonSchema.integer(minimum: 1, maximum: 1000),
+      'limit': _logLimitSchema,
+      'include_stack': JsonSchema.boolean(
+          description: 'Include each entry\'s stack trace. Default false, '
+              'because one trace can be larger than the rest of the response.'),
     }),
     annotations: readOnlyAnnotations,
     callback: (args, extra) async {
       try {
-        _rejectUnknown(args, {'limit'});
-        final limit = asInt(args['limit']) ?? 50;
+        _rejectUnknown(args, {'limit', 'include_stack'},
+            tool: 'get_recent_logs');
+        final limit = asInt(args['limit']) ?? 20;
+        final includeStack = asBool(args['include_stack']) ?? false;
         final rows = db.query(
-            'SELECT * FROM log_entries ORDER BY timestamp DESC, id DESC LIMIT ?',
+            'SELECT timestamp, level, category, message, stack_trace '
+            'FROM log_entries ORDER BY timestamp DESC, id DESC LIMIT ?',
             [limit]);
-        return _ok({'count': rows.length, 'logs': rows});
+        return _ok({
+          'count': rows.length,
+          'logs': [
+            for (final row in rows)
+              {
+                'timestamp': row['timestamp'],
+                'level': row['level'],
+                'category': row['category'],
+                'message': _truncateMessage(asText(row['message']) ?? ''),
+                if (includeStack) 'stack_trace': row['stack_trace'],
+              },
+          ],
+        });
       } on _ToolError catch (error) {
-        return _fail(error.message);
+        return _failWith(error);
       } catch (error) {
-        return _fail('get_recent_logs failed: $error');
+        return _failWith(_asToolError(error));
       }
     },
   );
@@ -1805,7 +2039,8 @@ Future<void> runServer(String dbPath, {bool readonly = true}) async {
     annotations: readOnlyAnnotations,
     callback: (args, extra) async {
       try {
-        _rejectUnknown(args, {'limit', 'full', _includeSharedKey});
+        _rejectUnknown(args, {'limit', 'full', _includeSharedKey},
+            tool: 'find_missing_times');
         final limit = asInt(args['limit']) ?? 200;
         final full = asBool(args['full']) ?? false;
         final owner = _ownerClause(db, 'flights',
@@ -1823,9 +2058,9 @@ Future<void> runServer(String dbPath, {bool readonly = true}) async {
           'flights': [for (final row in rows) _flightView(row, full: full)],
         });
       } on _ToolError catch (error) {
-        return _fail(error.message);
+        return _failWith(error);
       } catch (error) {
-        return _fail('find_missing_times failed: $error');
+        return _failWith(_asToolError(error));
       }
     },
   );
@@ -1842,7 +2077,7 @@ Future<void> runServer(String dbPath, {bool readonly = true}) async {
     annotations: readOnlyAnnotations,
     callback: (args, extra) async {
       try {
-        _rejectUnknown(args, {_includeSharedKey});
+        _rejectUnknown(args, {_includeSharedKey}, tool: 'dedupe_crew');
         final owner = _ownerClause(db, 'crew_members',
             includeShared: asBool(args[_includeSharedKey]) ?? false);
         final rows = db.query(
@@ -1860,9 +2095,9 @@ Future<void> runServer(String dbPath, {bool readonly = true}) async {
         ];
         return _ok({'groups': duplicates.length, 'duplicates': duplicates});
       } on _ToolError catch (error) {
-        return _fail(error.message);
+        return _failWith(error);
       } catch (error) {
-        return _fail('dedupe_crew failed: $error');
+        return _failWith(_asToolError(error));
       }
     },
   );
@@ -1885,7 +2120,7 @@ Future<void> runServer(String dbPath, {bool readonly = true}) async {
       inputSchema: JsonSchema.object(
         properties: {
           'id': _createIdSchema,
-          ..._flightWriteProperties(db),
+          ..._flightWriteProperties(db, notes: true),
         },
         required: ['date'],
       ),
@@ -1893,10 +2128,12 @@ Future<void> runServer(String dbPath, {bool readonly = true}) async {
           readOnlyHint: false, destructiveHint: false, openWorldHint: false),
       callback: (args, extra) async =>
           _runWrite(db, auditor, 'create_flight', args, () {
-        if (asText(args['date']) == null) throw _ToolError('date is required');
-        final flight = _flightValues(db, args);
+        if (asText(args['date']) == null) {
+          throw _ToolError('date is required', field: 'date');
+        }
+        final flight = _flightValues(db, args, tool: 'create_flight');
         final date = asInt(flight.values['date']);
-        if (date == null) throw _ToolError('date is required');
+        if (date == null) throw _ToolError('date is required', field: 'date');
         final id = _createId(db, 'flights', args);
         final dayOrder = _nextDayOrder(db, date);
         final fields = <String, Object?>{
@@ -1932,11 +2169,13 @@ Future<void> runServer(String dbPath, {bool readonly = true}) async {
           'are minutes; total_time_hours, day_time_hours and night_time_hours '
           'are accepted instead. draft: true clears total_time, because a null '
           'total_time cannot be sent. Recomputes day_order when date moves the '
-          'flight to another day. Returns the row as written as flight.',
+          'flight to another day. Returns the row as written as flight. The '
+          'field notes and limits are on create_flight, and field meaning is '
+          'in falcon://conventions.',
       inputSchema: JsonSchema.object(
         properties: {
           'id': JsonSchema.string(),
-          ..._flightWriteProperties(db),
+          ..._flightWriteProperties(db, notes: false),
         },
         required: ['id'],
       ),
@@ -1945,10 +2184,13 @@ Future<void> runServer(String dbPath, {bool readonly = true}) async {
       callback: (args, extra) async =>
           _runWrite(db, auditor, 'update_flight', args, () {
         final id = asText(args['id']);
-        if (id == null) throw _ToolError('Missing or invalid id');
+        if (id == null) throw _ToolError('Missing or invalid id', field: 'id');
         final before = _flightRow(db, id);
-        if (before == null) throw _ToolError('Flight not found: $id');
-        final flight = _flightValues(db, args);
+        if (before == null) {
+          throw _ToolError('Flight not found: $id',
+              code: 'not_found', field: 'id');
+        }
+        final flight = _flightValues(db, args, tool: 'update_flight');
         if (flight.values.isEmpty) throw _ToolError('No fields to update');
         final values = Map<String, Object?>.of(flight.values);
         final date = asInt(values['date']);
@@ -1960,7 +2202,10 @@ Future<void> runServer(String dbPath, {bool readonly = true}) async {
           'UPDATE flights SET ${assignments.join(', ')}, updated_at = ? WHERE id = ?',
           [...values.values, nowEpochSeconds(), id],
         );
-        if (changed != 1) throw _ToolError('Flight not found: $id');
+        if (changed != 1) {
+          throw _ToolError('Flight not found: $id',
+              code: 'not_found', field: 'id');
+        }
         final row = _flightRow(db, id)!;
         final warnings = [
           ...flight.warnings,
@@ -1987,9 +2232,10 @@ Future<void> runServer(String dbPath, {bool readonly = true}) async {
       callback: (args, extra) async =>
           _runWrite(db, auditor, 'delete_flight', args, () {
         final id = asText(args['id']);
-        if (id == null) throw _ToolError('Missing or invalid id');
+        if (id == null) throw _ToolError('Missing or invalid id', field: 'id');
         if (db.query('SELECT id FROM flights WHERE id = ?', [id]).isEmpty) {
-          throw _ToolError('Flight not found: $id');
+          throw _ToolError('Flight not found: $id',
+              code: 'not_found', field: 'id');
         }
         db.transaction(() {
           db.execute('DELETE FROM flights WHERE id = ?', [id]);
@@ -2016,14 +2262,19 @@ Future<void> runServer(String dbPath, {bool readonly = true}) async {
           readOnlyHint: false, destructiveHint: false, openWorldHint: false),
       callback: (args, extra) async =>
           _runWrite(db, auditor, 'add_aircraft', args, () {
-        _rejectUnknown(args, _fieldNames(_aircraftColumns, {'id'}));
+        _rejectUnknown(args, _fieldNames(_aircraftColumns, {'id'}),
+            tool: 'add_aircraft');
         final type = asText(args['type']);
         final registration = asText(args['registration']);
-        if (type == null) throw _ToolError('type is required');
-        if (registration == null) throw _ToolError('registration is required');
+        if (type == null) throw _ToolError('type is required', field: 'type');
+        if (registration == null) {
+          throw _ToolError('registration is required', field: 'registration');
+        }
         final countryCode = (asText(args['country_code']) ?? '').toUpperCase();
         final bare = _bareRegistration(registration, countryCode);
-        if (bare.isEmpty) throw _ToolError('registration is required');
+        if (bare.isEmpty) {
+          throw _ToolError('registration is required', field: 'registration');
+        }
         final clash = db.query(
           'SELECT id FROM aircraft WHERE UPPER(country_code) = ? AND UPPER(registration) = ?',
           [countryCode, bare],
@@ -2065,11 +2316,15 @@ Future<void> runServer(String dbPath, {bool readonly = true}) async {
           readOnlyHint: false, destructiveHint: false, openWorldHint: false),
       callback: (args, extra) async =>
           _runWrite(db, auditor, 'update_aircraft', args, () {
-        _rejectUnknown(args, _fieldNames(_aircraftColumns, {'id'}));
+        _rejectUnknown(args, _fieldNames(_aircraftColumns, {'id'}),
+            tool: 'update_aircraft');
         final id = asText(args['id']);
-        if (id == null) throw _ToolError('Missing or invalid id');
+        if (id == null) throw _ToolError('Missing or invalid id', field: 'id');
         final rows = db.query('SELECT * FROM aircraft WHERE id = ?', [id]);
-        if (rows.isEmpty) throw _ToolError('Aircraft not found: $id');
+        if (rows.isEmpty) {
+          throw _ToolError('Aircraft not found: $id',
+              code: 'not_found', field: 'id');
+        }
 
         // Normalise to the app's storage form before writing.
         final current = rows.first;
@@ -2128,9 +2383,10 @@ Future<void> runServer(String dbPath, {bool readonly = true}) async {
       callback: (args, extra) async =>
           _runWrite(db, auditor, 'delete_aircraft', args, () {
         final id = asText(args['id']);
-        if (id == null) throw _ToolError('Missing or invalid id');
+        if (id == null) throw _ToolError('Missing or invalid id', field: 'id');
         if (db.query('SELECT id FROM aircraft WHERE id = ?', [id]).isEmpty) {
-          throw _ToolError('Aircraft not found: $id');
+          throw _ToolError('Aircraft not found: $id',
+              code: 'not_found', field: 'id');
         }
         db.transaction(() {
           db.execute('DELETE FROM aircraft WHERE id = ?', [id]);
@@ -2156,7 +2412,8 @@ Future<void> runServer(String dbPath, {bool readonly = true}) async {
           readOnlyHint: false, destructiveHint: false, openWorldHint: false),
       callback: (args, extra) async =>
           _runWrite(db, auditor, 'add_crew', args, () {
-        _rejectUnknown(args, _fieldNames(_crewColumns, {'id'}));
+        _rejectUnknown(args, _fieldNames(_crewColumns, {'id'}),
+            tool: 'add_crew');
         final firstName = asText(args['first_name']);
         final lastName = asText(args['last_name']);
         if (firstName == null) throw _ToolError('first_name is required');
@@ -2195,12 +2452,14 @@ Future<void> runServer(String dbPath, {bool readonly = true}) async {
           readOnlyHint: false, destructiveHint: false, openWorldHint: false),
       callback: (args, extra) async =>
           _runWrite(db, auditor, 'update_crew', args, () {
-        _rejectUnknown(args, _fieldNames(_crewColumns, {'id'}));
+        _rejectUnknown(args, _fieldNames(_crewColumns, {'id'}),
+            tool: 'update_crew');
         final id = asText(args['id']);
-        if (id == null) throw _ToolError('Missing or invalid id');
+        if (id == null) throw _ToolError('Missing or invalid id', field: 'id');
         if (db
             .query('SELECT id FROM crew_members WHERE id = ?', [id]).isEmpty) {
-          throw _ToolError('Crew member not found: $id');
+          throw _ToolError('Crew member not found: $id',
+              code: 'not_found', field: 'id');
         }
         final columns = <String>[];
         final values = <Object?>[];
@@ -2226,10 +2485,11 @@ Future<void> runServer(String dbPath, {bool readonly = true}) async {
       callback: (args, extra) async =>
           _runWrite(db, auditor, 'delete_crew', args, () {
         final id = asText(args['id']);
-        if (id == null) throw _ToolError('Missing or invalid id');
+        if (id == null) throw _ToolError('Missing or invalid id', field: 'id');
         if (db
             .query('SELECT id FROM crew_members WHERE id = ?', [id]).isEmpty) {
-          throw _ToolError('Crew member not found: $id');
+          throw _ToolError('Crew member not found: $id',
+              code: 'not_found', field: 'id');
         }
         db.transaction(() {
           db.execute('DELETE FROM crew_members WHERE id = ?', [id]);
@@ -2257,7 +2517,8 @@ Future<void> runServer(String dbPath, {bool readonly = true}) async {
           readOnlyHint: false, destructiveHint: false, openWorldHint: false),
       callback: (args, extra) async =>
           _runWrite(db, auditor, 'add_custom_airport', args, () {
-        _rejectUnknown(args, _fieldNames(_customAirportColumns, {'id'}));
+        _rejectUnknown(args, _fieldNames(_customAirportColumns, {'id'}),
+            tool: 'add_custom_airport');
         final name = asText(args['name']);
         if (name == null) throw _ToolError('name is required');
         final id = _createId(db, 'custom_airports', args);
@@ -2292,12 +2553,14 @@ Future<void> runServer(String dbPath, {bool readonly = true}) async {
           readOnlyHint: false, destructiveHint: false, openWorldHint: false),
       callback: (args, extra) async =>
           _runWrite(db, auditor, 'update_custom_airport', args, () {
-        _rejectUnknown(args, _fieldNames(_customAirportColumns, {'id'}));
+        _rejectUnknown(args, _fieldNames(_customAirportColumns, {'id'}),
+            tool: 'update_custom_airport');
         final id = asText(args['id']);
-        if (id == null) throw _ToolError('Missing or invalid id');
+        if (id == null) throw _ToolError('Missing or invalid id', field: 'id');
         if (db.query(
             'SELECT id FROM custom_airports WHERE id = ?', [id]).isEmpty) {
-          throw _ToolError('Custom airport not found: $id');
+          throw _ToolError('Custom airport not found: $id',
+              code: 'not_found', field: 'id');
         }
         final columns = <String>[];
         final values = <Object?>[];
@@ -2323,10 +2586,11 @@ Future<void> runServer(String dbPath, {bool readonly = true}) async {
       callback: (args, extra) async =>
           _runWrite(db, auditor, 'delete_custom_airport', args, () {
         final id = asText(args['id']);
-        if (id == null) throw _ToolError('Missing or invalid id');
+        if (id == null) throw _ToolError('Missing or invalid id', field: 'id');
         if (db.query(
             'SELECT id FROM custom_airports WHERE id = ?', [id]).isEmpty) {
-          throw _ToolError('Custom airport not found: $id');
+          throw _ToolError('Custom airport not found: $id',
+              code: 'not_found', field: 'id');
         }
         db.transaction(() {
           db.execute('DELETE FROM custom_airports WHERE id = ?', [id]);
@@ -2350,7 +2614,8 @@ Future<void> runServer(String dbPath, {bool readonly = true}) async {
           readOnlyHint: false, destructiveHint: false, openWorldHint: false),
       callback: (args, extra) async =>
           _runWrite(db, auditor, 'add_saved_route', args, () {
-        _rejectUnknown(args, _fieldNames(_savedRouteColumns, {'id'}));
+        _rejectUnknown(args, _fieldNames(_savedRouteColumns, {'id'}),
+            tool: 'add_saved_route');
         final flightNumber = asText(args['flight_number']);
         final departure = asText(args['departure_icao']);
         final arrival = asText(args['arrival_icao']);
@@ -2387,12 +2652,14 @@ Future<void> runServer(String dbPath, {bool readonly = true}) async {
           readOnlyHint: false, destructiveHint: false, openWorldHint: false),
       callback: (args, extra) async =>
           _runWrite(db, auditor, 'update_saved_route', args, () {
-        _rejectUnknown(args, _fieldNames(_savedRouteColumns, {'id'}));
+        _rejectUnknown(args, _fieldNames(_savedRouteColumns, {'id'}),
+            tool: 'update_saved_route');
         final id = asInt(args['id']);
-        if (id == null) throw _ToolError('Missing or invalid id');
+        if (id == null) throw _ToolError('Missing or invalid id', field: 'id');
         if (db
             .query('SELECT id FROM saved_routes WHERE id = ?', [id]).isEmpty) {
-          throw _ToolError('Saved route not found: $id');
+          throw _ToolError('Saved route not found: $id',
+              code: 'not_found', field: 'id');
         }
         final columns = <String>[];
         final values = <Object?>[];
@@ -2418,10 +2685,11 @@ Future<void> runServer(String dbPath, {bool readonly = true}) async {
       callback: (args, extra) async =>
           _runWrite(db, auditor, 'delete_saved_route', args, () {
         final id = asInt(args['id']);
-        if (id == null) throw _ToolError('Missing or invalid id');
+        if (id == null) throw _ToolError('Missing or invalid id', field: 'id');
         if (db
             .query('SELECT id FROM saved_routes WHERE id = ?', [id]).isEmpty) {
-          throw _ToolError('Saved route not found: $id');
+          throw _ToolError('Saved route not found: $id',
+              code: 'not_found', field: 'id');
         }
         // The app clears route_id on linked flights when a route is deleted.
         db.transaction(() {
@@ -2449,7 +2717,8 @@ Future<void> runServer(String dbPath, {bool readonly = true}) async {
           readOnlyHint: false, destructiveHint: false, openWorldHint: false),
       callback: (args, extra) async =>
           _runWrite(db, auditor, 'update_flight_settings', args, () {
-        _rejectUnknown(args, _fieldNames(_flightSettingsColumns));
+        _rejectUnknown(args, _fieldNames(_flightSettingsColumns),
+            tool: 'update_flight_settings');
         final columns = <String>[];
         final values = <Object?>[];
         _collect(db, 'flights_settings', _flightSettingsColumns, args, columns,
@@ -2466,6 +2735,7 @@ Future<void> runServer(String dbPath, {bool readonly = true}) async {
               !entry.value.contains(value)) {
             throw _ToolError(
               '${entry.key} must be one of ${entry.value.join(', ')} (got "$value")',
+              field: entry.key,
             );
           }
         }
@@ -2599,7 +2869,9 @@ Future<void> runServer(String dbPath, {bool readonly = true}) async {
                 '- Expiry status is computed at read time, never stored: whole local days from today to due_date, below the orange threshold is red (which includes today and every overdue day), below the green threshold is orange, green above it. Thresholds come from expiry_settings (a local row first, then the newest), or 90 and 30 days when that table has no row. list_expiries includes overdue rows by default.\n'
                 '- Currency thresholds are HOURS for the four time metrics, because the app divides those values by 60, and counts for the other four. is_exceeded means the rule needs attention: for a requirement that is being below the threshold, for a limit it is reaching it. currency_status reproduces the app\'s currency page, which applies no owner filter and counts drafts as flights, so its numbers can mix owners on a synced logbook.\n'
                 '- Deleting a flight, aircraft, crew member or custom airport also records a sync tombstone when a Postgres sync provider has been used, so the deletion propagates.\n'
-                '- Use get_schema for exact table/column names before writing.',
+                '- A field means the same thing wherever it appears: create_flight and update_flight take the same flight fields with the same types and limits, the per-field notes are written once on create_flight, and what a field means is written here.\n'
+                '- Use get_schema for table names and their column counts; pass table for one table\'s columns, and detail: "full" for its default and pk columns too.\n'
+                '- A failed call returns {error, field, detail}: error is a stable code (unknown_field, invalid_value, not_found, constraint, busy, internal), field is the argument at fault, and unknown_field also names the tool. detail is one sentence, and the accepted list is capped at eight names plus a count.',
           ),
         ],
       );
@@ -2610,19 +2882,17 @@ Future<void> runServer(String dbPath, {bool readonly = true}) async {
     'schema',
     'falcon://schema',
     (
-      description: 'All tables with their columns, as JSON.',
+      description: 'Table names with their column counts, as JSON. Read one '
+          'table\'s columns with the get_schema tool.',
       mimeType: 'application/json'
     ),
     (uri, extra) async {
-      final out = <String, dynamic>{
-        for (final table in db.tables) table: describeTable(table),
-      };
       return ReadResourceResult(
         contents: [
           TextResourceContents(
             uri: uri.toString(),
             mimeType: 'application/json',
-            text: jsonEncode(out),
+            text: jsonEncode({'tables': _tableCounts(db)}),
           ),
         ],
       );
@@ -2658,7 +2928,7 @@ Future<void> runServer(String dbPath, {bool readonly = true}) async {
                   'get_flight_settings, get_app_settings, get_general_settings, get_recent_logs, '
                   'find_missing_times, dedupe_crew.\n'
                   '$writeTools\n'
-                  'Call get_schema for exact table/column names and read the falcon://conventions resource for field semantics (dates, minutes, registration format, draft rule).\n'
+                  'Call get_schema for table names and column counts, pass table for one table\'s columns, and read the falcon://conventions resource for field semantics (dates, minutes, registration format, draft rule).\n'
                   'Example questions: "How many hours did I fly last year?", "List flights into YSSY in 2025", '
                   '"Are there flights missing block times?", "Add a flight today in VH-XZO from YSSY to NZQN".\n'
                   'Always confirm destructive or bulk operations with the user first.',

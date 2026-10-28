@@ -154,6 +154,17 @@ row, because it is the detail call. Pages hold 20 rows by default and at most 20
 read returns `count`, `total`, `has_more` and `offset` so a client can page instead of inflating
 `limit`. Responses are compact JSON; your client pretty-prints them if you want them readable.
 
+The catalog is shaped the same way. `get_schema` returns table names with a column count; pass `table`
+for one table's columns, and `detail: "full"` to add its default and primary-key columns. The
+`falcon://schema` resource is the same table list, and no request returns the columns of every table at
+once. The per-field notes for a flight are written once, on `create_flight`; `update_flight` takes the same
+fields with the same types and limits and no repeated prose, and `falcon://conventions` is where the
+meaning of a field lives. `get_recent_logs` returns timestamp, level, category and a message cut to 500
+characters, 20 entries by default and 200 at most, and includes a stack trace only with
+`include_stack: true`. A failed call returns `{"error", "field", "detail"}`, where `error` is a stable code
+such as `unknown_field`, `invalid_value` or `not_found`, plus `tool` when an argument name was rejected;
+raw database text and SQL are never passed through.
+
 Apache License 2.0. Copyright 2026 Team Super Panda. Free to use, modify and redistribute, including
 commercially. See [falconlogbook.com/license](https://falconlogbook.com/license) for the full terms.
 The Falcon name and logo are trademarks, not licensed.

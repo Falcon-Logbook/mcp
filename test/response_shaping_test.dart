@@ -392,20 +392,8 @@ void main() {
     final helpBytes = utf8.encode(helpText as String).length;
     expect(helpBytes, lessThan(1500), reason: 'falcon_help costs $helpBytes B');
 
-    // Write mode is the catalog most sessions never pay for, and it grows with
-    // the write schemas. Issue #11 budgets 28 KB, but that figure was measured
-    // before #15 grew the catalog to 27,193 B with write validation text; the
-    // read-side text here takes it to 28,062 B. #8's two read tools add 2,702 B
-    // again, for 30,765 B, so the bound is 31 KiB (31,744 B): 979 B of room,
-    // which a new argument description of more than a few hundred bytes still
-    // fails. PR 2 should tighten it to the 22 KB target when it collapses the
-    // flight write schemas. This guards against re-inflation meanwhile.
-    final writer = await start(write: true);
-    final writeCatalog = utf8
-        .encode(jsonEncode((await writer.send('tools/list', {}))['result']))
-        .length;
-    expect(writeCatalog, lessThan(31744),
-        reason: 'the write-mode catalog costs $writeCatalog B, '
-            'and 31 KiB is 31,744 B');
+    // The write-mode catalog, the schema payouts and the error envelope are
+    // measured and asserted in catalog_cost_test.dart, where the flight write
+    // schemas are also compared field by field.
   });
 }
