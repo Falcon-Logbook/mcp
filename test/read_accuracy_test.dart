@@ -377,7 +377,12 @@ void main() {
     ]) {
       final result = await server.call(tool, args);
       expect(result.isError, isTrue, reason: '$tool must reject unknown args');
-      expect('${result.payload}', contains('Unknown field(s)'));
+      // The envelope says which tool refused as well as which field was wrong,
+      // because this loop is exactly the "three tools in a row" case.
+      final envelope = jsonDecode('${result.payload}') as Map;
+      expect(envelope['error'], 'unknown_field', reason: tool);
+      expect(envelope['tool'], tool);
+      expect(envelope['field'], args.keys.last);
     }
   });
 

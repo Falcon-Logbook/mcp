@@ -1,3 +1,4 @@
+import 'dart:convert';
 import 'dart:io';
 
 import 'package:test/test.dart';
@@ -401,8 +402,10 @@ void main() {
     final withId = await server
         .call('update_flight_settings', {'id': 'x', 'pilot_name': 'Ada'});
     expect(withId.isError, isTrue);
-    expect('${withId.payload}', contains('Unknown field(s)'));
-    expect('${withId.payload}', contains('id'));
+    final envelope = jsonDecode('${withId.payload}') as Map;
+    expect(envelope['error'], 'unknown_field');
+    expect(envelope['field'], 'id');
+    expect(envelope['tool'], 'update_flight_settings');
 
     final updated =
         await server.call('update_flight_settings', {'pilot_name': 'Ada'});

@@ -1,3 +1,4 @@
+import 'dart:convert';
 import 'dart:io';
 
 import 'package:test/test.dart';
@@ -62,7 +63,8 @@ void main() {
     // A reintroduced tool with these words in it means that scope came back.
     final tools = await server.toolNames();
     expect(
-      tools.where((tool) => RegExp(r'sync|cloud|server|provider').hasMatch(tool)),
+      tools.where(
+          (tool) => RegExp(r'sync|cloud|server|provider').hasMatch(tool)),
       isEmpty,
       reason: 'desktop-only server must expose no sync or cloud tools',
     );
@@ -85,12 +87,21 @@ void main() {
     final missing = await server.call('get_schema', {'table': 'nope'});
     expect(missing.isError, isTrue);
 
+    // The resource lists table names with their column counts, and leaves the
+    // columns of a table to the tool: describing every table cost 11 KB on this
+    // fixture and 33 KB on a real logbook.
     final resource =
         await server.send('resources/read', {'uri': 'falcon://schema'});
     final contents =
         ((resource['result'] as Map)['contents'] as List).single as Map;
     expect(contents['mimeType'], 'application/json');
-    expect(contents['text'], contains('aircraft_registration'));
+    final listed = jsonDecode(contents['text'] as String) as Map;
+    final flights = (listed['tables'] as List)
+        .cast<Map<String, dynamic>>()
+        .firstWhere((table) => table['name'] == 'flights');
+    expect(flights['columns'], columns.length,
+        reason: 'the count and the column list come from one source');
+    expect(contents['text'], isNot(contains('aircraft_registration')));
   });
 
   test('flight writes link aircraft and crew and record an audit line',
