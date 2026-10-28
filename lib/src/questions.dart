@@ -20,6 +20,14 @@ class QuestionOption {
   /// An optional second line explaining the option.
   final String? description;
 
+  /// The label a single choice shows.
+  ///
+  /// An entry of `oneOf` allows a const and a title only, so an explanation
+  /// would be dropped there; a multiple choice keeps it inside `anyOf`. Folding
+  /// it into the label is what makes the catalogue's explanations reach a form
+  /// on both, and it stays out of the question text so a label is not repeated.
+  String get formLabel => description == null ? label : '$label ($description)';
+
   Map<String, dynamic> toJson() => {
         'value': value,
         'label': label,
@@ -61,6 +69,21 @@ class Question {
   /// Whether the answer must be present for the form to be accepted.
   final bool required;
 
+  /// The same question with no options.
+  ///
+  /// The catalogue cannot know the aircraft, legs or columns a flow offered, so
+  /// a call that answers without resending the questions is checked against the
+  /// id and the type of this question alone. A choice with no options is
+  /// therefore not a form question: [elicitRequest] refuses one.
+  Question withoutOptions() => Question(
+        id: id,
+        header: header,
+        question: question,
+        type: type,
+        defaultValue: defaultValue,
+        required: required,
+      );
+
   /// The question as it travels to a caller, so a fallback client can send the
   /// same questions back with its answers.
   Map<String, dynamic> toJson() => {
@@ -89,7 +112,7 @@ class Question {
           'description': question,
           'oneOf': [
             for (final option in options)
-              {'const': option.value, 'title': option.label},
+              {'const': option.value, 'title': option.formLabel},
           ],
           if (defaultValue != null) 'default': defaultValue,
         });
@@ -304,4 +327,26 @@ abstract final class AskQuestions {
         defaultValue: false,
         required: true,
       );
+
+  /// The catalogue question with [id], or null when no question has that id.
+  ///
+  /// This is how a call that answers without resending the questions is
+  /// checked: the ids above are the ones the tool offers, and each carries the
+  /// type its answer must have. The questions whose options come from a logbook
+  /// or an imported file have none here, because only the flow that asked knows
+  /// them, so their answers are checked for id and type alone.
+  static Question? byId(String id) => _byId[id];
+
+  static final Map<String, Question> _byId = {
+    aircraftId: aircraft(const []).withoutOptions(),
+    timeBasisId: timeBasis,
+    crewRoleId: crewRole,
+    selectLegsId: selectLegs(const []).withoutOptions(),
+    createMissingCrewId: createMissingCrew,
+    columnDateId: columnDate(const []).withoutOptions(),
+    durationFormatId: durationFormat,
+    unmappedColumnId: unmappedColumn(''),
+    confirmPlanId: confirmPlan,
+    deleteRowsId: deleteRows(0),
+  };
 }

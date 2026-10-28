@@ -97,7 +97,7 @@ void main() {
           'default': '',
           'type': 'string',
           'oneOf': [
-            {'const': 'ac-1', 'title': 'VH-XZO'},
+            {'const': 'ac-1', 'title': 'VH-XZO (B738)'},
             {'const': '', 'title': 'Leave blank'},
           ],
         },
@@ -139,6 +139,7 @@ void main() {
     expect(answered['structuredContent'], {
       'status': 'answered',
       'answers': {'aircraft': 'ac-1', 'time_basis': 'utc'},
+      'defaulted': ['time_basis'],
     });
     expect(answered['isError'], isNot(true));
   });
@@ -165,7 +166,31 @@ void main() {
     expect(resultOf(second)['structuredContent'], {
       'status': 'answered',
       'answers': {'aircraft': 'ac-1', 'time_basis': 'airport_local'},
+      'defaulted': <String>[],
     });
+
+    // The shape issue #6 documents: the answers alone, no questions resent, on
+    // the connection that has no form to show them in. This client is the one
+    // that needs it, so this test is where it has to keep working.
+    final alone = resultOf(await server.callRaw('ask_user', {
+      'answers': {'aircraft': 'ac-1'},
+    }));
+    expect(alone['isError'], isNot(true), reason: '${alone['content']}');
+    expect(alone['structuredContent'], {
+      'status': 'answered',
+      'answers': {'aircraft': 'ac-1'},
+      'defaulted': <String>[],
+    });
+
+    final declined =
+        resultOf(await server.callRaw('ask_user', {'action': 'decline'}));
+    expect(declined['isError'], isNot(true),
+        reason: 'a decline is an answer, not a failure');
+    expect(declined['structuredContent'], {'status': 'declined'});
+
+    final cancelled =
+        resultOf(await server.callRaw('ask_user', {'action': 'cancel'}));
+    expect(cancelled['structuredContent'], {'status': 'cancelled'});
   });
 
   test('a multi-select answer survives the round trip', () async {
@@ -233,6 +258,7 @@ void main() {
       'answers': {
         'select_legs': ['fl-2'],
       },
+      'defaulted': <String>[],
     });
   });
 
@@ -356,6 +382,7 @@ void main() {
     expect(resultOf(response)['structuredContent'], {
       'status': 'answered',
       'answers': {'aircraft': 'ac-1', 'time_basis': 'utc'},
+      'defaulted': ['time_basis'],
     });
   });
 
@@ -379,6 +406,7 @@ void main() {
     expect(answered.payload, {
       'status': 'answered',
       'answers': {'aircraft': 'ac-1', 'time_basis': 'utc'},
+      'defaulted': ['time_basis'],
     });
   });
 
@@ -431,10 +459,7 @@ void main() {
     expect(typo['error'], 'unknown_field');
     expect(typo['field'], 'question');
     expect(typo['tool'], 'ask_user');
-    expect(
-        typo['detail'],
-        contains('Unknown field(s): question. '
-            'Supported: action, answers, questions'));
+    expect(typo['detail'], 'accepts action, answers, questions');
   });
 
   test('ask_user writes nothing', () async {

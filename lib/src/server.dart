@@ -1210,15 +1210,18 @@ Future<void> runServer(String dbPath, {bool readonly = true}) async {
         'Ask the pilot questions and get answers back, not in prose. A '
         'question has a stable id, a type (choice, multi, boolean, text) and '
         'options of value and label for choice and multi. Returns status '
-        'answered with the answers by id, or declined or cancelled. On '
+        'answered with the answers by id, and the ids in defaulted that were '
+        'filled in rather than answered, or declined or cancelled. On '
         'needs_input this client cannot show a form: ask the questions '
-        'yourself, then call again with the same questions plus answers.',
+        'yourself, then call again with answers by id, with the questions '
+        'repeated or not.',
     inputSchema: askUserInputSchema,
     annotations: readOnlyAnnotations,
     callback: (args, extra) async {
-      final capabilities =
-          extra.clientCapabilities ?? server.server.getClientCapabilities();
       try {
+        _rejectUnknown(args, askUserArgumentFields, tool: 'ask_user');
+        final capabilities =
+            extra.clientCapabilities ?? server.server.getClientCapabilities();
         return await askUser(
           args,
           stateless: isStatelessProtocolVersion(extra.protocolVersion ?? ''),

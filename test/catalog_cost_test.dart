@@ -275,8 +275,8 @@ void main() {
       // #8's expiry and currency reads add 2,702 B (`list_expiries` 1,295 and
       // `currency_status` 1,405, schemas included), taking this from 11,713 B
       // to 14,415 B. The bound was 15 KiB (15,360 B), 945 B of room, the same
-      // figure response_shaping_test uses. #6 adds `ask_user` at 888 B for
-      // 15,304 B, so the bound moves with it to 16 KiB (16,384 B): 1,080 B of
+      // figure response_shaping_test uses. #6 adds `ask_user` at 973 B for
+      // 15,389 B, so the bound moves with it to 16 KiB (16,384 B): 995 B of
       // room, which is that same ~1 KB.
       final readOnly =
           bytesOf(jsonEncode((await reader.send('tools/list', {}))['result']));
@@ -291,8 +291,8 @@ void main() {
       // This is the reachable number: 27,254 B before the bound, about 800 B
       // under the pre-slice 28,063 B. #8's two read tools add the same 2,702 B
       // for 29,956 B, so the bound was 30 KiB (30,720 B): 764 B of room. #6's
-      // `ask_user` adds its 888 B again, to 30,845 B, so the bound is 31 KiB
-      // (31,744 B): 899 B of room, the same guard at 900 B instead of 764.
+      // `ask_user` adds its 973 B again, to 30,930 B, so the bound is 31 KiB
+      // (31,744 B): 814 B of room, the same guard at 800 B instead of 764.
       final writeMode =
           bytesOf(jsonEncode((await writer.send('tools/list', {}))['result']));
       expect(writeMode, lessThan(31744),

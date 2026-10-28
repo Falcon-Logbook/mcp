@@ -122,7 +122,10 @@ void main() {
         (choice['oneOf'] as List).map((option) => (option as Map)['const']),
         ['utc', 'local', 'airport_local'],
       );
-      expect((choice['oneOf'] as List).first, {'const': 'utc', 'title': 'UTC'});
+      expect((choice['oneOf'] as List).first, {
+        'const': 'utc',
+        'title': 'UTC (Coordinated Universal Time)',
+      });
 
       final multi = wireProperty(AskQuestions.selectLegsId);
       expect(multi['type'], 'array');
@@ -141,6 +144,29 @@ void main() {
         'default': false,
         'type': 'boolean',
       });
+    });
+
+    test('a choice keeps the catalogue explanation the oneOf would drop', () {
+      // oneOf allows a const and a title only, so the explanation has to sit in
+      // the label to reach a form at all. multi keeps it inside anyOf, which is
+      // why this is folded rather than added to the question text as well.
+      for (final (id, value, explanation) in [
+        (AskQuestions.timeBasisId, 'utc', 'Coordinated Universal Time'),
+        (AskQuestions.crewRoleId, 'pilotInCommand', 'Pilot in Command'),
+        (
+          AskQuestions.unmappedColumnId,
+          'custom_columns',
+          'Stored with the flight, shown in its own column',
+        ),
+      ]) {
+        final property = wireProperty(id);
+        final title = ((property['oneOf'] as List)
+            .map((entry) => entry as Map)
+            .firstWhere((entry) => entry['const'] == value))['title'] as String;
+        expect(title, contains(explanation));
+        expect(property['description'], isNot(contains(explanation)),
+            reason: 'the question text must not repeat the label');
+      }
     });
 
     test('a text question is a plain string the protocol accepts', () {
@@ -175,7 +201,11 @@ void main() {
       expect(AskQuestions.ids.toSet(), hasLength(AskQuestions.ids.length));
       for (final id in AskQuestions.ids) {
         expect(id, matches(RegExp(r'^[a-z][a-z0-9_]*$')));
+        // Every id a caller can answer resolves to a question, which is what
+        // an answer without the questions is checked against.
+        expect(AskQuestions.byId(id)?.id, id);
       }
+      expect(AskQuestions.byId('airecraft'), isNull);
       // Each factory uses the id it exports, so a flow reads the answer by the
       // constant rather than by a copied string.
       expect(AskQuestions.aircraft(const [QuestionOption('a', 'A')]).id,
@@ -247,14 +277,21 @@ void main() {
 
   group('answers', () {
     test('a missing optional answer takes its default', () {
-      final answers = readAnswers(const {}, roster());
-      expect(answers, {
+      final read = readAnswers(const {}, roster());
+      expect(read.answers, {
         AskQuestions.aircraftId: AskQuestions.leaveBlank,
         AskQuestions.timeBasisId: 'utc',
         AskQuestions.crewRoleId: 'pilotInCommand',
         AskQuestions.selectLegsId: ['fl-1', 'fl-2'],
         AskQuestions.createMissingCrewId: false,
       });
+      expect(read.defaulted, [
+        AskQuestions.aircraftId,
+        AskQuestions.timeBasisId,
+        AskQuestions.crewRoleId,
+        AskQuestions.selectLegsId,
+        AskQuestions.createMissingCrewId,
+      ]);
     });
 
     test('a question with no default stays absent, not empty or zero', () {
@@ -333,7 +370,49 @@ void main() {
           AskQuestions.selectLegsId: ['fl-2'],
           AskQuestions.createMissingCrewId: false,
         },
+        'defaulted': [
+          AskQuestions.timeBasisId,
+          AskQuestions.crewRoleId,
+          AskQuestions.createMissingCrewId,
+        ],
       });
+    });
+
+    test('nothing is defaulted when the caller answered everything', () {
+      final read = readAnswers({
+        AskQuestions.aircraftId: 'ac-1',
+        AskQuestions.timeBasisId: 'local',
+        AskQuestions.crewRoleId: 'copilot',
+        AskQuestions.selectLegsId: ['fl-1'],
+        AskQuestions.createMissingCrewId: true,
+      }, roster());
+      expect(read.defaulted, isEmpty);
+      expect(read.answers[AskQuestions.crewRoleId], 'copilot');
+    });
+
+    test('answers without questions are checked against the catalogue', () {
+      // A client with no form answers by id alone: the ids come from the
+      // catalogue, so a typo is refused by name rather than guessed at.
+      final read = readAnswers({
+        AskQuestions.timeBasisId: 'local',
+        AskQuestions.confirmPlanId: true,
+      }, null);
+      expect(read.answers, {
+        AskQuestions.timeBasisId: 'local',
+        AskQuestions.confirmPlanId: true,
+      });
+      expect(read.defaulted, isEmpty,
+          reason: 'the questions that were not sent were not asked');
+      expect(
+        () => readAnswers({AskQuestions.timeBasisId: 'zulu'}, null),
+        throwsA(isA<AskUserError>()
+            .having((e) => e.message, 'message', contains('got "zulu"'))),
+      );
+      expect(
+        () => readAnswers({'aircraf': 'ac-1'}, null),
+        throwsA(isA<AskUserError>().having((e) => e.message, 'message',
+            allOf(contains('Unknown answer'), contains('aircraf')))),
+      );
     });
 
     test('decline and cancel are statuses, not errors', () {
@@ -555,6 +634,7 @@ void main() {
       expect(payloadOf(retry), {
         'status': 'answered',
         'answers': {AskQuestions.confirmPlanId: true},
+        'defaulted': <String>[],
       });
     });
 
@@ -616,6 +696,7 @@ void main() {
       expect(payloadOf(result), {
         'status': 'answered',
         'answers': {AskQuestions.confirmPlanId: true},
+        'defaulted': <String>[],
       });
     });
 
@@ -645,7 +726,31 @@ void main() {
             AskQuestions.aircraftId: 'ac-1',
             AskQuestions.timeBasisId: 'utc',
           },
+          'defaulted': [AskQuestions.timeBasisId],
         });
+      }
+    });
+
+    test('the documented shape completes without resending the questions',
+        () async {
+      // Issue #6's second criterion: a client with no form answers with the
+      // answers alone, over the connection that has no form capability.
+      for (final stateless in [true, false]) {
+        final result = await ask({
+          'answers': {AskQuestions.aircraftId: 'ac-1'},
+        }, stateless: stateless);
+        expect(payloadOf(result), {
+          'status': 'answered',
+          'answers': {AskQuestions.aircraftId: 'ac-1'},
+          'defaulted': <String>[],
+        });
+
+        final declined = await ask({'action': 'decline'}, stateless: stateless);
+        expect(payloadOf(declined), {'status': 'declined'});
+        expect((declined as CallToolResult).isError, isFalse);
+
+        final cancelled = await ask({'action': 'cancel'}, stateless: stateless);
+        expect(payloadOf(cancelled), {'status': 'cancelled'});
       }
     });
 
@@ -662,6 +767,7 @@ void main() {
       expect(payloadOf(result), {
         'status': 'answered',
         'answers': {AskQuestions.confirmPlanId: true},
+        'defaulted': <String>[],
       });
       expect(state.pending, 0);
     });
@@ -694,14 +800,11 @@ void main() {
   });
 
   group('boundary', () {
-    test('an unknown argument is rejected', () async {
+    test('an accept with no answers and no questions is refused', () async {
       await expectLater(
-        ask({
-          'questions': [AskQuestions.confirmPlan.toJson()],
-          'question': 'typo',
-        }),
-        throwsA(isA<AskUserError>()
-            .having((e) => e.message, 'message', contains('Unknown field'))),
+        ask({'action': 'accept'}),
+        throwsA(isA<AskUserError>().having(
+            (e) => e.message, 'message', contains('accepting needs answers'))),
       );
     });
 

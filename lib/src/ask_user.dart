@@ -31,6 +31,13 @@ final JsonObject askUserInputSchema = JsonSchema.object(properties: {
       description: 'How the user answered. Defaults to accept.'),
 });
 
+/// The arguments `ask_user` accepts.
+///
+/// The registration refuses any other name with the same `unknown_field`
+/// envelope every other tool uses, which is why the names are published rather
+/// than kept private here.
+const askUserArgumentFields = {'questions', 'answers', 'action'};
+
 /// A question the server refuses to ask, or an answer it refuses to accept.
 ///
 /// It carries the same three parts as every other tool error: a stable [code],
@@ -146,6 +153,11 @@ String _signatureOf(List<Question> questions) => [
 /// - legacy session with form elicitation: asks with [elicit] inside this call.
 /// - anything else: returns [needsInput] and completes from `answers`.
 ///
+/// `questions` is required to start an exchange and to answer one through
+/// [inputResponses]. A completion call may leave them out and send `answers`
+/// alone: the ids are then checked against the catalogue, which is what a
+/// client with no form is looking at anyway.
+///
 /// [canElicit] is decided by the caller from the capabilities the client
 /// declared, because the server raises the missing-capability error after the
 /// callback has returned: there is nothing in here to catch.
@@ -158,23 +170,15 @@ Future<BaseResultData> askUser(
   InputResponses? inputResponses,
   String? requestState,
 }) async {
-  final unknown = _unknownIn(args, _argumentFields);
-  if (unknown.isNotEmpty) {
-    _refuse(
-        unknown.first,
-        'Unknown field(s): ${unknown.join(', ')}. '
-        'Supported: ${_sorted(_argumentFields)}',
-        code: 'unknown_field');
-  }
   final answers = switch (args['answers']) {
     null => null,
     final Map<dynamic, dynamic> answers => answers,
     _ => _refuse('answers', 'answers must be an object keyed by question id'),
   };
   final action = _parseAction(args['action']);
-  final questions = parseQuestions(args['questions']);
 
   if (inputResponses != null) {
+    final questions = parseQuestions(args['questions']);
     if (requestState == null) {
       _refuse('requestState',
           'inputResponses requires the requestState from the first call');
@@ -198,10 +202,21 @@ Future<BaseResultData> askUser(
   if (answers != null || args.containsKey('action')) {
     if (action == ElicitAction.decline) return _status('declined');
     if (action == ElicitAction.cancel) return _status('cancelled');
+    // Questions are optional here. An agent that echoes them is checked
+    // against exactly those, defaults included; one that sends answers alone is
+    // checked against the catalogue.
+    final questions = args.containsKey('questions')
+        ? parseQuestions(args['questions'])
+        : null;
+    if (answers == null && questions == null) {
+      _refuse('answers',
+          'accepting needs answers: one value per question id, or decline');
+    }
     return _answered(
         readAnswers(answers ?? const <String, Object?>{}, questions));
   }
 
+  final questions = parseQuestions(args['questions']);
   if (!canElicit) return needsInput(questions);
   final request = elicitRequest(questions);
   if (stateless) {
@@ -247,9 +262,9 @@ ElicitRequest elicitRequest(List<Question> questions) {
 /// The result for a client that cannot show a form: the same questions, as
 /// data, with [reason] set when a question set could not be resumed.
 ///
-/// The fallback keeps no server state. It asks the caller to send the same
-/// questions back with `answers`, so the ids stay the contract and every
-/// answer is checked against the same schema the form would have used.
+/// The fallback keeps no server state. It asks the caller to answer by question
+/// id, and that call may leave the questions out: the ids are then checked
+/// against the catalogue, which is the list this result just handed over.
 CallToolResult needsInput(List<Question> questions, {String? reason}) =>
     _result({
       'status': 'needs_input',
@@ -277,17 +292,32 @@ CallToolResult readElicitResponse(
   return _fromElicitResult(result, questions);
 }
 
+/// The answers of a completed form, and which of them the server supplied.
+///
+/// A caller that cannot tell its own answer from a default could report a
+/// guess as a fact, so [defaulted] names every id that was filled in rather
+/// than answered.
+typedef AnswerSet = ({Map<String, Object?> answers, List<String> defaulted});
+
 /// Checks [content] against [questions] and returns the answers by id.
 ///
 /// The protocol validates the shape of a response but not its content, so this
 /// is the only check between a client and a flow: unknown ids and values that
 /// are not one of the offered options are refused by name, and an optional
-/// question the client left out takes its default.
-Map<String, Object?> readAnswers(
+/// question the client left out takes its default, reported in
+/// [AnswerSet.defaulted].
+///
+/// [questions] may be null, which is a call that answers without resending them.
+/// The ids are then checked against [AskQuestions.byId] and each value against
+/// the type the catalogue gives it. A default is never filled on that path: the
+/// server cannot tell which of the optional questions were asked.
+AnswerSet readAnswers(
   Map<dynamic, dynamic> content,
-  List<Question> questions,
+  List<Question>? questions,
 ) {
-  final known = {for (final question in questions) question.id};
+  final known = questions == null
+      ? AskQuestions.ids.toSet()
+      : {for (final question in questions) question.id};
   final unknown = [
     for (final key in content.keys)
       if (!known.contains('$key')) '$key',
@@ -301,7 +331,8 @@ Map<String, Object?> readAnswers(
   }
 
   final answers = <String, Object?>{};
-  for (final question in questions) {
+  final defaulted = <String>[];
+  for (final question in questions ?? _catalogueQuestions(content)) {
     final value = content[question.id];
     if (value == null) {
       if (question.required) {
@@ -310,12 +341,23 @@ Map<String, Object?> readAnswers(
       }
       if (question.defaultValue != null) {
         answers[question.id] = question.defaultValue;
+        defaulted.add(question.id);
       }
       continue;
     }
     answers[question.id] = _checkAnswer(question, value);
   }
-  return answers;
+  return (answers: answers, defaulted: defaulted);
+}
+
+/// The catalogue questions [content] answers, in the order they were sent.
+///
+/// Every key has a question by the time this runs: the ids were checked above.
+Iterable<Question> _catalogueQuestions(Map<dynamic, dynamic> content) sync* {
+  for (final key in content.keys) {
+    final question = AskQuestions.byId('$key');
+    if (question != null) yield question;
+  }
 }
 
 /// Parses the `questions` argument into the questions the server will ask.
@@ -347,8 +389,6 @@ const _questionFields = {
   'default',
   'required',
 };
-
-const _argumentFields = {'questions', 'answers', 'action'};
 
 const _optionFields = {'value', 'label', 'description'};
 
@@ -510,7 +550,11 @@ Object? _checkAnswer(Question question, Object? value) {
       if (value is! String) {
         _refuse(field, '$id must be one of the option values, as a string');
       }
-      if (!question.options.any((option) => option.value == value)) {
+      // A question rebuilt from the catalogue for a call that did not resend it
+      // carries no options, so only its type can be checked: the flow that
+      // asked is the only place that knows the values it offered.
+      if (question.options.isNotEmpty &&
+          !question.options.any((option) => option.value == value)) {
         _refuse(
             field,
             '$id must be one of: ${question.options.map((o) => o.value).join(', ')}'
@@ -526,7 +570,7 @@ Object? _checkAnswer(Question question, Object? value) {
         for (final item in value.cast<String>())
           if (!known.contains(item)) item,
       ];
-      if (unknown.isNotEmpty) {
+      if (known.isNotEmpty && unknown.isNotEmpty) {
         _refuse(
             field,
             '$id must be made of: ${known.join(', ')} '
@@ -545,9 +589,13 @@ Object? _checkAnswer(Question question, Object? value) {
   }
 }
 
-/// The answers of a completed form, keyed by question id.
-CallToolResult _answered(Map<String, Object?> answers) =>
-    _result({'status': 'answered', 'answers': answers});
+/// The answers of a completed form, keyed by question id, with the ids the
+/// server filled in itself.
+CallToolResult _answered(AnswerSet read) => _result({
+      'status': 'answered',
+      'answers': read.answers,
+      'defaulted': read.defaulted,
+    });
 
 /// A form the user declined or cancelled. Not an error: the flow stops here.
 CallToolResult _status(String status) => _result({'status': status});
