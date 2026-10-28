@@ -375,8 +375,13 @@ void main() {
     final readOnlyCatalog = utf8
         .encode(jsonEncode((await server.send('tools/list', {}))['result']))
         .length;
-    expect(readOnlyCatalog, lessThan(12000),
-        reason: 'the read-only catalog costs $readOnlyCatalog B');
+    // #8's expiry and currency reads add 2,702 B (`list_expiries` 1,295 and
+    // `currency_status` 1,405, schemas included), taking the catalog from
+    // 11,096 B to 13,798 B. The bound moves to 15 KiB (15,360 B), which is
+    // 1,562 B of room: a description that grows by more than that fails here.
+    expect(readOnlyCatalog, lessThan(15360),
+        reason: 'the read-only catalog costs $readOnlyCatalog B, '
+            'and 15 KiB is 15,360 B');
 
     final typo = await bytesOf(server, 'list_flights', {'limt': 5});
     expect(typo, lessThan(400), reason: 'a typo error costs $typo B');
@@ -390,17 +395,17 @@ void main() {
     // Write mode is the catalog most sessions never pay for, and it grows with
     // the write schemas. Issue #11 budgets 28 KB, but that figure was measured
     // before #15 grew the catalog to 27,193 B with write validation text; the
-    // read-side text here takes it to 28,062 B. That is 610 B under 28 KiB
-    // (28,672 B), so the bound is that Ki figure and it is deliberately tight:
-    // a new argument description of more than a few hundred bytes fails here.
-    // PR 2 should tighten it to the 22 KB target when it collapses the flight
-    // write schemas. This guards against re-inflation meanwhile.
+    // read-side text here takes it to 28,062 B. #8's two read tools add 2,702 B
+    // again, for 30,765 B, so the bound is 31 KiB (31,744 B): 979 B of room,
+    // which a new argument description of more than a few hundred bytes still
+    // fails. PR 2 should tighten it to the 22 KB target when it collapses the
+    // flight write schemas. This guards against re-inflation meanwhile.
     final writer = await start(write: true);
     final writeCatalog = utf8
         .encode(jsonEncode((await writer.send('tools/list', {}))['result']))
         .length;
-    expect(writeCatalog, lessThan(28672),
+    expect(writeCatalog, lessThan(31744),
         reason: 'the write-mode catalog costs $writeCatalog B, '
-            'and 28 KiB is 28,672 B');
+            'and 31 KiB is 31,744 B');
   });
 }
