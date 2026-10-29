@@ -454,4 +454,41 @@ void main() {
     expect(rejected.isError, isTrue);
     expect(rejected.payload, contains('time_start'));
   });
+
+  test('a v20 database opens and reports its schema version', () async {
+    // Falcon-Logbook/app#237 adds four nullable columns to flights and bumps
+    // user_version to 20. The gate used to refuse anything above 19, which
+    // locks every app user out of the server the moment they upgrade.
+    withFixtureDb(dbPath, (db) {
+      for (final statement in [
+        'ALTER TABLE flights ADD COLUMN scheduled_departure_utc INTEGER NULL',
+        'ALTER TABLE flights ADD COLUMN scheduled_arrival_utc INTEGER NULL',
+        'ALTER TABLE flights ADD COLUMN scheduled_block_minutes INTEGER NULL',
+        'ALTER TABLE flights ADD COLUMN schedule_source TEXT NULL',
+      ]) {
+        db.execute(statement);
+      }
+      db.execute('PRAGMA user_version = 20');
+    });
+
+    final server = await McpProcess.start(dbPath, write: true);
+    addTearDown(() async {
+      await server.stop();
+    });
+
+    final info = await server.call('db_info', {});
+    expect(info.isError, isFalse, reason: '${info.payload}');
+    expect((info.payload as Map)['schemaVersion'], 20);
+
+    // The v20 columns are additive and unknown to this server, so a flight can
+    // still be created without them and an existing row still reads back.
+    final created = await server.call('create_flight', {
+      'date': '2026-02-04',
+      'total_time': 30,
+    });
+    expect(created.isError, isFalse, reason: '${created.payload}');
+
+    final listed = await server.call('list_flights', {'limit': 5});
+    expect(listed.isError, isFalse, reason: '${listed.payload}');
+  });
 }
