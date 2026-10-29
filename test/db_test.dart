@@ -37,12 +37,15 @@ void main() {
     final row = db.query("SELECT * FROM flights WHERE id = 'fl-1'").single;
     expect(row['is_simulator'], isFalse);
     expect(row['aircraft_id'], 'ac-1');
-    // Drift stores DateTime as unix seconds; epochToIso renders local time.
-    expect(row['date'], isA<String>());
-    expect(
-      DateTime.parse(row['date'] as String).toLocal().day,
-      DateTime.fromMillisecondsSinceEpoch(1761408000 * 1000).day,
-    );
+    // Drift stores a DateTime as unix seconds; the row mapper renders a
+    // calendar date as strict YYYY-MM-DD in the logbook zone (the system zone
+    // here), and that date must round-trip to the day holding the stored
+    // instant. A declaration or a value claiming any other shape fails here.
+    expect(dateTypeOf(row['date']), 'calendar_date');
+    final start = dateToEpoch(row['date'] as String)!;
+    final end = dateToEpoch(row['date'] as String, endOfDay: true)!;
+    expect(1761408000, inInclusiveRange(start, end),
+        reason: 'the rendered date covers the stored midnight');
     expect(row['attachment'], 'AQI=');
   });
 

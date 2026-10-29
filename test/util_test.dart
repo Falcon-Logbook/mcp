@@ -44,8 +44,15 @@ void main() {
 
   group('parseCalendarDate', () {
     test('accepts exactly YYYY-MM-DD', () {
-      expect(parseCalendarDate('2025-01-31'), DateTime(2025, 1, 31));
-      expect(parseCalendarDate(' 2025-01-31 '), DateTime(2025, 1, 31));
+      // The result is the day's logbook-zone midnight (a TZDateTime), so the
+      // fields and the resolved instant are what is asserted, not object
+      // equality with a plain DateTime.
+      for (final input in ['2025-01-31', ' 2025-01-31 ']) {
+        final date = parseCalendarDate(input)!;
+        expect([date.year, date.month, date.day], [2025, 1, 31]);
+        expect(epochForDayStart(date),
+            DateTime(2025, 1, 31).millisecondsSinceEpoch ~/ 1000);
+      }
       expect(
           formatCalendarDate(parseCalendarDate('2025-01-05')!), '2025-01-05');
     });

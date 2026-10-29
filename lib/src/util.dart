@@ -3,20 +3,19 @@ import 'dart:io';
 import 'dart:math';
 
 import 'package:path/path.dart' as p;
+import 'package:timezone/timezone.dart' as tz;
+
+import 'zone.dart';
 
 final RegExp _dateOnly = RegExp(r'^(\d{4})-(\d{1,2})-(\d{1,2})$');
 
 /// Converts a date-ish input into the unix epoch seconds the Falcon database
-/// stores. Dates are interpreted in local time, matching the app: the `date`
-/// column holds local midnight of the flight date.
+/// stores. Dates are interpreted in the logbook zone ([logbookZone]: the zone
+/// `FALCON_TZ` declares, or the system zone when it is unset), matching the
+/// app: the `date` column holds logbook-zone midnight of the flight date.
 ///
-/// Timezone independence is deliberately not handled here: mapping a stored
-/// local midnight back to the calendar date it represents needs the zone the
-/// app wrote in, so the follow-up slice tracked in issue #9 (#4) adds a declared
-/// logbook zone (FALCON_TZ or a stored setting) before this changes.
-///
-/// [endOfDay] returns 23:59:59 of the same local day, useful for inclusive
-/// upper bounds.
+/// [endOfDay] returns 23:59:59 of the same logbook-zone day, useful for
+/// inclusive upper bounds.
 int? dateToEpoch(Object? value, {bool endOfDay = false}) {
   if (value is! String) return null;
   final text = value.trim();
@@ -27,9 +26,9 @@ int? dateToEpoch(Object? value, {bool endOfDay = false}) {
     final year = int.parse(match.group(1)!);
     final month = int.parse(match.group(2)!);
     final day = int.parse(match.group(3)!);
-    final start = DateTime(year, month, day);
-    // DateTime normalises out-of-range values (month 13 -> next January), so
-    // reject anything that does not round-trip.
+    final start = logbookDateAt(year, month, day);
+    // Field arithmetic normalises out-of-range values (month 13 -> next
+    // January), so reject anything that does not round-trip.
     if (start.year != year || start.month != month || start.day != day) {
       return null;
     }
@@ -38,8 +37,10 @@ int? dateToEpoch(Object? value, {bool endOfDay = false}) {
 
   final parsed = DateTime.tryParse(text);
   if (parsed == null) return null;
-  final local = parsed.toLocal();
-  return _epochFor(DateTime(local.year, local.month, local.day),
+  // A timestamp carries an instant: convert it to the logbook zone and take
+  // the calendar day it lands on there.
+  final zoned = tz.TZDateTime.from(parsed, logbookZone);
+  return _epochFor(logbookDateAt(zoned.year, zoned.month, zoned.day),
       endOfDay: endOfDay);
 }
 
@@ -50,9 +51,10 @@ final RegExp _strictDate = RegExp(r'^(\d{4})-(\d{2})-(\d{2})$');
 
 /// Parses a date argument for a read filter. Accepts exactly `YYYY-MM-DD` and
 /// returns null for anything else: timestamps, compact forms, impossible
-/// dates, blanks. A caller must treat null as a rejection, never as "no
-/// filter", because dropping the filter turns a period answer into a career
-/// answer.
+/// dates, blanks. The result is the day's logbook-zone midnight (a
+/// `tz.TZDateTime` in [logbookZone]). A caller must treat null as a
+/// rejection, never as "no filter", because dropping the filter turns a
+/// period answer into a career answer.
 ///
 /// [dateToEpoch] stays as it is for the write path, where a wider input form
 /// is already part of the contract.
@@ -63,21 +65,25 @@ DateTime? parseCalendarDate(Object? value) {
   final year = int.parse(match.group(1)!);
   final month = int.parse(match.group(2)!);
   final day = int.parse(match.group(3)!);
-  final date = DateTime(year, month, day);
+  final date = logbookDateAt(year, month, day);
   if (date.year != year || date.month != month || date.day != day) return null;
   return date;
 }
 
-/// Local midnight at the start of [day], as the `date` column stores it.
+/// Logbook-zone midnight at the start of [day], as the `date` column stores
+/// it. [day]'s calendar fields are what counts, not the zone it was built in.
 int epochForDayStart(DateTime day) =>
-    DateTime(day.year, day.month, day.day).millisecondsSinceEpoch ~/ 1000;
+    logbookDateAt(day.year, day.month, day.day).millisecondsSinceEpoch ~/ 1000;
 
-/// Local midnight at the start of the day after [day]: the exclusive upper
-/// bound that includes every row on [day].
+/// Logbook-zone midnight at the start of the day after [day]: the exclusive
+/// upper bound that includes every row on [day]. Calendar arithmetic rather
+/// than +24h, so a DST day still ends at the next midnight.
 int epochForDayAfter(DateTime day) =>
-    DateTime(day.year, day.month, day.day + 1).millisecondsSinceEpoch ~/ 1000;
+    logbookDateAt(day.year, day.month, day.day + 1).millisecondsSinceEpoch ~/
+    1000;
 
-/// [day] as `YYYY-MM-DD`, the form read filters accept and echo back.
+/// [day] as `YYYY-MM-DD`, the form read filters accept and echo back. Pure
+/// field formatting, so it reads the same for any zone's date value.
 String formatCalendarDate(DateTime day) {
   final year = day.year.toString().padLeft(4, '0');
   final month = day.month.toString().padLeft(2, '0');
@@ -95,37 +101,40 @@ const List<String> datePresets = [
   'last_year',
 ];
 
-/// Resolves one of [datePresets] against [now]. Both bounds are inclusive
-/// calendar dates, matching the app: a last-N-days window is today plus the
-/// N-1 preceding dates. Returns null for an unknown preset.
+/// Resolves one of [datePresets] against the calendar date of [now] in the
+/// logbook zone, so a window is the pilot's days whatever zone the server
+/// runs in. Both bounds are inclusive calendar dates, matching the app: a
+/// last-N-days window is today plus the N-1 preceding dates. Returns null for
+/// an unknown preset.
 ({DateTime from, DateTime to})? resolveDatePreset(String preset,
     {required DateTime now}) {
   // Calendar arithmetic rather than Duration so a DST change cannot move a
   // boundary off midnight.
+  final today = logbookDateOf(now);
   return switch (preset) {
     'last_7_days' => (
-        from: DateTime(now.year, now.month, now.day - 6),
-        to: DateTime(now.year, now.month, now.day),
+        from: logbookDateAt(today.year, today.month, today.day - 6),
+        to: today,
       ),
     'last_30_days' => (
-        from: DateTime(now.year, now.month, now.day - 29),
-        to: DateTime(now.year, now.month, now.day),
+        from: logbookDateAt(today.year, today.month, today.day - 29),
+        to: today,
       ),
     'last_90_days' => (
-        from: DateTime(now.year, now.month, now.day - 89),
-        to: DateTime(now.year, now.month, now.day),
+        from: logbookDateAt(today.year, today.month, today.day - 89),
+        to: today,
       ),
     'this_month' => (
-        from: DateTime(now.year, now.month, 1),
-        to: DateTime(now.year, now.month + 1, 0),
+        from: logbookDateAt(today.year, today.month, 1),
+        to: logbookDateAt(today.year, today.month + 1, 0),
       ),
     'this_year' => (
-        from: DateTime(now.year, 1, 1),
-        to: DateTime(now.year, 12, 31),
+        from: logbookDateAt(today.year, 1, 1),
+        to: logbookDateAt(today.year, 12, 31),
       ),
     'last_year' => (
-        from: DateTime(now.year - 1, 1, 1),
-        to: DateTime(now.year - 1, 12, 31),
+        from: logbookDateAt(today.year - 1, 1, 1),
+        to: logbookDateAt(today.year - 1, 12, 31),
       ),
     _ => null,
   };
@@ -134,16 +143,24 @@ const List<String> datePresets = [
 int _epochFor(DateTime start, {required bool endOfDay}) {
   if (!endOfDay) return start.millisecondsSinceEpoch ~/ 1000;
   // Calendar arithmetic rather than +24h so DST days stay at 23:59:59.
-  final next = DateTime(start.year, start.month, start.day + 1);
+  final next = logbookDateAt(start.year, start.month, start.day + 1);
   return next.millisecondsSinceEpoch ~/ 1000 - 1;
 }
 
-/// Formats epoch seconds as a local ISO-8601 string.
+/// Formats epoch seconds as an ISO-8601 instant in the logbook zone, with an
+/// explicit offset (for example `2026-10-27T00:00:00.000+1100`), so the same
+/// instant renders identically on every host.
 String epochToIso(int seconds) =>
-    DateTime.fromMillisecondsSinceEpoch(seconds * 1000).toIso8601String();
+    logbookDateFromEpoch(seconds).toIso8601String();
+
+/// Formats epoch seconds as the `YYYY-MM-DD` calendar date the instant falls
+/// on in the logbook zone, the form every date column renders as.
+String epochToCalendarDate(int seconds) =>
+    formatCalendarDate(logbookDateFromEpoch(seconds));
 
 /// Current time as unix epoch seconds, matching the app's `created_at`/
-/// `updated_at` columns.
+/// `updated_at` columns. Epoch seconds are an instant and zone-free; anything
+/// that decides a calendar day uses [nowInLogbookZone] instead.
 int nowEpochSeconds() => DateTime.now().millisecondsSinceEpoch ~/ 1000;
 
 /// Sync provider name the app's sync engine used before it was renamed.

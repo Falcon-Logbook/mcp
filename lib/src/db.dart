@@ -8,11 +8,9 @@ import 'sqlite_loader.dart';
 import 'util.dart';
 
 /// Columns that hold unix epoch seconds even when their name does not end in
-/// `_at`/`_on`/`_date`.
-const Set<String> _dateColumns = {
-  'date',
+/// `_at`/`_on`, rendered as instants (see [_isInstantColumn]).
+const Set<String> _instantColumns = {
   'timestamp',
-  'due_date',
   'last_backed_up',
   'last_push_at',
   'last_pull_at',
@@ -20,6 +18,14 @@ const Set<String> _dateColumns = {
   // and the name ends in `_utc`, which the naming conventions do not catch.
   'scheduled_departure_utc',
   'scheduled_arrival_utc',
+};
+
+/// Columns that hold a calendar date, stored as the epoch seconds of the
+/// logbook zone's midnight starting that day. `due_date` is spelled out even
+/// though the `*_date` rule catches it, because the whole name is the case.
+const Set<String> _calendarDateColumns = {
+  'date',
+  'due_date',
 };
 
 /// Integer 0/1 columns whose name is not caught by the prefix rules below.
@@ -191,7 +197,9 @@ class FalconDb {
     for (final column in row.keys) {
       final value = row[column];
       if (value is int) {
-        if (_isDateColumn(column)) {
+        if (_isCalendarDateColumn(column)) {
+          out[column] = epochToCalendarDate(value);
+        } else if (_isInstantColumn(column)) {
           out[column] = epochToIso(value);
         } else if (_isBoolColumn(column)) {
           out[column] = value != 0;
@@ -212,14 +220,22 @@ class FalconDb {
   void close() => _db.dispose();
 }
 
-/// Epoch-second columns: known names plus the drift naming conventions for
-/// timestamps and dates (`*_at`, `*_on`, `*_date`), so additive schema changes
-/// keep being rendered readably.
-bool _isDateColumn(String column) =>
-    _dateColumns.contains(column) ||
+/// Calendar-date columns: known names plus the drift naming convention
+/// (`*_date`). A calendar date has no time and no offset, so it renders as
+/// `YYYY-MM-DD` computed in the logbook zone ([epochToCalendarDate]): the
+/// stored value is the zone's midnight, and rendering it any other way would
+/// move the date on a host in a different zone.
+bool _isCalendarDateColumn(String column) =>
+    _calendarDateColumns.contains(column) || column.endsWith('_date');
+
+/// Instant columns: known names plus the drift naming conventions for
+/// timestamps (`*_at`, `*_on`), so additive schema changes keep being rendered
+/// readably. An instant is a moment, so it renders as ISO-8601 with an
+/// explicit offset ([epochToIso]) rather than as someone's local clock.
+bool _isInstantColumn(String column) =>
+    _instantColumns.contains(column) ||
     column.endsWith('_at') ||
-    column.endsWith('_on') ||
-    column.endsWith('_date');
+    column.endsWith('_on');
 
 bool _isBoolColumn(String column) =>
     _boolColumns.contains(column) ||

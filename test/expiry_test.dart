@@ -9,11 +9,12 @@ import 'support/harness.dart';
 /// 90/30 fallback, overdue rows included by default. The numbers here are the
 /// ones the app's expiry page shows for the same rows.
 ///
-/// Day counts are asserted with a one-day tolerance and filters are checked
-/// against the days the server itself reports, because a DST change makes a
-/// 30-day span 29 days and 23 hours, which `.inDays` truncates to 29. That is
-/// the app's own arithmetic (`expiry_status.dart:8-14`) and is asserted exactly
-/// in the pure group below on fixed dates.
+/// Day counts are whole calendar days in the logbook zone, so a DST change
+/// cannot stretch or shrink them; the one-day tolerance below is only for a
+/// run that crosses local midnight between computing the fixtures and asking
+/// the server. Filter boundaries are checked against the days the server
+/// itself reports, and fixed-date counts are asserted exactly in the pure
+/// group below.
 void main() {
   group('expiry status', () {
     final today = DateTime(2026, 10, 28);

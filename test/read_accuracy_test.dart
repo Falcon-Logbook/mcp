@@ -415,8 +415,9 @@ void main() {
     }
 
     // Asserted against the shape of a value the server actually returns, not
-    // against a literal: the date columns are rendered as local ISO-8601
-    // strings, so a declaration that says epoch seconds fails here.
+    // against a literal: the date columns are rendered as YYYY-MM-DD calendar
+    // dates in the logbook zone, so a declaration that says epoch seconds or
+    // an ISO timestamp fails here.
     expect(serialisedDate, isNotNull,
         reason: 'a row date to check the declaration against');
     expect(declarations.values.toSet(), hasLength(1),

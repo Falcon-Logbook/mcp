@@ -100,12 +100,15 @@ T withFixtureDb<T>(String path, T Function(sqlite.Database db) body) {
 }
 
 /// The `units.date` declaration that matches [value]'s actual shape. A row's
-/// date is serialised by the server as a local ISO-8601 string, never as the
-/// epoch integer the column stores; deriving the expectation from the value
-/// keeps the declaration and the value from drifting apart.
+/// date is serialised by the server as the `YYYY-MM-DD` calendar date in the
+/// logbook zone, never as the epoch integer the column stores; deriving the
+/// expectation from the value keeps the declaration and the value from
+/// drifting apart. A row date in any other shape is refused here rather than
+/// matched loosely, so the declaration can never claim a form the server does
+/// not return.
 String dateTypeOf(Object? value) => switch (value) {
-      int() => 'epoch_seconds',
-      String() when DateTime.tryParse(value) != null => 'iso8601_local',
+      String() when RegExp(r'^\d{4}-\d{2}-\d{2}$').hasMatch(value) =>
+        'calendar_date',
       _ => throw ArgumentError('not a date value: $value'),
     };
 
@@ -117,8 +120,9 @@ class McpProcess {
 
   static Future<McpProcess> start(String dbPath,
       {bool write = false,
-      Map<String, dynamic> capabilities = const {}}) async {
-    final client = await _spawn(dbPath, write: write);
+      Map<String, dynamic> capabilities = const {},
+      Map<String, String> environment = const {}}) async {
+    final client = await _spawn(dbPath, write: write, environment: environment);
     final init = await client.send('initialize', {
       'protocolVersion': '2025-06-18',
       'capabilities': capabilities,
@@ -139,8 +143,9 @@ class McpProcess {
   /// this and tests that need an older client use [start].
   static Future<McpProcess> startStateless(String dbPath,
       {bool write = false,
-      Map<String, dynamic> clientCapabilities = const {}}) async {
-    final client = await _spawn(dbPath, write: write);
+      Map<String, dynamic> clientCapabilities = const {},
+      Map<String, String> environment = const {}}) async {
+    final client = await _spawn(dbPath, write: write, environment: environment);
     client._statelessMeta = {
       'io.modelcontextprotocol/protocolVersion': '2026-07-28',
       'io.modelcontextprotocol/clientCapabilities': clientCapabilities,
@@ -152,7 +157,8 @@ class McpProcess {
     return client;
   }
 
-  static Future<McpProcess> _spawn(String dbPath, {bool write = false}) async {
+  static Future<McpProcess> _spawn(String dbPath,
+      {bool write = false, Map<String, String> environment = const {}}) async {
     final libraryPath = Platform.environment['LD_LIBRARY_PATH'] ?? '';
     final process = await Process.start(
       Platform.resolvedExecutable,
@@ -165,8 +171,11 @@ class McpProcess {
       ],
       environment: {
         // The server resolves libsqlite3 itself; keep the parent's library path
-        // in case the platform needs it.
+        // in case the platform needs it. [environment] (TZ, FALCON_TZ for the
+        // timezone tests) overrides the parent's values; everything else is
+        // merged in from the parent environment as usual.
         'LD_LIBRARY_PATH': libraryPath,
+        ...environment,
       },
     );
     return McpProcess._(process);
