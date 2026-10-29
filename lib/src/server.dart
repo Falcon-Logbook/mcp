@@ -1732,6 +1732,602 @@ String _rosterIdentity(Map<String, Object?> values) => [
       values['total_time'] ?? 'null',
     ].join('\u{1}');
 
+// ------------------------------------------------------------
+// Logbook import (mode: import)
+// ------------------------------------------------------------
+
+/// The row convention a batch call declares. `roster` (default) is a pasted
+/// schedule of planned legs, exactly the behaviour the roster engine had
+/// before this existed; `import` is rows read from a logbook file, where the
+/// date and unit rules below are strict. A roster call pays for none of them.
+JsonSchema get _importModeSchema => JsonSchema.string(
+      enumValues: const ['roster', 'import'],
+      description: 'roster (default): a pasted schedule, validated as today. '
+          'import: rows read from a logbook file, validated strictly (date '
+          'must be YYYY-MM-DD with serials and other readings refused, '
+          'durations read in the declared units, unknown columns reported).',
+    );
+
+/// How the rows of an import write durations, declared once for the whole
+/// call. The file's convention is never guessed per cell: mixed units in one
+/// file are an error, not a conversion.
+JsonSchema get _importUnitsSchema => JsonSchema.string(
+      enumValues: const ['minutes', 'decimal_hours', 'hhmm'],
+      description: 'How duration cells are written: minutes (default, whole '
+          'minutes), decimal_hours (1.5 is 90 minutes) or hhmm (1:30 is 90 '
+          'minutes). Used only when mode is import; a cell that does not match '
+          'the declared unit is refused, never read in another one.',
+    );
+
+/// The declarations of one batch call, validated. [import] is the flag every
+/// import-only rule gates on, so a roster call pays nothing for them.
+({bool import, String units}) _importSettings(Map<String, dynamic> args) {
+  final mode = asText(args['mode']) ?? 'roster';
+  if (mode != 'roster' && mode != 'import') {
+    throw _ToolError('mode must be one of roster, import (got "$mode")',
+        field: 'mode');
+  }
+  final units = asText(args['units']) ?? 'minutes';
+  if (!const {'minutes', 'decimal_hours', 'hhmm'}.contains(units)) {
+    throw _ToolError(
+        'units must be one of minutes, decimal_hours, hhmm (got "$units")',
+        field: 'units');
+  }
+  return (import: mode == 'import', units: units);
+}
+
+/// The spreadsheet serial epoch: a serial cell shows 1899-12-30 plus that many
+/// days (the one-day offset is the 1900 leap year bug, which Excel and Sheets
+/// both inherit). What the cell shows is what the refusal names; the server
+/// never converts one, because a wrong reading moves a flight between months
+/// and years.
+final DateTime _serialEpoch = DateTime.utc(1899, 12, 30);
+
+/// The shapes an import date cell arrives in that are not the one accepted
+/// form: the strict shape, the timestamp that starts with one, a bare number
+/// (a spreadsheet serial), and three numeric fields with any separator.
+final RegExp _isoDateShape = RegExp(r'^\d{4}-\d{2}-\d{2}$');
+final RegExp _isoDatePrefix = RegExp(r'^(\d{4}-\d{2}-\d{2})(?:[Tt ].*)?$');
+final RegExp _numberOnly = RegExp(r'^-?\d+(?:\.\d+)?$');
+final RegExp _threeFields =
+    RegExp(r'^(\d{1,4})[/.\-](\d{1,2})[/.\-](\d{1,4})$');
+final RegExp _hhmmCell = RegExp(r'^(\d{1,2}):([0-5]\d)$');
+
+/// The last serial a spreadsheet can show: 1899-12-30 plus this many days is
+/// 9999-12-31, and a cell cannot hold a later date than that.
+const int _maxSerial = 2958465;
+
+/// The `YYYY-MM-DD` a spreadsheet cell with [serial] shows. A fractional
+/// serial carries a time of day, so the day is floored.
+///
+/// Null when the serial is outside the range a cell can show (negative,
+/// beyond [_maxSerial], or not a finite number): flooring it would throw, and
+/// adding it as a [Duration] would wrap into a date the cell never showed.
+String? _serialReading(num serial) {
+  if (!serial.isFinite || serial < 0 || serial > _maxSerial) return null;
+  final days = serial.floor();
+  return formatCalendarDate(_serialEpoch.add(Duration(days: days)));
+}
+
+/// The refusal for an import `date` cell that is not strict `YYYY-MM-DD`, or
+/// null when the cell is fine and the row builder can take it. A spreadsheet
+/// serial is named with the date it shows, a text date with its probable
+/// reading (both readings when a slash date is ambiguous), and neither is ever
+/// converted: the pilot confirms and re-sends.
+({String code, String message})? _importDateIssue(Object? raw) {
+  if (raw == null) return null;
+  if (raw is! String) {
+    if (raw is num) return _serialDateIssue(raw, '$raw');
+    return (code: 'date_format', message: _dateMessage('$raw', const [], null));
+  }
+  final text = raw.trim();
+  if (text.isEmpty) {
+    return (
+      code: 'date_missing',
+      message: 'date is required: every import row needs the date it was flown',
+    );
+  }
+  if (_isoDateShape.hasMatch(text)) {
+    if (parseCalendarDate(text) != null) return null;
+    return (
+      code: 'date_format',
+      message: 'date "$text" is not a real calendar date: its month or day '
+          'does not exist. The server never fixes one up; ask the pilot for '
+          'the date as YYYY-MM-DD.',
+    );
+  }
+  final numeric = _numberOnly.hasMatch(text) ? num.tryParse(text) : null;
+  if (numeric != null) return _serialDateIssue(numeric, text);
+  final readings = _dateReadings(text);
+  return (
+    code: 'date_format',
+    message: _dateMessage(text, readings.readings, readings.note),
+  );
+}
+
+/// The refusal for a spreadsheet serial cell. [text] is the cell as written,
+/// so a numeric string is echoed as typed rather than as the number Dart
+/// parsed it into.
+({String code, String message}) _serialDateIssue(num serial, String text) {
+  final reading = _serialReading(serial);
+  if (reading == null) {
+    return (
+      code: 'serial_date',
+      message: 'date $text is a spreadsheet serial number outside the range a '
+          'spreadsheet can show: the last one it can hold is $_maxSerial '
+          '(9999-12-31). It is refused and never converted: ask the pilot to '
+          'confirm the date and send it as YYYY-MM-DD.',
+    );
+  }
+  return (
+    code: 'serial_date',
+    message: 'date $text is a spreadsheet serial number, which shows '
+        '$reading (DateTime.utc(1899, 12, 30) plus '
+        '${serial.floor()} days). Serial numbers are refused and never '
+        'converted: ask the pilot to confirm the date and send it as '
+        'YYYY-MM-DD.',
+  );
+}
+
+/// The `date_format` refusal for [text] with the readings the server can see
+/// in it. One reading is stated as probable, two are both named because the
+/// server never guesses between D/M/Y and M/D/Y. [note] adds what the shape of
+/// the cell says beyond its reading, such as a timestamp crossing the day
+/// boundary in the logbook zone.
+String _dateMessage(String text, List<String> readings, String? note) {
+  if (readings.isEmpty) {
+    return 'date "$text" is not YYYY-MM-DD and no reading can be guessed from '
+        'it. Ask the pilot which date this row was flown and send it as '
+        'YYYY-MM-DD.';
+  }
+  if (readings.length == 1) {
+    return 'date "$text" is not YYYY-MM-DD; it probably means ${readings[0]}. '
+        '${note == null ? '' : '$note '}'
+        'Dates are refused and never converted: ask the pilot to confirm and '
+        'send date as YYYY-MM-DD.';
+  }
+  return 'date "$text" is not YYYY-MM-DD and both of its first two fields are '
+      '12 or less: it reads as ${readings[0]} (D/M/Y) or ${readings[1]} '
+      '(M/D/Y). Ask the pilot which convention the file uses; the server '
+      'never guesses.';
+}
+
+/// The zone designator that turns a timestamp into an instant: a trailing `Z`
+/// or a `+hh:mm` / `-hh:mm` offset. Without one the text is a wall clock
+/// reading, whose zone nobody knows.
+final RegExp _timestampZone = RegExp(r'(?:[Zz]|[+-]\d{2}:?\d{2})$');
+
+/// The logbook-zone calendar date a timestamp falls on, or null when [text] is
+/// not one or carries no zone. A timestamp with a zone is an instant, so this
+/// is the day it was flown in the logbook zone; a naive timestamp is only the
+/// wall clock its text states, so its own fields are the safest reading.
+String? _zonedDate(String text) {
+  if (!_timestampZone.hasMatch(text)) return null;
+  final parsed = DateTime.tryParse(text);
+  if (parsed == null) return null;
+  return formatCalendarDate(
+      logbookDateFromEpoch(parsed.millisecondsSinceEpoch ~/ 1000));
+}
+
+/// The probable `YYYY-MM-DD` readings of a non-ISO date cell: one when the
+/// shape fixes it, two when a slash date could be D/M/Y or M/D/Y, none when
+/// nothing can be guessed. Only real calendar dates are named.
+///
+/// A timestamp's reading is the logbook-zone day it falls on, and [note] says
+/// so when that day differs from the date its text starts with: a row logged
+/// late in the evening UTC is the next day's flight in the logbook zone.
+({List<String> readings, String? note}) _dateReadings(String text) {
+  String? reading(int year, int month, int day) {
+    final date = logbookDateAt(year, month, day);
+    if (date.year != year || date.month != month || date.day != day) {
+      return null;
+    }
+    return formatCalendarDate(date);
+  }
+
+  final iso = _isoDatePrefix.firstMatch(text);
+  if (iso != null) {
+    final stated = iso.group(1)!;
+    final date = parseCalendarDate(stated);
+    if (date == null) return (readings: const [], note: null);
+    final zoned = _zonedDate(text);
+    if (zoned == null) {
+      return (readings: [formatCalendarDate(date)], note: null);
+    }
+    return (
+      readings: [zoned],
+      note: zoned == stated
+          ? null
+          : 'Its text starts with $stated, but in the logbook zone that '
+              'instant falls on $zoned.',
+    );
+  }
+  final fields = _threeFields.firstMatch(text);
+  if (fields == null) return (readings: const [], note: null);
+  final first = int.parse(fields.group(1)!);
+  final second = int.parse(fields.group(2)!);
+  final third = int.parse(fields.group(3)!);
+  // A four-digit first field is the year: 2026/10/27 is Y/M/D everywhere.
+  if (fields.group(1)!.length == 4) {
+    final date = reading(first, second, third);
+    return (readings: date == null ? const [] : [date], note: null);
+  }
+  if (fields.group(3)!.length != 4) return (readings: const [], note: null);
+  final year = third;
+  if (first > 12 && second > 12) return (readings: const [], note: null);
+  if (first > 12) {
+    final date = reading(year, second, first);
+    return (readings: date == null ? const [] : [date], note: null);
+  }
+  if (second > 12) {
+    final date = reading(year, first, second);
+    return (readings: date == null ? const [] : [date], note: null);
+  }
+  final readings = <String>[];
+  final dmy = reading(year, second, first);
+  if (dmy != null) readings.add(dmy);
+  final mdy = reading(year, first, second);
+  if (mdy != null) readings.add(mdy);
+  return (readings: readings, note: null);
+}
+
+/// [exact] as the minute count a message names: at most two decimals, so
+/// floating point noise is not reported as precision.
+String _exactMinutes(double exact) =>
+    exact.toStringAsFixed(2).replaceFirst(RegExp(r'\.?0+$'), '');
+
+/// One duration cell of an import row as whole minutes in the declared
+/// [units], or the refusal saying why it cannot be read.
+///
+/// The declared unit is the file's convention, chosen once on the call. A
+/// cell that does not match is refused rather than read in another unit:
+/// `1:30` in a decimal file and `1.5` in an hhmm file are exactly the mixed
+/// units this rule stops.
+({Object? value, String? code, String? message}) _importMinutes(
+    String column, Object? raw, String units) {
+  String mismatch() => '$column "$raw" is not $units: the call declared units '
+      '$units for this file. Mixed units are refused, never guessed; ask the '
+      'pilot which convention the column uses.';
+
+  final int minutes;
+  if (units == 'minutes') {
+    final value = asInt(raw);
+    if (value == null) {
+      return (value: null, code: 'unit_mismatch', message: mismatch());
+    }
+    minutes = value;
+  } else if (units == 'decimal_hours') {
+    final hours = asDouble(raw);
+    if (hours == null) {
+      return (value: null, code: 'unit_mismatch', message: mismatch());
+    }
+    final exact = hours * 60;
+    final rounded = exact.round();
+    if ((exact - rounded).abs() > 1e-6) {
+      return (
+        value: null,
+        code: 'unit_implausible',
+        message: '$column $raw decimal_hours is ${_exactMinutes(exact)} '
+            'minutes, which is not a whole minute. A duration is refused, '
+            'never rounded; ask the pilot for the real value.',
+      );
+    }
+    minutes = rounded;
+  } else {
+    final match = raw is String ? _hhmmCell.firstMatch(raw.trim()) : null;
+    if (match == null) {
+      return (value: null, code: 'unit_mismatch', message: mismatch());
+    }
+    minutes = int.parse(match.group(1)!) * 60 + int.parse(match.group(2)!);
+  }
+  if (minutes < 0 || minutes > maxFlightMinutes) {
+    return (
+      value: null,
+      code: 'unit_implausible',
+      message: '$column "$raw" is $minutes minutes, outside 0 to '
+          '$maxFlightMinutes minutes (${maxFlightMinutes ~/ 60} hours).',
+    );
+  }
+  return (value: minutes, code: null, message: null);
+}
+
+/// The curated home for the source columns a logbook file carries that Falcon
+/// has no exact name for: instructing, PIC, copilot, block, start/stop, rego,
+/// type, remarks and date headers. Matched on the tokens of the source header,
+/// most specific family first, and every column named is one the live write
+/// path can store, so a hint never offers a column this build would refuse.
+const List<({List<String> tokens, List<String> columns, String hint})>
+    _importColumnAliases = [
+  (
+    tokens: ['BLOCKOFF'],
+    columns: ['time_start'],
+    hint: 'A block-off column is time_start, a HH:MM clock time.'
+  ),
+  (
+    tokens: ['BLOCKON'],
+    columns: ['time_stop'],
+    hint: 'A block-on column is time_stop, a HH:MM clock time.'
+  ),
+  (
+    tokens: ['START', 'OFF'],
+    columns: ['time_start'],
+    hint: 'An off or start column is time_start, a HH:MM clock time.'
+  ),
+  (
+    tokens: ['STOP', 'ON'],
+    columns: ['time_stop'],
+    hint: 'An on or stop column is time_stop, a HH:MM clock time.'
+  ),
+  (
+    tokens: ['INSTRUCT', 'INSTR', 'ICUS', 'PICUS'],
+    columns: ['icus_day_time', 'icus_night_time'],
+    hint: 'Instructing and PICUS time map to icus_day_time and icus_night_time.'
+  ),
+  (
+    tokens: ['PIC'],
+    columns: ['crew_role'],
+    hint: 'A PIC column maps to crew_role = pilotInCommand per row.'
+  ),
+  (
+    tokens: ['COPILOT', 'FIRSTOFFICER', 'SIC'],
+    columns: ['crew_role'],
+    hint: 'A copilot column maps to crew_role = copilot.'
+  ),
+  (
+    tokens: ['TOTAL', 'BLOCK'],
+    columns: ['total_time'],
+    hint: 'A total or block column is total_time, in minutes.'
+  ),
+  (
+    tokens: ['REGO', 'REGISTRATION', 'REG', 'TAIL'],
+    columns: ['aircraft_registration'],
+    hint:
+        'A rego or tail column is aircraft_registration; never infer a tail from a type.'
+  ),
+  (
+    tokens: ['TYPE'],
+    columns: [],
+    hint: 'An aircraft type has no flight column: pass it as the aircraft_type '
+        'row hint and map tails with list_aircraft.'
+  ),
+  (
+    tokens: ['REMARK', 'NOTE', 'COMMENT'],
+    columns: ['custom_columns', 'approach_details'],
+    hint: 'Remarks usually go to custom_columns or approach_details.'
+  ),
+  (
+    tokens: ['DATE', 'DOF'],
+    columns: ['date'],
+    hint: 'The flight date is date, strict YYYY-MM-DD.'
+  ),
+  (
+    tokens: ['ID'],
+    columns: [],
+    hint: 'An id column is not mapped: the batch mints its own ids, and a row '
+        'is retried under its client_ref instead.'
+  ),
+];
+
+/// The alias family [key] belongs to, if any. A token of the header equals one
+/// of the family's tokens, or contains one long enough to mean something, so
+/// `REMARKS` finds `REMARK` while the `ON` in `NOTES` finds nothing.
+({List<String> columns, String hint})? _importAliasFor(String key) {
+  final tokens = key
+      .toUpperCase()
+      .split(RegExp(r'[^A-Z0-9]+'))
+      .where((token) => token.isNotEmpty);
+  for (final family in _importColumnAliases) {
+    for (final token in tokens) {
+      for (final needle in family.tokens) {
+        if (token == needle || (needle.length >= 4 && token.contains(needle))) {
+          return (columns: family.columns, hint: family.hint);
+        }
+      }
+    }
+  }
+  return null;
+}
+
+/// The flight columns this build can write: the live table and the write spec
+/// agree on these, and every alternative an unknown column is offered comes
+/// from here.
+List<_Column> _writableFlightColumns(FalconDb db) =>
+    _supported(db, 'flights', _flightColumns);
+
+/// Writable columns whose names share a chunk with [key], for a source header
+/// the curated list does not know.
+List<String> _similarFlightColumns(String key, List<_Column> writable) {
+  final wanted = _normalizeKey(key);
+  if (wanted.length < 3) return const [];
+  return [
+    for (final column in writable)
+      if (_normalizeKey(column.name).contains(wanted) ||
+          (wanted.contains(_normalizeKey(column.name)) &&
+              _normalizeKey(column.name).length >= 4))
+        column.name,
+  ];
+}
+
+/// The `unknown_column` issue for one source header: the real columns that
+/// could hold it, plus the curated hint for the headers this flow sees over
+/// and over. The key is removed from the row and the rest of the row is still
+/// evaluated: an unknown column is a question for the pilot, never a silent
+/// drop.
+({String message, List<Map<String, dynamic>> candidates}) _unknownColumnIssue(
+    FalconDb db, String key) {
+  final writable = _writableFlightColumns(db);
+  final alias = _importAliasFor(key);
+  final wanted = {
+    ...?alias?.columns,
+    ..._similarFlightColumns(key, writable),
+  };
+  final matches = [
+    for (final column in writable)
+      if (wanted.contains(column.name)) column,
+  ];
+  final hint = alias == null ? '' : '${alias.hint} ';
+  final names = [for (final column in matches) column.name];
+  return (
+    message: names.isEmpty
+        ? 'Column "$key" is not a Falcon flight column; none of the columns '
+            'this build can write (falcon://import) is a likely home. $hint'
+            'Ask the pilot where the values go; never drop the column silently.'
+        : 'Column "$key" is not a Falcon flight column; the closest this '
+            'build can write are ${names.join(', ')} (all of them are in '
+            'falcon://import). $hint'
+            'Ask the pilot where the values go; never drop the column silently.',
+    candidates: [
+      for (final column in matches)
+        {'name': column.name, 'note': _importColumnNote(column)},
+    ],
+  );
+}
+
+/// Columns that hold a unix epoch second rather than a count of things.
+const Set<String> _epochColumns = {
+  'scheduled_departure_utc',
+  'scheduled_arrival_utc',
+};
+
+/// How the import column table describes a column's kind, unit included: a
+/// duration cell reads as minutes, a count is not a duration, and a planned
+/// time is an instant in unix seconds.
+String _importColumnKind(_Column column) => switch (column.kind) {
+      _Kind.text => 'text',
+      _Kind.integer => _minuteColumns.contains(column.name)
+          ? 'integer minutes'
+          : _epochColumns.contains(column.name)
+              ? 'unix seconds'
+              : 'integer count',
+      _Kind.real => 'number',
+      _Kind.boolean => 'boolean',
+      _Kind.date => 'date YYYY-MM-DD',
+      _Kind.clock => 'clock HH:MM',
+    };
+
+/// What a column holds, for the import column table: the write catalog's own
+/// note where there is one, the kind where the catalog carries the column
+/// bare, which is still true and never a guess at the data.
+String _importColumnNote(_Column column) =>
+    column.note ??
+    switch (column.kind) {
+      _Kind.text => 'Free text.',
+      _Kind.integer => 'Whole-number count.',
+      _Kind.real => 'Number.',
+      _Kind.boolean => 'true or false.',
+      _Kind.date => 'Calendar date.',
+      _Kind.clock => '24-hour clock time.',
+    };
+
+/// The import column table: one line per flight column this build can write,
+/// generated from the live table and the write spec when the resource is read.
+/// A database that has not migrated has no planned-time columns, so the table
+/// names only what an import can actually send, and never a column the write
+/// path would refuse.
+String _importColumnTable(FalconDb db) => [
+      for (final column in _writableFlightColumns(db))
+        '- ${column.name} (${_importColumnKind(column)}): '
+            '${_importColumnNote(column)}',
+    ].join('\n');
+
+/// `falcon://import`: the guided import contract. The question script, the
+/// mapping and review rule, the strict date and unit rules, the loud
+/// partial-failure rule, and the column table generated from the live
+/// database at read time.
+String _importResourceText(FalconDb db) => 'FALCON LOGBOOK IMPORT\n'
+    '\n'
+    'The server never reads the file: it sees SQLite and the rows you send, so '
+    'this is a mapping contract with questions, validation and an atomic '
+    'apply. You do the reading and the OCR. Anything that looks like "the '
+    'server parses the CSV" is out of scope by design.\n'
+    '\n'
+    'QUESTIONS: ASK, DO NOT ASSUME\n'
+    'Ask only what the file does not say, in a few grouped questions, never '
+    'one field at a time and never again what the pilot has already answered. '
+    'On a client that supports it, ask with ask_user (pickers and yes/no '
+    'forms) and record each answer against its question id. The groups:\n'
+    '1. Source and shape. What is it: a CSV, Excel or JSON export, PDF text, '
+    'an image, or a pasted table? Where did it come from (ForeFlight, LogTen '
+    'Pro, Garmin Pilot, a CASA-style paper logbook, an airline logbook, a '
+    'hand-made spreadsheet)? If unknown, say so and work from the headers, '
+    'and show the headers back exactly as written. How many rows?\n'
+    '2. The date column. Which column holds the flight date? Dates here are '
+    'strict YYYY-MM-DD: a spreadsheet serial number is refused with the date '
+    'it shows (1899-12-30 plus the serial), and text like 27/10/2026 or '
+    '2026-10-27T00:00:00Z is refused with its probable reading, both readings '
+    'named when a slash date is ambiguous. Nothing is ever converted, because '
+    'a wrong reading moves a flight between months and years.\n'
+    '3. Duration units. Are the durations total time, day plus night, or '
+    'block time? Are the cells whole minutes (units "minutes"), decimal hours '
+    '(units "decimal_hours", 1.5 is 90 minutes) or H:MM (units "hhmm", 1:30 '
+    'is 90 minutes)? Declare one convention for the whole call: mixed units '
+    'in one file are an error, never a guess, and a cell that does not match '
+    'the declared unit is refused with unit_mismatch or unit_implausible.\n'
+    "4. Whose logbook. Is this the pilot's own logbook, or does it carry "
+    "other pilots' rows too?\n"
+    '5. Aircraft mapping. Which types and registrations appear, and which '
+    'existing aircraft rows do they map to? Offer list_aircraft. Never infer '
+    'a tail from a type that happens to match one aircraft, and never invent '
+    'a registration.\n'
+    '6. Roles. Is PIC per row, or the whole file as PIC? Any copilot, '
+    'student or dual rows? crew_role drives currency, so it is never '
+    'assumed.\n'
+    '7. Simulator rows. Which rows are FNPT or FFS sessions (is_simulator)? '
+    'Separate them out.\n'
+    '8. Timezone. flights.date is the logbook-zone local midnight of the '
+    'flight date, and the logbook zone is the one FALCON_TZ declares (an IANA '
+    'name such as Australia/Sydney). Is the date column already the local '
+    'calendar date, and could any row move if it was logged in UTC? Never '
+    'infer a zone from a city name.\n'
+    '\n'
+    'SHOW THE MAPPING, GET AN EXPLICIT YES\n'
+    'Render "source column -> Falcon column" for every source column, plus '
+    'THREE sample rows already rendered as Falcon rows (create_flight field '
+    'names), so the pilot can spot a shift before anything is written. Then '
+    'get an explicit yes. If the pilot skips the review, skip the table but '
+    'keep the dry run: never blind-import a file.\n'
+    '\n'
+    'UNKNOWN COLUMNS ARE QUESTIONS, NEVER DROPPED\n'
+    'validate_flight_drafts reports every column it cannot map as '
+    'unknown_column, with the real columns this build could write instead '
+    '(also in the column table below, and from get_schema). Ask with those '
+    'real options rather than dropping the column: ignore it (information '
+    'lost), fold it into custom_columns, or map it to one of the named '
+    'columns. The alias hints cover the usual source headers (instructing, '
+    'PIC, copilot, block, start/stop, rego, type, remarks, date).\n'
+    '\n'
+    'PARTIAL FAILURE IS LOUD\n'
+    'Silent partial success is the failure this flow exists to prevent. Name '
+    'every row that did not land, with its index, its client_ref if it had '
+    'one, and the reason. State the batch_id and how many rows landed. Say '
+    'plainly that the rows that did land now carry updated_at like a manually '
+    'entered flight and push to Postgres on the next sync.\n'
+    '\n'
+    'TOOLS\n'
+    'validate_flight_drafts writes nothing: flights (up to 500, create_flight '
+    'field names), mode: "import", the declared units, optional date_from and '
+    'date_to. Each row answers ok, issues of {field, code, message, severity} '
+    'and warnings; severity error is a row apply_flight_batch would refuse, '
+    'warning is a row to ask about (would_create_draft means the row would '
+    'land as a draft), info is stored as text. Import codes: serial_date, '
+    'date_format, unit_mismatch, unit_implausible, unit_conflict, '
+    'would_create_draft, unknown_column, plus the shared ones (invalid_row, '
+    'split_mismatch, duplicate_existing, duplicate_batch, date_missing and '
+    'the rest). Each row also accepts client_ref (retry identity) and '
+    'aircraft_type (a hint, never stored).\n'
+    'apply_flight_batch (write mode only) takes the same rows plus dry_run '
+    '(default true: the same plan, nothing written), allow_partial (default '
+    'false: atomic, one bad row writes nothing) and batch_id. An import row '
+    'lands as it stands: complete when it carries a total, a draft when it '
+    'does not. A duplicate in the logbook or the batch is skipped, never '
+    'overwritten, and so is a client_ref an earlier batch already '
+    'imported.\n'
+    '\n'
+    'COLUMN TABLE: FLIGHT COLUMNS THIS BUILD CAN WRITE\n'
+    'Generated from this database when this resource is read. Never map to a '
+    'column that is not listed here.\n'
+    '${_importColumnTable(db)}\n';
+
 /// Validates every row of a roster without writing anything, and returns one
 /// [_RosterRow] per input row, in input order.
 ///
@@ -1740,11 +2336,16 @@ String _rosterIdentity(Map<String, Object?> values) => [
 /// on top is the roster's own business: the stated date window, the order of
 /// the legs, duplicates in the logbook and in the batch, planned times this
 /// database cannot store, and a total on a scheduled leg.
+///
+/// [settings] gates the import rules: strict dates, durations read in the
+/// declared unit, unknown columns surfaced with real alternatives, and the
+/// draft warning. A roster call passes the defaults and pays for none of them.
 List<_RosterRow> _rosterRows(
   FalconDb db,
   Map<String, dynamic> args, {
   required String tool,
   required ({DateTime? from, DateTime? to}) range,
+  required ({bool import, String units}) settings,
 }) {
   final raw = _rosterFlightRows(args);
   final plannedAvailable = _plannedTimesAvailable(db);
@@ -1791,6 +2392,65 @@ List<_RosterRow> _rosterRows(
       }
     }
 
+    if (settings.import) {
+      // Unknown columns are reported with the real columns that could hold
+      // them and removed, so the rest of the row is still evaluated and the
+      // pilot's instructing time is a question rather than a silent drop.
+      final unknown = [
+        for (final key in flight.keys)
+          if (!_rosterRowFields.contains(key)) key,
+      ];
+      for (final key in unknown) {
+        flight.remove(key);
+        final issue = _unknownColumnIssue(db, key);
+        row.add('unknown_column', issue.message,
+            field: key, candidates: issue.candidates);
+      }
+
+      // The date is strict YYYY-MM-DD here. One date issue skips the row
+      // builder, so the row carries the refusal instead of a second generic
+      // one from the coercion below.
+      final dateIssue = _importDateIssue(flight['date']);
+      if (dateIssue != null) {
+        row.add(dateIssue.code, dateIssue.message, field: 'date');
+        continue;
+      }
+
+      // Durations are read in the unit the call declared and converted to the
+      // minutes the columns store. The `_hours` aliases are the write tools'
+      // shorthand; an import has already declared its convention, so the
+      // shorthand is refused instead of converting in a unit the file may not
+      // use. A cell that does not convert is the row's clear issue, and the
+      // row builder is skipped rather than asked to parse what it cannot.
+      var unitFailed = false;
+      for (final entry in _hoursAliases.entries) {
+        if (!flight.containsKey(entry.value)) continue;
+        row.add(
+            'unit_conflict',
+            '${entry.value} is refused on an import: the file\'s duration '
+                'convention was declared once on the call as units '
+                '"${settings.units}". Send ${entry.key} in ${settings.units} '
+                'instead.',
+            field: entry.value);
+        flight.remove(entry.value);
+        unitFailed = true;
+      }
+      for (final column in _minuteColumns) {
+        if (!flight.containsKey(column)) continue;
+        final raw = flight[column];
+        if (raw == null) continue;
+        final read = _importMinutes(column, raw, settings.units);
+        if (read.code != null) {
+          row.add(read.code!, read.message!, field: column);
+          flight.remove(column);
+          unitFailed = true;
+          continue;
+        }
+        flight[column] = read.value;
+      }
+      if (unitFailed) continue;
+    }
+
     try {
       _rejectUnknown(flight, _rosterRowFields, tool: tool);
       final built = _flightValues(db, flight, tool: tool);
@@ -1810,16 +2470,34 @@ List<_RosterRow> _rosterRows(
     if (date == null) {
       row.add(
           'date_missing',
-          'date is required: every roster leg needs the local date it '
-              'operates on',
+          settings.import
+              ? 'date is required: every import row needs the date it was flown'
+              : 'date is required: every roster leg needs the local date it '
+                  'operates on',
           field: 'date');
       continue;
     }
+    // An import row with no total lands as a draft, which is right when the
+    // source has no total for it and a silent gap when it does. It still
+    // writes: the warning is for the confirmation before apply, not a block.
+    if (settings.import &&
+        values['total_time'] == null &&
+        asBool(flight['draft']) != true) {
+      row.add(
+          'would_create_draft',
+          'no total_time on the row: this would create a draft; confirm the '
+              'source has no total for it',
+          field: 'total_time',
+          severity: 'warning');
+    }
     final day = logbookDateFromEpoch(date);
+    // An import has no roster: the range is what the file's own start and end
+    // claim, and its rows are ordered by date rather than by departure.
     if (range.from != null && day.isBefore(range.from!)) {
       row.add(
         'date_out_of_range',
-        '${formatCalendarDate(day)} is before the stated roster start '
+        '${formatCalendarDate(day)} is before the stated '
+            '${settings.import ? 'start' : 'roster start'} '
             '${formatCalendarDate(range.from!)}',
         field: 'date',
         severity: 'warning',
@@ -1828,7 +2506,8 @@ List<_RosterRow> _rosterRows(
     if (range.to != null && day.isAfter(range.to!)) {
       row.add(
         'date_out_of_range',
-        '${formatCalendarDate(day)} is after the stated roster end '
+        '${formatCalendarDate(day)} is after the stated '
+            '${settings.import ? 'end' : 'roster end'} '
             '${formatCalendarDate(range.to!)}',
         field: 'date',
         severity: 'warning',
@@ -1837,9 +2516,11 @@ List<_RosterRow> _rosterRows(
     if (previousDate != null && day.isBefore(previousDate)) {
       row.add(
         'date_order',
-        '${formatCalendarDate(day)} is before the previous leg '
+        '${formatCalendarDate(day)} is before the previous '
+            '${settings.import ? 'row' : 'leg'} '
             '(${formatCalendarDate(previousDate)}): check the dates or sort the '
-            'roster by departure',
+            '${settings.import ? 'file' : 'roster'} by '
+            '${settings.import ? 'date' : 'departure'}',
         field: 'date',
         severity: 'warning',
       );
@@ -4174,16 +4855,25 @@ Future<void> runServer(String dbPath, {bool readonly = true}) async {
         'Check a batch of proposed flights without writing anything. Pass '
         'flights as up to $_rosterRowCap objects using create_flight field '
         'names, plus optional date_from and date_to for the roster range. '
-        'Returns valid and invalid counts and one entry per row with index, '
-        'client_ref, ok, issues of {field, code, message, severity} and any '
-        'warnings. Severity error is a row apply_flight_batch would refuse; '
-        'warning is a row worth asking about (unknown aircraft, an airport that '
-        'does not resolve, a duplicate, a date out of range or out of order); '
-        'info is stored as text. A total_time on a leg with planned times is an '
-        'error, because a total makes the flight complete. Row fields not in '
-        'create_flight: client_ref (identity across retries) and aircraft_type '
-        '(a hint, never stored). Write nothing and check a whole roster first, '
-        'then apply it.',
+        'mode: roster (default) checks a pasted roster; import checks rows '
+        'read from a logbook file, strictly: date must be YYYY-MM-DD (a '
+        'spreadsheet serial or a text date is refused with its probable '
+        'reading, never converted), duration cells must match the units '
+        'declared on the call, and a column Falcon cannot store is reported '
+        'with the real columns that could hold it, never dropped. units '
+        '(minutes default, decimal_hours, hhmm) says how the file writes '
+        'durations and applies only when mode is import. Returns valid and '
+        'invalid counts and one entry per row with index, client_ref, ok, '
+        'issues of {field, code, message, severity} and warnings. Severity '
+        'error is a row apply_flight_batch would refuse; warning is a row '
+        'worth asking about (unknown aircraft, an airport that does not '
+        'resolve, a duplicate, a date out of range or out of order, and in '
+        'import mode would_create_draft: a row with no total that would land '
+        'as a draft); info is stored as text. A total_time on a leg with '
+        'planned times is an error, because a total makes the flight '
+        'complete. Row fields not in create_flight: client_ref (identity '
+        'across retries) and aircraft_type (a hint, never stored). Write '
+        'nothing and check the whole batch first, then apply it.',
     inputSchema: JsonSchema.object(properties: {
       'flights': JsonSchema.array(
         items: JsonSchema.object(properties: {}),
@@ -4195,17 +4885,21 @@ Future<void> runServer(String dbPath, {bool readonly = true}) async {
           description: 'Inclusive start of the stated roster range.'),
       'date_to': JsonSchema.string(
           format: 'date', description: 'Inclusive end of the roster range.'),
+      'mode': _importModeSchema,
+      'units': _importUnitsSchema,
     }, required: [
       'flights'
     ]),
     annotations: readOnlyAnnotations,
     callback: (args, extra) async {
       try {
-        _rejectUnknown(args, {'flights', 'date_from', 'date_to'},
+        _rejectUnknown(
+            args, {'flights', 'date_from', 'date_to', 'mode', 'units'},
             tool: 'validate_flight_drafts');
+        final settings = _importSettings(args);
         final range = _rosterRange(args);
-        final rows =
-            _rosterRows(db, args, tool: 'validate_flight_drafts', range: range);
+        final rows = _rosterRows(db, args,
+            tool: 'validate_flight_drafts', range: range, settings: settings);
         return _ok(_rosterReport(rows, range));
       } on _ToolError catch (error) {
         return _failWith(error);
@@ -4281,18 +4975,20 @@ Future<void> runServer(String dbPath, {bool readonly = true}) async {
     server.registerTool(
       'apply_flight_batch',
       description:
-          'Create up to $_rosterRowCap draft flights from a roster in one '
-          'transaction, using create_flight field names per row. Defaults to '
-          'dry_run: true, a preview with the same plan and verdicts and no '
-          'rows written; pass dry_run: false to apply. Every row is validated '
-          'first: by default any row with an error issue (the codes '
-          'validate_flight_drafts reports) writes nothing and the response '
-          'lists it with applied: 0. allow_partial: true writes the clean rows '
-          'and reports the rest. A duplicate in the logbook or the batch is '
-          'skipped, never overwritten, and so is a client_ref an earlier batch '
-          'already imported. Returns batch_id, dry_run, applied, created ids, '
-          'skipped and failed with {index, reason}. A leg with planned times '
-          'lands as a draft with total_time empty.',
+          'Create up to $_rosterRowCap flights from a roster or an import in '
+          'one transaction, using create_flight field names per row. mode and '
+          'units are as on validate_flight_drafts: an import row lands as it '
+          'stands, complete when it carries a total and a draft when it does '
+          'not. Defaults to dry_run: true, a preview with the same plan and '
+          'verdicts and no rows written; pass dry_run: false to apply. Every '
+          'row is validated first: by default any row with an error issue '
+          '(the codes validate_flight_drafts reports) writes nothing and the '
+          'response lists it with applied: 0. allow_partial: true writes the '
+          'clean rows and reports the rest. A duplicate in the logbook or the '
+          'batch is skipped, never overwritten, and so is a client_ref an '
+          'earlier batch already imported. Returns batch_id, dry_run, '
+          'applied, created ids, skipped and failed with {index, reason}. A '
+          'leg with planned times lands as a draft with total_time empty.',
       inputSchema: JsonSchema.object(properties: {
         'dry_run': _dryRunSchema,
         'flights': JsonSchema.array(
@@ -4307,6 +5003,8 @@ Future<void> runServer(String dbPath, {bool readonly = true}) async {
         'batch_id': JsonSchema.string(
             description: 'Optional id for this batch, recorded in the audit '
                 'log. Generated when omitted.'),
+        'mode': _importModeSchema,
+        'units': _importUnitsSchema,
       }, required: [
         'flights'
       ]),
@@ -4323,11 +5021,22 @@ Future<void> runServer(String dbPath, {bool readonly = true}) async {
         };
         return _runWrite(db, auditor, 'apply_flight_batch', effectiveArgs, () {
           _rejectUnknown(
-              args, {'flights', 'dry_run', 'allow_partial', 'batch_id'},
+              args,
+              {
+                'flights',
+                'dry_run',
+                'allow_partial',
+                'batch_id',
+                'mode',
+                'units',
+              },
               tool: 'apply_flight_batch');
+          final settings = _importSettings(args);
           final allowPartial = asBool(args['allow_partial']) ?? false;
           final rows = _rosterRows(db, args,
-              tool: 'apply_flight_batch', range: (from: null, to: null));
+              tool: 'apply_flight_batch',
+              range: (from: null, to: null),
+              settings: settings);
           final imported = _importedClientRefs(dbPath);
 
           final failed = <Map<String, dynamic>>[
@@ -5685,8 +6394,34 @@ Future<void> runServer(String dbPath, {bool readonly = true}) async {
                 'REPORT EVERY ROW THAT DID NOT MAKE IT\n'
                 'Silent partial success is the failure this flow exists to prevent. At the end, list every row that was skipped or failed, with its index, its client_ref if it had one, and the reason. Say how many landed, and name the batch_id.\n\n'
                 'TOOLS AND CODES\n'
-                'validate_flight_drafts writes nothing: flights (up to 500, create_flight field names), date_from, date_to. Every row answers ok, issues of {field, code, message, severity} and warnings; severity error means apply_flight_batch would refuse the row, warning means ask about it, info is stored as text. Codes: unknown_field, invalid_row, invalid_crew_role, invalid_flight_type, invalid_calc_time_mode, aircraft_not_found, crew_not_found, date_missing, date_out_of_range, date_order, aircraft_unmatched, aircraft_ambiguous, aircraft_missing, crew_unmatched, crew_ambiguous, route_unparsable, airport_unresolved, split_mismatch, duplicate_existing, duplicate_batch, scheduled_total_time, planned_times_unsupported.\n'
+                'validate_flight_drafts writes nothing: flights (up to 500, create_flight field names), date_from, date_to, plus mode (roster by default; import checks a logbook file instead, see falcon://import) and units (the file\'s duration convention, used only in import mode). Every row answers ok, issues of {field, code, message, severity} and warnings; severity error means apply_flight_batch would refuse the row, warning means ask about it, info is stored as text. Codes: unknown_field, invalid_row, invalid_crew_role, invalid_flight_type, invalid_calc_time_mode, aircraft_not_found, crew_not_found, date_missing, date_out_of_range, date_order, aircraft_unmatched, aircraft_ambiguous, aircraft_missing, crew_unmatched, crew_ambiguous, route_unparsable, airport_unresolved, split_mismatch, duplicate_existing, duplicate_batch, scheduled_total_time, planned_times_unsupported.\n'
                 'apply_flight_batch (write mode only) takes the same flights plus dry_run (default true: a preview with the same plan), allow_partial (default false: atomic) and batch_id. Per row it accepts client_ref, which makes a retry idempotent, and aircraft_type, a hint that is never stored. It returns batch_id, dry_run, applied, created ids, skipped and failed, each entry {index, reason}. A duplicate in the logbook or the batch is skipped, never overwritten.\n',
+          ),
+        ],
+      );
+    },
+  );
+
+  // The guided logbook import: the mapping contract, the questions that make
+  // it safe, and the columns this build can actually write. The column table
+  // is generated from the live database when the resource is read, so it can
+  // never offer a column the write path would refuse.
+  server.registerResource(
+    'import',
+    'falcon://import',
+    (
+      description:
+          'Importing a logbook file: the questions to ask, the mapping to '
+              'approve, and the flight columns this build can write.',
+      mimeType: 'text/plain'
+    ),
+    (uri, extra) async {
+      return ReadResourceResult(
+        contents: [
+          TextResourceContents(
+            uri: uri.toString(),
+            mimeType: 'text/plain',
+            text: _importResourceText(db),
           ),
         ],
       );
@@ -5801,6 +6536,32 @@ Future<void> runServer(String dbPath, {bool readonly = true}) async {
       'when writes are on. Write drafts only: never a scheduled time into '
       'total_time, never an invented tail, timezone, crew role or airport. '
       'Report every row that was skipped or failed, with its reason.',
+    ),
+  );
+
+  // A logbook file to import: the resource is the contract, this is the entry
+  // point. The mapping and the dry run come before every write.
+  server.registerPrompt(
+    'logbook_import_guide',
+    description:
+        'Import a logbook file into flights: ask, map, preview, then apply.',
+    callback: (args, extra) async => _promptResult(
+      'Read falcon://import and follow it. Read the file the pilot gave you '
+      '(the reading and the OCR are yours; the server only ever sees rows), '
+      'ask the grouped questions with ask_user where the client supports it, '
+      'and declare the duration units once for the whole file.\n'
+      'Show the mapping as "source column -> Falcon column" plus THREE sample '
+      'rows already rendered as Falcon rows, and get an explicit yes before '
+      'anything is written. If the pilot skips the review, keep the dry run; '
+      'never blind-import.\n'
+      'Then call validate_flight_drafts with mode: "import" and the declared '
+      'units, walk the pilot through every issue and warning, and call '
+      'apply_flight_batch with dry_run: false only once the rows are '
+      'confirmed.\n'
+      'Report every row that did not land, with its index, client_ref and '
+      'reason, and name the batch_id. A refused date or unit is reported, '
+      'never guessed, and an unknown column is a question with real options, '
+      'never a silent drop.',
     ),
   );
 
