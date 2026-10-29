@@ -8,8 +8,15 @@ const String serverVersion = '0.5.0';
 /// Schema versions this server can read and write. Every query selects whole
 /// rows and writes only columns it knows about, so additive columns added by
 /// later migrations are tolerated.
+///
+/// v20 (Falcon-Logbook/app#237) only adds nullable columns to `flights`:
+/// `scheduled_departure_utc`, `scheduled_arrival_utc`,
+/// `scheduled_block_minutes` and `schedule_source`. Nothing this server reads
+/// or writes changed shape, so v20 is accepted without further guards. Bump
+/// this ceiling in the same release window as any app schema change, or the
+/// app's next release locks every user out of the server (app#261).
 const int minSchemaVersion = 18;
-const int maxSchemaVersion = 19;
+const int maxSchemaVersion = 20;
 
 /// Candidate application-support directories where the Falcon app may have
 /// written `db_path.conf`, most likely first.
