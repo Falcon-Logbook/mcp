@@ -295,9 +295,11 @@ void main() {
       // `ask_user` 888 B; enum values on entity_totals' type and sort plus its
       // offset argument add 138 B. #12's `data_quality_report` adds 1,421 B.
       // #7's `logbook_overview` adds 640 B. #3's `validate_flight_drafts` adds
-      // 1,460 B, the read half of the roster flow.
-      // The bound is the measurement plus 1,024 B: 21,433 B measured, so
-      // 22,457 B.
+      // 1,460 B, the read half of the roster flow. Slice 3's logbook zone
+      // rewords the three flight reads to say a date comes back as YYYY-MM-DD
+      // rather than a local ISO string, 9 B at 21,442 B measured.
+      // The bound is the measurement plus 1,024 B: 21,442 B measured, so
+      // 22,466 B.
       // The headroom is for wording, not for tools: a new tool or a
       // description that grows materially is hundreds of bytes and trips this,
       // while wording that fixes a sentence does not, so the next author does
@@ -305,8 +307,8 @@ void main() {
       // deliberate act with a new measurement.
       final readOnly =
           bytesOf(jsonEncode((await reader.send('tools/list', {}))['result']));
-      expect(readOnly, lessThanOrEqualTo(22457),
-          reason: 'the read-only catalog costs $readOnly B, against 21,433 B '
+      expect(readOnly, lessThanOrEqualTo(22466),
+          reason: 'the read-only catalog costs $readOnly B, against 21,442 B '
               'measured plus 1,024 B of wording headroom');
 
       // Issue #11 sets 22 KiB here, measured when the two flight write schemas
@@ -325,14 +327,15 @@ void main() {
       // add 3,778 B of argument and description text. #7's `logbook_overview`
       // is a read tool, so it is in this catalog too, at 640 B. #3 adds the
       // roster twice over: `validate_flight_drafts` is in both catalogs at
-      // 1,460 B, and `apply_flight_batch` adds 1,685 B of its own. Same rule
-      // as above: measured plus 1,024 B, so wording has room and a tool does
-      // not.
+      // 1,460 B, and `apply_flight_batch` adds 1,685 B of its own. Slice 3's
+      // flight read rewording adds the same 9 B as in the read-only catalog,
+      // at 45,860 B measured. Same rule as above: measured plus 1,024 B, so
+      // wording has room and a tool does not.
       final writeMode =
           bytesOf(jsonEncode((await writer.send('tools/list', {}))['result']));
-      expect(writeMode, lessThanOrEqualTo(46875),
+      expect(writeMode, lessThanOrEqualTo(46884),
           reason: 'the write-mode catalog costs $writeMode B, against '
-              '45,851 B measured plus 1,024 B of wording headroom');
+              '45,860 B measured plus 1,024 B of wording headroom');
     });
   });
 

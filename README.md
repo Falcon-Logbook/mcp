@@ -171,6 +171,17 @@ default. A configured path that no longer exists is ignored. Transport is stdio;
 plain Dart console program, no Flutter. Tests run with `dart test` against a temporary database, so
 your own logbook stays untouched.
 
+### The logbook time zone (`FALCON_TZ`)
+
+Flight dates are stored as the local midnight the Falcon app wrote in the time zone its device ran
+in, so the server needs to know that zone to answer with the pilot's `YYYY-MM-DD` dates and day
+windows. Set `FALCON_TZ` to it, as an IANA name such as `Australia/Sydney`, and every calendar date
+(flight dates, date filters, expiry day counts, currency windows) is computed in that zone no matter
+what zone the server itself runs in. When `FALCON_TZ` is unset the system zone applies, exactly the
+behaviour the server had before the variable existed. An invalid IANA name stops the server at
+startup, with the error on stderr and a non-zero exit, instead of silently falling back to another
+zone and shifting every date.
+
 Flight reads are shaped for context cost. `list_flights`, `search_flights`, `find_missing_times` and
 the `falcon://flights` resource return a twelve-field summary per flight (id, date, route, flight
 number, registration, crew name, total/day/night minutes, takeoffs, landings, simulator flag); add

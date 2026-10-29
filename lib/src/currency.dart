@@ -2,6 +2,7 @@ import 'dart:math';
 
 import 'db.dart';
 import 'util.dart';
+import 'zone.dart';
 
 /// The app's `CurrencyMetric` enum, in enum order.
 const List<String> currencyMetrics = [
@@ -53,31 +54,36 @@ const Map<String, String> currencyMetricLabels = {
   'flightCount': 'flights',
 };
 
-/// The period bounds `currency_dao.dart:218-238` uses, local calendar
-/// arithmetic and no UTC. An unknown period falls back to all time, the same as
-/// the app's `switch` default.
+/// The period bounds `currency_dao.dart:218-238` uses: calendar arithmetic in
+/// the logbook zone, never the server's own zone. An unknown period falls back
+/// to all time, the same as the app's `switch` default.
 ///
 /// [start] is inclusive and [end] is exclusive.
-({DateTime start, DateTime end}) currencyBounds(String period, DateTime now) =>
-    switch (period) {
-      'calendarYear' => (
-          start: DateTime(now.year),
-          end: DateTime(now.year + 1),
-        ),
-      'rolling365' => (
-          start: DateTime(now.year, now.month, now.day - 364),
-          end: DateTime(now.year, now.month, now.day + 1),
-        ),
-      'calendarMonth' => (
-          start: DateTime(now.year, now.month),
-          end: DateTime(now.year, now.month + 1),
-        ),
-      'rolling30' => (
-          start: DateTime(now.year, now.month, now.day - 29),
-          end: DateTime(now.year, now.month, now.day + 1),
-        ),
-      _ => (start: DateTime(0), end: DateTime(9999)),
-    };
+({DateTime start, DateTime end}) currencyBounds(String period, DateTime now) {
+  final today = logbookDateOf(now);
+  return switch (period) {
+    'calendarYear' => (
+        start: logbookDateAt(today.year, 1, 1),
+        end: logbookDateAt(today.year + 1, 1, 1),
+      ),
+    'rolling365' => (
+        start: logbookDateAt(today.year, today.month, today.day - 364),
+        end: logbookDateAt(today.year, today.month, today.day + 1),
+      ),
+    'calendarMonth' => (
+        start: logbookDateAt(today.year, today.month, 1),
+        end: logbookDateAt(today.year, today.month + 1, 1),
+      ),
+    'rolling30' => (
+        start: logbookDateAt(today.year, today.month, today.day - 29),
+        end: logbookDateAt(today.year, today.month, today.day + 1),
+      ),
+    _ => (
+        start: logbookDateAt(0, 1, 1),
+        end: logbookDateAt(9999, 1, 1),
+      ),
+  };
+}
 
 /// One aggregate per metric, mirroring `_batchAggregates` (`currency_dao.dart`
 /// 145-199). This map is the allowlist: a metric name never reaches SQL any
@@ -136,16 +142,16 @@ int currencyRawTotal(
 double currencyValue(int raw, String metric) =>
     isCurrencyTimeMetric(metric) ? raw / 60.0 : raw.toDouble();
 
-/// The inclusive local dates the numbers were summed over, or null for all
-/// time, which has no bound. The SQL upper bound is exclusive, so the echoed
-/// `to` is the last included day.
+/// The inclusive logbook-zone dates the numbers were summed over, or null for
+/// all time, which has no bound. The SQL upper bound is exclusive, so the
+/// echoed `to` is the last included day.
 Map<String, dynamic>? currencyWindow(String period, DateTime now) {
   if (!currencyPeriods.contains(period) || period == 'allTime') return null;
   final bounds = currencyBounds(period, now);
   return {
     'from': formatCalendarDate(bounds.start),
     'to': formatCalendarDate(
-        DateTime(bounds.end.year, bounds.end.month, bounds.end.day - 1)),
+        logbookDateAt(bounds.end.year, bounds.end.month, bounds.end.day - 1)),
   };
 }
 

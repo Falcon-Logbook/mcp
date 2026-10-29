@@ -1,5 +1,6 @@
 import 'db.dart';
 import 'util.dart';
+import 'zone.dart';
 
 /// Fallbacks when `expiry_settings` has no row, matching
 /// `AppConstants.expiryGreenThreshold` and `expiryOrangeThreshold`. The app
@@ -8,15 +9,18 @@ import 'util.dart';
 const int defaultExpiryGreen = 90;
 const int defaultExpiryOrange = 30;
 
-/// Whole days from [today] to [dueDate], ignoring the time of day.
+/// Whole calendar days from [today] to [dueDate], ignoring the time of day.
 ///
-/// Both sides go through local midnight and are subtracted the way
-/// `expiry_status.dart` does it, so a due date tomorrow is 1, today is 0 and
-/// yesterday is -1. A stored `due_date` is not necessarily midnight: the app's
-/// add dialog seeds it with `DateTime.now().add(365 days)`.
+/// Both sides are reduced to their calendar date in the logbook zone, then
+/// subtracted as dates: a due date tomorrow is 1, today is 0 and yesterday is
+/// -1, and a DST change cannot turn a 30-day window into 29 days and 23 hours.
+/// A stored `due_date` is not necessarily midnight: the app's add dialog seeds
+/// it with `DateTime.now().add(365 days)`.
 int daysUntilDue(DateTime dueDate, DateTime today) {
-  return DateTime(dueDate.year, dueDate.month, dueDate.day)
-      .difference(DateTime(today.year, today.month, today.day))
+  final due = logbookDateOf(dueDate);
+  final now = logbookDateOf(today);
+  return DateTime.utc(due.year, due.month, due.day)
+      .difference(DateTime.utc(now.year, now.month, now.day))
       .inDays;
 }
 

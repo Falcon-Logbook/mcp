@@ -11,6 +11,7 @@ import 'expiry.dart';
 import 'route.dart';
 import 'totals.dart';
 import 'util.dart';
+import 'zone.dart';
 
 // ============================================================
 // Field metadata
@@ -242,11 +243,12 @@ const Map<String, String> _hoursAliases = {
 
 /// Every response that carries a time or date field states its units here,
 /// once per response rather than per row. `date` describes what a read
-/// serialises, which is the local ISO-8601 string [epochToIso] renders, not the
-/// epoch integer the column stores.
+/// serialises: the `YYYY-MM-DD` calendar date [epochToCalendarDate] renders in
+/// the logbook zone, not the epoch integer the column stores. Timestamps come
+/// back as ISO-8601 with an explicit offset ([epochToIso]).
 const Map<String, String> _units = {
   'time': 'minutes',
-  'date': 'iso8601_local',
+  'date': 'calendar_date',
 };
 
 /// The columns a flight summary carries: what was flown, when, in what, with
@@ -723,7 +725,8 @@ _DateWindow _flightDateFilter(Map<String, dynamic> args,
     params.add(epochForDayStart(from));
   }
   if (to != null) {
-    // Half open: local midnight of the day after the last requested day.
+    // Half open: logbook-zone midnight of the day after the last requested
+    // day.
     where.add('date < ?');
     params.add(epochForDayAfter(to));
   }
@@ -1032,14 +1035,20 @@ String _candidatesText(List<Map<String, dynamic>> candidates) {
   return '${shown.join('; ')}${rest > 0 ? '; and $rest more' : ''}';
 }
 
-/// A `*_date` column's value as a local [DateTime]. [FalconDb] renders an epoch
-/// `*_date` column as a local ISO string, so that is what a read sees; an
-/// integer is accepted too, for a query that bypasses the mapper.
-DateTime? _localDate(Object? value) => switch (value) {
-      int() => DateTime.fromMillisecondsSinceEpoch(value * 1000),
-      String() => DateTime.tryParse(value)?.toLocal(),
-      _ => null,
-    };
+/// A `*_date` column's value as the calendar date in the logbook zone.
+/// [FalconDb] renders an epoch `*_date` column as `YYYY-MM-DD`, so that is
+/// what a read sees. An integer is accepted too, for a query that bypasses the
+/// mapper, and a wider timestamp is converted as an instant: its date in the
+/// logbook zone, never the fields the host zone happens to parse it into.
+DateTime? _localDate(Object? value) {
+  if (value is int) return logbookDateFromEpoch(value);
+  if (value is! String) return null;
+  final calendar = parseCalendarDate(value);
+  if (calendar != null) return calendar;
+  final parsed = DateTime.tryParse(value);
+  if (parsed == null) return null;
+  return logbookDateFromEpoch(parsed.millisecondsSinceEpoch ~/ 1000);
+}
 
 /// Display registration the app would show: the one rule [displayRegistration]
 /// writes, kept as a non-null wrapper for the matcher, which has already
@@ -1047,12 +1056,9 @@ DateTime? _localDate(Object? value) => switch (value) {
 String _displayRegistration(String? countryCode, String registration) =>
     displayRegistration(countryCode, registration) ?? registration;
 
-/// Today's local midnight as the epoch seconds a `date` column stores, so
-/// "future" in a report means after today, not after this second.
-int _todayLocalMidnightEpoch() {
-  final now = DateTime.now();
-  return DateTime(now.year, now.month, now.day).millisecondsSinceEpoch ~/ 1000;
-}
+/// Today's logbook-zone midnight as the epoch seconds a `date` column stores,
+/// so "future" in a report means after today, not after this second.
+int _todayLocalMidnightEpoch() => epochForDayStart(nowInLogbookZone());
 
 /// The pilot's own registration country from `flights_settings`, or null. The
 /// aircraft link prefers it when one bare registration exists under two
@@ -1809,7 +1815,7 @@ List<_RosterRow> _rosterRows(
           field: 'date');
       continue;
     }
-    final day = DateTime.fromMillisecondsSinceEpoch(date * 1000);
+    final day = logbookDateFromEpoch(date);
     if (range.from != null && day.isBefore(range.from!)) {
       row.add(
         'date_out_of_range',
@@ -2037,7 +2043,7 @@ Map<String, dynamic>? _flightRow(FalconDb db, String id) {
 /// app computes it on save (`_nextDayOrderForDate`): the highest local order on
 /// that day plus one, or 0 for the first flight of the day.
 int _nextDayOrder(FalconDb db, int date) {
-  final day = DateTime.fromMillisecondsSinceEpoch(date * 1000);
+  final day = logbookDateFromEpoch(date);
   final where = <String>['date >= ?', 'date < ?'];
   final owner = _ownerClause(db, 'flights', includeShared: false);
   if (owner.isNotEmpty) where.add(owner);
@@ -2050,9 +2056,10 @@ int _nextDayOrder(FalconDb db, int date) {
 }
 
 /// Whether [date] is still the local day [storedDate] represents. [storedDate]
-/// is the `date` column as the row mapper renders it, local ISO text.
+/// is the `date` column as the row mapper renders it, the `YYYY-MM-DD`
+/// calendar date in the logbook zone.
 bool _sameLocalDay(Object? storedDate, int date) =>
-    storedDate == epochToIso(date);
+    storedDate == epochToCalendarDate(date);
 
 /// Records a sync tombstone so a deleted row is not resurrected by Postgres
 /// sync, mirroring the app's `recordDeletion`. No-op when no provider has
@@ -2310,7 +2317,7 @@ Map<String, dynamic> _logbookOverview(
   // The last [days] days, over the calendar arithmetic the date presets use (a
   // last-N-days window is today plus the N-1 days before it) and the same
   // aggregate `logbook_stats` reports, so the two numbers agree.
-  final from = DateTime(now.year, now.month, now.day - (days - 1));
+  final from = logbookDateAt(now.year, now.month, now.day - (days - 1));
   final window = _flightDateFilter(
     {'date_from': formatCalendarDate(from), 'date_to': formatCalendarDate(now)},
     now: now,
@@ -2396,12 +2403,16 @@ Map<String, dynamic>? _recentActivity(FalconDb db, DateTime now) {
       '${owner.isEmpty ? '' : ' WHERE $owner'}');
   final epoch = rows.isEmpty ? null : asInt(rows.first['last']);
   if (epoch == null) return null;
-  final last = DateTime.fromMillisecondsSinceEpoch(epoch * 1000);
+  final last = logbookDateFromEpoch(epoch);
+  // Whole calendar days from the flight's date to today, computed in the
+  // logbook zone like the expiry counts, so a host in another zone cannot add
+  // or lose a day.
+  final days = DateTime.utc(now.year, now.month, now.day)
+      .difference(DateTime.utc(last.year, last.month, last.day))
+      .inDays;
   return {
     'last_flight_date': formatCalendarDate(last),
-    'days_since_last_flight': DateTime(now.year, now.month, now.day)
-        .difference(DateTime(last.year, last.month, last.day))
-        .inDays,
+    'days_since_last_flight': days,
   };
 }
 
@@ -2843,8 +2854,9 @@ Future<void> runServer(String dbPath, {bool readonly = true}) async {
     'list_flights',
     description:
         'List flights, newest first (date, then day_order, then id). Times are '
-        'minutes and dates come back as local ISO-8601 strings; filters take '
-        'YYYY-MM-DD. Returns count (rows on this page), total (all matching '
+        'minutes and dates come back as YYYY-MM-DD calendar dates; filters '
+        'take YYYY-MM-DD. Returns count (rows on this page), total (all '
+        'matching '
         'rows), has_more, offset and the applied range. Each flight is a '
         'twelve-field summary unless full is true. Local rows only unless '
         'include_shared is true.',
@@ -2869,7 +2881,7 @@ Future<void> runServer(String dbPath, {bool readonly = true}) async {
         final offset = asInt(args['offset']) ?? 0;
         if (offset < 0) return _fail('offset must be >= 0', field: 'offset');
         final full = asBool(args['full']) ?? false;
-        final window = _flightDateFilter(args, now: DateTime.now());
+        final window = _flightDateFilter(args, now: nowInLogbookZone());
         final narrowing = _flightNarrowing(db, args);
         final where = [...window.where, ...narrowing.where];
         final params = [...window.params, ...narrowing.params];
@@ -2904,7 +2916,8 @@ Future<void> runServer(String dbPath, {bool readonly = true}) async {
     'get_flight',
     description:
         'Get a single flight by id, with every column. Times are minutes and '
-        'dates come back as local ISO-8601 strings. This is the detail call: '
+        'dates come back as YYYY-MM-DD calendar dates. This is the detail '
+        'call: '
         'use it when a summary row does not answer the question. Local rows '
         'only unless include_shared is true.',
     inputSchema: JsonSchema.object(properties: {
@@ -2943,8 +2956,9 @@ Future<void> runServer(String dbPath, {bool readonly = true}) async {
     'search_flights',
     description:
         'Search flights by free text (route, flight number, crew name, '
-        'registration). Times are minutes and dates come back as local ISO-8601 '
-        'strings; filters take YYYY-MM-DD. Returns count (rows on this page), '
+        'registration). Times are minutes and dates come back as YYYY-MM-DD '
+        'calendar dates; filters take YYYY-MM-DD. Returns count (rows on this '
+        'page), '
         'total (all matching rows), has_more, offset and the applied range. '
         'Ordered newest first (date, then day_order, then id). Each flight is '
         'a twelve-field summary unless full is true. Local rows only unless '
@@ -2978,7 +2992,7 @@ Future<void> runServer(String dbPath, {bool readonly = true}) async {
         if (offset < 0) return _fail('offset must be >= 0', field: 'offset');
         final full = asBool(args['full']) ?? false;
         final like = '%${escapeLike(text)}%';
-        final window = _flightDateFilter(args, now: DateTime.now());
+        final window = _flightDateFilter(args, now: nowInLogbookZone());
         final narrowing = _flightNarrowing(db, args);
         final where = <String>[
           "(route LIKE ? ESCAPE '\\' OR flight_number LIKE ? ESCAPE '\\' "
@@ -3325,7 +3339,7 @@ Future<void> runServer(String dbPath, {bool readonly = true}) async {
         if (limit < 1) return _fail('limit must be >= 1', field: 'limit');
 
         final thresholds = readExpiryThresholds(db);
-        final today = DateTime.now();
+        final today = nowInLogbookZone();
         final owner = _ownerClause(db, 'expiries',
             includeShared: asBool(args[_includeSharedKey]) ?? false);
         // The app sorts on due date alone; the id tiebreak keeps two documents
@@ -3398,7 +3412,7 @@ Future<void> runServer(String dbPath, {bool readonly = true}) async {
         _rejectUnknown(args, {..._flightFilterKeys, 'include_simulator'},
             tool: 'logbook_stats');
         final includeSimulator = asBool(args['include_simulator']) ?? true;
-        final window = _flightDateFilter(args, now: DateTime.now());
+        final window = _flightDateFilter(args, now: nowInLogbookZone());
         final where = [
           ...window.where,
           if (!includeSimulator) 'is_simulator = 0',
@@ -3461,7 +3475,7 @@ Future<void> runServer(String dbPath, {bool readonly = true}) async {
         final days = asInt(args['days']) ?? 90;
         if (days < 1) return _fail('days must be >= 1', field: 'days');
         return _ok(_logbookOverview(db,
-            days: days, readonly: readonly, now: DateTime.now()));
+            days: days, readonly: readonly, now: nowInLogbookZone()));
       } on _ToolError catch (error) {
         return _failWith(error);
       } catch (error) {
@@ -3633,7 +3647,7 @@ Future<void> runServer(String dbPath, {bool readonly = true}) async {
               field: 'period');
         }
 
-        final now = DateTime.now();
+        final now = nowInLogbookZone();
         // No owner filter and no is_active filter: the app reads every row
         // (`currency_dao.dart:14-20, 74`) and renders them in table order.
         final rows = db.query(
@@ -5595,7 +5609,7 @@ Future<void> runServer(String dbPath, {bool readonly = true}) async {
             uri: uri.toString(),
             mimeType: 'text/plain',
             text: 'FALCON DB CONVENTIONS\n\n'
-                '- Dates and timestamps are stored as unix epoch seconds and returned as local ISO-8601 strings, for example 2026-10-27T00:00:00.000. The flights.date column holds local midnight of the flight date; tool inputs accept YYYY-MM-DD and are converted the same way.\n'
+                '- Dates are calendar dates: stored as unix epoch seconds of the logbook zone\'s local midnight, returned as YYYY-MM-DD. Timestamps are stored as unix epoch seconds and returned as ISO-8601 with an explicit offset, for example 2026-10-27T00:00:00.000+1100. The logbook time zone is the zone the Falcon app wrote local midnights in, declared by the FALCON_TZ environment variable (an IANA name such as Australia/Sydney); when FALCON_TZ is unset the server\'s system zone applies. The flights.date column holds logbook-zone midnight of the flight date; tool inputs accept YYYY-MM-DD and are converted the same way. Calendar dates, filtered windows and counts are identical whatever zone the server itself runs in.\n'
                 '- Read filters accept only YYYY-MM-DD (or a named period) and reject anything else instead of ignoring it. Every filtered response echoes the applied window as range {from, to}.\n'
                 '- Flight time columns (total_time, day_time, night_time, actual_instrument, simulated_instrument, ground_instrument, icus_day_time, icus_night_time) are integer MINUTES. Responses state this in a units object. Write tools also accept an _hours form of any of them, for example total_time_hours or icus_night_time_hours.\n'
                 '- Flight time is capped at 525600 minutes (8760 hours) and takeoff/landing counts at 10000, the same limits the app enforces. A value outside either is refused, and the error names the limit.\n'
@@ -5616,7 +5630,7 @@ Future<void> runServer(String dbPath, {bool readonly = true}) async {
                 '- logbook_country is "AU", "NZ", or null.\n'
                 '- total_time is the authoritative flight duration; takeoffs/landings are counts per flight row.\n'
                 '- is_simulator and is_ifr are stored as 0/1 and rendered as true or false, as are archived and the aircraft flags (multi_engine, ifr, complex, pressurised, tailwheel, simulator, helicopter, float_plane).\n'
-                '- Expiry status is computed at read time, never stored: whole local days from today to due_date, below the orange threshold is red (which includes today and every overdue day), below the green threshold is orange, green above it. Thresholds come from expiry_settings (a local row first, then the newest), or 90 and 30 days when that table has no row. list_expiries includes overdue rows by default.\n'
+                '- Expiry status is computed at read time, never stored: whole calendar days from today to due_date in the logbook zone, below the orange threshold is red (which includes today and every overdue day), below the green threshold is orange, green above it. Thresholds come from expiry_settings (a local row first, then the newest), or 90 and 30 days when that table has no row. list_expiries includes overdue rows by default.\n'
                 '- Currency thresholds are HOURS for the four time metrics, because the app divides those values by 60, and counts for the other four. is_exceeded means the rule needs attention: for a requirement that is being below the threshold, for a limit it is reaching it. currency_status reproduces the app\'s currency page, which applies no owner filter and counts drafts as flights, so its numbers can mix owners on a synced logbook.\n'
                 '- entity_totals.flights_complete counts COMPLETE flights, because it counts the rows its minutes come from; logbook_stats.flights counts every row including drafts, and its flights_complete is the same number. Aircraft and type group on flights.aircraft_id and crew groups on flights.crew_member_id, so a flight that only carries registration text is in the registration group alone. It pages with limit, offset, count, total and has_more like the flight lists, and the registration it reports for an aircraft is the app\'s display form (country code and tail joined, without doubling a tail that already carries the code).\n'
                 '- get_settings reads one allowlisted single-row settings table at a time (aircraft_settings, app_settings, crew_settings, expiry_settings, flights_settings, general_settings, routes_settings, sidebar_settings) and returns {} when the app has never written that row, which means the app defaults apply; it never creates the row. aircraft_type_settings is keyed by type, not a singleton, and is not readable here.\n'
@@ -5627,7 +5641,7 @@ Future<void> runServer(String dbPath, {bool readonly = true}) async {
                 '- Every write tool accepts dry_run: true: it resolves, validates and answers exactly as the write would (the row as written, computed ids, warnings), marks the response dry_run: true, and commits nothing. A preview error is the write error, so a clean preview means the write will apply; an id a preview generated is not reserved, so pass your own or let the real call make one.\n'
                 '- data_quality_report is one read-only call over every defect class an imported logbook can have: drafts, missing or mismatched splits, absurd totals, unlinked aircraft and crew, duplicate crew and flights, unparsable routes, future dates, dangling route links, simulator oddities, orphaned registration text. Each class carries a stable id, a count and a sample of up to 4 rows; a count is the finding, not the full list.\n'
                 '- The repair tools merge_crew, link_flights_to_aircraft and link_flights_to_crew default to dry_run: true and say so on the response; pass dry_run: false to apply the same diff. They run in one transaction, stamp updated_at, tombstone deletions so sync propagates them, never create rows beyond the operation named, and never delete flights: duplicate flights are reported for a human to decide.\n'
-                '- Planned times (scheduled_departure_utc, scheduled_arrival_utc, scheduled_block_minutes) come with Falcon-Logbook/app#231 and schema 20. The two instants are unix epoch seconds UTC and render as local ISO strings; the block is integer minutes. They exist only on a migrated database, so a write naming them on an older file is refused by name rather than silently dropped. A leg with planned times stays a draft: total_time empty, the block kept as the plan.\n'
+                '- Planned times (scheduled_departure_utc, scheduled_arrival_utc, scheduled_block_minutes) come with Falcon-Logbook/app#231 and schema 20. The two instants are unix epoch seconds UTC and render as ISO-8601 with an explicit offset; the block is integer minutes. They exist only on a migrated database, so a write naming them on an older file is refused by name rather than silently dropped. A leg with planned times stays a draft: total_time empty, the block kept as the plan.\n'
                 '- validate_flight_drafts and apply_flight_batch take a roster as flights, an array of objects using create_flight field names, up to 500 rows. Each row also accepts client_ref (an identity for retries) and aircraft_type (a hint, never stored). validate writes nothing and answers per row with ok, issues of {field, code, message, severity} and warnings; severity error is a row apply refuses. apply is atomic by default (one bad row writes nothing, applied: 0), allows partial with allow_partial: true, skips a duplicate or an already imported client_ref instead of overwriting, records one audit entry per batch with batch_id and the created ids, and previews with dry_run: true (its default). A roster leg is written as a draft through the same row builder as create_flight, so updated_at and sync behave the same.\n'
                 '- A failed call returns {error, field, detail}: error is a stable code (unknown_field, invalid_value, not_found, conflict, constraint, busy, internal), field is the argument at fault, and unknown_field also names the tool. detail is one sentence, and the accepted list is capped at eight names plus a count. A conflict adds current, the row as it stands now.',
           ),

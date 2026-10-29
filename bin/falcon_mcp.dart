@@ -33,6 +33,16 @@ Future<void> main(List<String> args) async {
     if (fromEnv != null) readonly = fromEnv;
   }
 
+  // The logbook zone decides every calendar date, so a FALCON_TZ the IANA
+  // database does not know stops the server here rather than shifting every
+  // date silently. stdout stays clean for MCP; the error goes to stderr.
+  try {
+    configureLogbookZoneFromEnvironment();
+  } on LogbookZoneException catch (error) {
+    stderr.writeln('falcon_mcp: $error');
+    exit(1);
+  }
+
   final dbPath = resolveDbPath(override: result['db'] as String?);
   // stdout is the MCP channel; diagnostics go to stderr only.
   stderr.writeln(
