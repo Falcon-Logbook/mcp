@@ -401,12 +401,16 @@ void main() {
     // `data_quality_report` adds 1,421 B and #7's `logbook_overview` 640 B.
     // #3's `validate_flight_drafts` adds 1,460 B. Slice 3's timezone reword
     // of the three flight read descriptions adds 9 B, measured at 21,442 B.
+    // #4's guided logbook import adds `mode` and `units` to
+    // `validate_flight_drafts` and rewords its description, 1,224 B at 22,666
+    // B measured (the same measurement and bound as catalog_cost_test, where
+    // the write-mode catalog is measured too).
     // The bound is the measurement plus 1,024 B of headroom, which leaves
     // room to reword a description but trips on a new tool or a description
-    // that grows materially.
-    expect(readOnlyCatalog, lessThanOrEqualTo(22466),
+    // that grows materially: 22,666 B measured, so 23,690 B.
+    expect(readOnlyCatalog, lessThanOrEqualTo(23690),
         reason: 'the read-only catalog costs $readOnlyCatalog B, against '
-            '21,442 B measured plus 1,024 B of wording headroom');
+            '22,666 B measured plus 1,024 B of wording headroom');
 
     final typo = await bytesOf(server, 'list_flights', {'limt': 5});
     expect(typo, lessThan(400), reason: 'a typo error costs $typo B');

@@ -297,9 +297,12 @@ void main() {
       // #7's `logbook_overview` adds 640 B. #3's `validate_flight_drafts` adds
       // 1,460 B, the read half of the roster flow. Slice 3's logbook zone
       // rewords the three flight reads to say a date comes back as YYYY-MM-DD
-      // rather than a local ISO string, 9 B at 21,442 B measured.
-      // The bound is the measurement plus 1,024 B: 21,442 B measured, so
-      // 22,466 B.
+      // rather than a local ISO string, 9 B at 21,442 B measured. #4's guided
+      // logbook import adds `mode` and `units` to `validate_flight_drafts`
+      // (name, enum values and one line each) and rewords its description to
+      // describe the strict import rules, 1,224 B at 22,666 B measured.
+      // The bound is the measurement plus 1,024 B: 22,666 B measured, so
+      // 23,690 B.
       // The headroom is for wording, not for tools: a new tool or a
       // description that grows materially is hundreds of bytes and trips this,
       // while wording that fixes a sentence does not, so the next author does
@@ -307,8 +310,8 @@ void main() {
       // deliberate act with a new measurement.
       final readOnly =
           bytesOf(jsonEncode((await reader.send('tools/list', {}))['result']));
-      expect(readOnly, lessThanOrEqualTo(22466),
-          reason: 'the read-only catalog costs $readOnly B, against 21,442 B '
+      expect(readOnly, lessThanOrEqualTo(23690),
+          reason: 'the read-only catalog costs $readOnly B, against 22,666 B '
               'measured plus 1,024 B of wording headroom');
 
       // Issue #11 sets 22 KiB here, measured when the two flight write schemas
@@ -329,13 +332,17 @@ void main() {
       // roster twice over: `validate_flight_drafts` is in both catalogs at
       // 1,460 B, and `apply_flight_batch` adds 1,685 B of its own. Slice 3's
       // flight read rewording adds the same 9 B as in the read-only catalog,
-      // at 45,860 B measured. Same rule as above: measured plus 1,024 B, so
-      // wording has room and a tool does not.
+      // at 45,860 B measured. #4's guided logbook import adds `mode` and
+      // `units` to both roster tools: `validate_flight_drafts` carries its
+      // 1,224 B here too, and `apply_flight_batch` grows 796 B with the same
+      // two arguments and its reworded description, at 47,880 B measured.
+      // Same rule as above: measured plus 1,024 B, so wording has room and a
+      // tool does not: 47,880 B measured, so 48,904 B.
       final writeMode =
           bytesOf(jsonEncode((await writer.send('tools/list', {}))['result']));
-      expect(writeMode, lessThanOrEqualTo(46884),
+      expect(writeMode, lessThanOrEqualTo(48904),
           reason: 'the write-mode catalog costs $writeMode B, against '
-              '45,860 B measured plus 1,024 B of wording headroom');
+              '47,880 B measured plus 1,024 B of wording headroom');
     });
   });
 
@@ -466,6 +473,10 @@ void main() {
       // The accepted list is capped: eight names then a count, so the envelope
       // stays inside the budget the issue sets. The count grew with #3's three
       // planned-time columns and their hours alias: 47 names, 39 left out.
+      // #4 checked this deliberately: its `mode` and `units` arguments are
+      // declared on validate_flight_drafts and apply_flight_batch and never
+      // reach _flightValues' accepted set, which is what this envelope lists,
+      // so update_flight still accepts 47 and the count stands.
       final detail = envelope['detail'] as String;
       expect(detail, contains('and 39 more'),
           reason: 'update_flight accepts 47 arguments; eight are named');

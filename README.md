@@ -79,6 +79,31 @@ roster".
 
 ---
 
+## Importing a logbook
+
+Point it at an export from your last app, a scanned or digital paper logbook, or a pasted table, and
+say "import my logbook". Your client reads the file (including the OCR); the server validates the
+mapped rows and writes them.
+
+- **The mapping is shown and confirmed first.** Every source column mapped to a Falcon column, plus
+  three sample rows rendered as they would land, and an explicit yes from you before anything is
+  written. Skip the review and it still keeps the dry run: it never blind-imports a file.
+- **Units are declared once.** Whole minutes, decimal hours, or H:MM, for the whole file. A cell that
+  does not match the declared convention is refused, never guessed: mixed units in one column are an
+  error, not a conversion.
+- **Dates are strict YYYY-MM-DD.** A spreadsheet serial number is refused with the date it shows, and
+  a slash or timestamp date with its probable reading (both readings when it is ambiguous). None of
+  them is ever converted for you, because a wrong reading moves a flight between months and years.
+- **Unknown columns are surfaced, never dropped.** A column Falcon has no home for is reported with
+  the real columns that could hold it (instructing time, block time, remarks), and you decide where
+  it goes.
+- **Writes are atomic.** One transaction for the batch: one bad row writes nothing unless `allow_partial`
+  opts in, and then every row that did not land is named with its reason and the batch id.
+- **Imported rows are ordinary flights afterwards.** They carry `updated_at` like anything you typed
+  in, appear in the app, and push to Postgres on the next sync.
+
+---
+
 ## How it stays yours
 
 - **Read-only by default.** Writes happen only when you turn them on, with `--no-readonly` or
