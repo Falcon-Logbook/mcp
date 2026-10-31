@@ -82,9 +82,25 @@ class AskStateStore {
   final Map<String, _PendingAsk> _pending = {};
   final Random _random = Random.secure();
 
+  List<Question>? _flow;
+
+  /// The questions of the flow the client was last handed, if any.
+  ///
+  /// A token is not always echoed back: a client with no form answers with the
+  /// answers alone, which leaves the server with no other record of what it
+  /// asked. The required questions of [flow] are what such a call is judged
+  /// against, so one flow is kept for the life of the process and replaced by
+  /// the next ask.
+  List<Question>? get flow => _flow;
+
+  /// Records [questions] as the flow a later call may answer without resending
+  /// them.
+  void recordFlow(List<Question> questions) => _flow = questions;
+
   /// Remembers [questions] and returns the token that resumes them.
   String remember(List<Question> questions) {
     _forgetExpired();
+    recordFlow(questions);
     final token = _newToken();
     _pending[token] = _PendingAsk(
       signature: _signatureOf(questions),
@@ -155,8 +171,9 @@ String _signatureOf(List<Question> questions) => [
 ///
 /// `questions` is required to start an exchange and to answer one through
 /// [inputResponses]. A completion call may leave them out and send `answers`
-/// alone: the ids are then checked against the catalogue, which is what a
-/// client with no form is looking at anyway.
+/// alone: the ids are then checked against the catalogue, and the required
+/// questions of the flow the server last asked ([AskStateStore.flow]) must be
+/// answered, because a client that simply omits one never sends it.
 ///
 /// [canElicit] is decided by the caller from the capabilities the client
 /// declared, because the server raises the missing-capability error after the
@@ -204,7 +221,8 @@ Future<BaseResultData> askUser(
     if (action == ElicitAction.cancel) return _status('cancelled');
     // Questions are optional here. An agent that echoes them is checked
     // against exactly those, defaults included; one that sends answers alone is
-    // checked against the catalogue.
+    // checked against the flow the server last asked, because a required
+    // question the client leaves out never appears in the answers.
     final questions = args.containsKey('questions')
         ? parseQuestions(args['questions'])
         : null;
@@ -212,12 +230,16 @@ Future<BaseResultData> askUser(
       _refuse('answers',
           'accepting needs answers: one value per question id, or decline');
     }
-    return _answered(
-        readAnswers(answers ?? const <String, Object?>{}, questions));
+    final content = answers ?? const <Object?, Object?>{};
+    if (questions == null) _requireFlowAnswers(content, state);
+    return _answered(readAnswers(content, questions));
   }
 
   final questions = parseQuestions(args['questions']);
-  if (!canElicit) return needsInput(questions);
+  if (!canElicit) {
+    state.recordFlow(questions);
+    return needsInput(questions);
+  }
   final request = elicitRequest(questions);
   if (stateless) {
     return InputRequiredResult(
@@ -310,7 +332,10 @@ typedef AnswerSet = ({Map<String, Object?> answers, List<String> defaulted});
 /// [questions] may be null, which is a call that answers without resending them.
 /// The ids are then checked against [AskQuestions.byId] and each value against
 /// the type the catalogue gives it. A default is never filled on that path: the
-/// server cannot tell which of the optional questions were asked.
+/// server cannot tell which of the optional questions were asked. Which
+/// required questions must be present is decided by [askUser] from the flow it
+/// last asked, because the catalogue alone would demand every required question
+/// in it, including the ones no flow asked.
 AnswerSet readAnswers(
   Map<dynamic, dynamic> content,
   List<Question>? questions,
@@ -348,6 +373,20 @@ AnswerSet readAnswers(
     answers[question.id] = _checkAnswer(question, value);
   }
   return (answers: answers, defaulted: defaulted);
+}
+
+/// Refuses [content] when it leaves out a required question of [state]'s flow.
+///
+/// Only the required entries of the flow the server last asked are enforced:
+/// an optional question may be left out, and a required question of a flow that
+/// was never asked is not required here. The refusal is the one [readAnswers]
+/// raises when the questions are resent, so the two paths agree.
+void _requireFlowAnswers(Map<Object?, Object?> content, AskStateStore state) {
+  for (final question in state.flow ?? const <Question>[]) {
+    if (!question.required || content[question.id] != null) continue;
+    _refuse('answers.${question.id}',
+        '${question.id} is required: ${question.question}');
+  }
 }
 
 /// The catalogue questions [content] answers, in the order they were sent.
