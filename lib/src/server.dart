@@ -2775,6 +2775,23 @@ void _recordTombstones(FalconDb db, String table, Object id) {
   }
 }
 
+/// Clears every provider's tombstone for [table]/[id], because the row is
+/// about to exist again.
+///
+/// A caller-supplied create id is usually an import retry: the bad import was
+/// deleted (which wrote a tombstone per provider) and re-running it asks for
+/// the same ids. The push reads `sync_deletions` to tell the cloud a row is
+/// gone, so leaving the tombstone would delete the row the create just
+/// reported as created. Only the exact table/id is cleared, and the caller runs
+/// inside the write transaction, so a failed insert rolls the delete back.
+void _clearTombstones(FalconDb db, String table, Object id) {
+  if (!db.hasTable('sync_deletions')) return;
+  db.execute(
+    'DELETE FROM sync_deletions WHERE sync_table = ? AND row_id = ?',
+    [table, id.toString()],
+  );
+}
+
 /// Deletes [id] from [table] and records its sync tombstones in one
 /// transaction, for the four synced tables' delete tools.
 ///
@@ -2934,6 +2951,12 @@ String _bareRegistration(String registration, String countryCode) {
 /// The id a create should use. A caller-supplied id is accepted only when it is
 /// a UUID v4 and unused: imports need stable ids, and substituting a fresh one
 /// silently would defeat that.
+///
+/// "Unused" means unused in the live table only. An id that a previous delete
+/// tombstoned is free to re-use - that delete-and-replay is the import retry
+/// the optional id exists for - so accepting it clears those stale tombstones
+/// in the caller's write transaction. Insert one row and the cloud push would
+/// otherwise delete it again.
 String _createId(FalconDb db, String table, Map<String, dynamic> args) {
   final requested = asText(args['id']);
   if (requested == null) return uuidV4();
@@ -2947,6 +2970,7 @@ String _createId(FalconDb db, String table, Map<String, dynamic> args) {
     throw _ToolError('A $table row with id $requested already exists.',
         code: 'constraint', field: 'id');
   }
+  _clearTombstones(db, table, requested);
   return requested;
 }
 
