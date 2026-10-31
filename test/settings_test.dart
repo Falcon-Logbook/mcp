@@ -141,6 +141,43 @@ void main() {
     expect(sidebar['position'], 'right');
   });
 
+  test('expiry_settings resolves the local row list_expiries computes with',
+      () async {
+    // A sync leaves two rows: another device's newer, stricter one, inserted
+    // first, then the local one. An unordered LIMIT 1 can return either, and
+    // the shared row would give get_settings a different green and orange than
+    // the statuses list_expiries reports.
+    withFixtureDb(dbPath, (db) {
+      db.execute(
+        'INSERT INTO expiry_settings '
+        '(id, green_threshold, orange_threshold, owner_id, updated_at) '
+        "VALUES ('exp-synced', 10, 5, 'other-device', 9)",
+      );
+      db.execute(
+        'INSERT INTO expiry_settings '
+        '(id, green_threshold, orange_threshold, updated_at) '
+        "VALUES ('exp-local', 45, 12, 2)",
+      );
+    });
+    final server = await start();
+
+    final settings = payloadOf(
+        await server.call('get_settings', {'table': 'expiry_settings'}));
+    expect(settings['id'], 'exp-local', reason: 'the local row wins');
+    expect(settings['green_threshold'], 45);
+    expect(settings['orange_threshold'], 12);
+
+    final expiries = payloadOf(await server.call('list_expiries', {}));
+    expect(
+        expiries['thresholds'],
+        {
+          'green': settings['green_threshold'],
+          'orange': settings['orange_threshold'],
+          'source': 'settings',
+        },
+        reason: 'the two reads must agree on the row they resolved');
+  });
+
   test('a typo argument names the tool that refused', () async {
     final server = await start();
 
