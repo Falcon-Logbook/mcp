@@ -72,7 +72,10 @@ final Map<String, _Dimension> _dimensions = {
     join: 'LEFT JOIN aircraft ON aircraft.id = flights.aircraft_id',
     groupBy: 'flights.aircraft_id, aircraft.country_code, '
         'aircraft.registration, aircraft.type',
-    conditions: ['flights.aircraft_id IS NOT NULL'],
+    conditions: [
+      'flights.aircraft_id IS NOT NULL',
+      "flights.aircraft_id != ''",
+    ],
     row: (row) => {
       'aircraft_id': row['entity_key'],
       'registration': displayRegistration(

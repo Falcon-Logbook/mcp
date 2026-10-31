@@ -415,6 +415,42 @@ void main() {
             'last rather than first');
     expect([for (final entity in byLabel) entity['minutes']], [60, 60, 60]);
   });
+
+  test('an empty aircraft_id is not an aircraft group', () async {
+    dbPath = createEmptyFixture('${tempDir.path}/empty.sqlite');
+    withFixtureDb(dbPath, (db) {
+      db.execute(
+        'INSERT INTO aircraft (id, type, country_code, registration, created_at) '
+        'VALUES (?, ?, ?, ?, 1700000000)',
+        ['ac-1', 'B738', 'VH', 'XZO'],
+      );
+    });
+    insertFlights(dbPath, [
+      {
+        'id': 'fl-1',
+        'date': _day(1),
+        'aircraft_id': 'ac-1',
+        'aircraft_registration': 'VH-XZO',
+        'total_time': 120,
+      },
+      // A hand-inserted empty link. No writer in the app or this server
+      // produces one, but the aircraft dimension must still agree with the
+      // doc comment: a group is never keyed on an empty string.
+      {
+        'id': 'fl-empty',
+        'date': _day(2),
+        'aircraft_id': '',
+        'total_time': 60,
+      },
+    ]);
+    final server = await start();
+
+    final payload =
+        payloadOf(await server.call('entity_totals', {'type': 'aircraft'}));
+    expect(totals(payload, 'aircraft_id'), [('ac-1', 120, 1)]);
+    expect(payload['total'], 1,
+        reason: 'an empty key would occupy a slot in total and in pagination');
+  });
 }
 
 DateTime _day(int dayOfMonth) => DateTime(2026, 1, dayOfMonth);
