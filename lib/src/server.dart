@@ -781,6 +781,21 @@ String _ownerClause(FalconDb db, String table,
         ? "(${prefix}owner_id IS NULL OR ${prefix}owner_id = 'local')"
         : '';
 
+/// The `id = ?` predicate of a write that targets one local row, plus the same
+/// owner rule the reads apply. A write resolves its target by id alone, so
+/// without this an id a caller got from an `include_shared` read would name a
+/// row another pilot owns; with it that row is simply not found. The id
+/// parameter stays first, which is how every UPDATE and DELETE binds it.
+String _localRowWhere(FalconDb db, String table) =>
+    'id = ?${_ownerAnd(db, table)}';
+
+/// [_ownerClause] as a trailing AND term, for a write whose WHERE already
+/// names the rows it touches some other way (a link column, a name).
+String _ownerAnd(FalconDb db, String table) {
+  final owner = _ownerClause(db, table, includeShared: false);
+  return owner.isEmpty ? '' : ' AND $owner';
+}
+
 /// The aggregate row `logbook_stats` reports. `logbook_overview` reads the same
 /// numbers from the same query over the same rows, so the two tools cannot
 /// disagree about a logbook.
@@ -2945,9 +2960,11 @@ Set<String> _importedClientRefs(String dbPath) {
   return refs;
 }
 
-/// The flight row [id] as the read tools present it, or null when it is gone.
+/// The flight row [id] as the read tools present it, or null when it is gone or
+/// another pilot owns it.
 Map<String, dynamic>? _flightRow(FalconDb db, String id) {
-  final rows = db.query('SELECT * FROM flights WHERE id = ?', [id]);
+  final rows = db.query(
+      'SELECT * FROM flights WHERE ${_localRowWhere(db, 'flights')}', [id]);
   return rows.isEmpty ? null : rows.first;
 }
 
@@ -3031,9 +3048,13 @@ void _clearTombstones(FalconDb db, String table, Object id) {
 /// ends in a [notFoundLabel] error instead of a deleted result that never
 /// deleted anything, and no tombstone is written for a row that was already
 /// gone.
+///
+/// The delete carries the owner rule, so a row another pilot owns is never
+/// deleted and never tombstoned: it ends in the same [notFoundLabel] error.
 void _deleteSyncedRow(FalconDb db, String table, Object id, String label) {
   db.transaction(() {
-    final deleted = db.execute('DELETE FROM $table WHERE id = ?', [id]);
+    final deleted = db
+        .execute('DELETE FROM $table WHERE ${_localRowWhere(db, table)}', [id]);
     if (deleted == 0) {
       throw _ToolError('$label not found: $id', code: 'not_found', field: 'id');
     }
@@ -3138,7 +3159,8 @@ void _requireUpdated(
   Map<String, Object?> Function(Map<String, dynamic> row)? shape,
 }) {
   if (changed == 1) return;
-  final rows = db.query('SELECT * FROM $table WHERE id = ?', [id]);
+  final where = _localRowWhere(db, table);
+  final rows = db.query('SELECT * FROM $table WHERE $where', [id]);
   if (rows.isEmpty) {
     throw _ToolError('$label not found: $id', code: 'not_found', field: 'id');
   }
@@ -3146,7 +3168,7 @@ void _requireUpdated(
   // The raw stamp: query() renders a `*_at` epoch as ISO text, and the
   // comparison has to name the stored value the caller will send next time.
   final stored = db.selectRaw(
-      'SELECT updated_at FROM $table WHERE id = ?', [id]).first['updated_at'];
+      'SELECT updated_at FROM $table WHERE $where', [id]).first['updated_at'];
   throw _ToolError(
     stored is! int
         ? 'the row has no updated_at stamp yet, so it cannot be compared '
@@ -5521,7 +5543,7 @@ Future<void> runServer(String dbPath, {bool readonly = true}) async {
         final guard = _optimisticGuard(args);
         final changed = db.execute(
           'UPDATE flights SET ${assignments.join(', ')}, updated_at = ? '
-          'WHERE id = ?${guard.$1}',
+          'WHERE ${_localRowWhere(db, 'flights')}${guard.$1}',
           [...values.values, nowEpochSeconds(), id, ...guard.$2],
         );
         _requireUpdated(db,
@@ -5560,7 +5582,9 @@ Future<void> runServer(String dbPath, {bool readonly = true}) async {
         _rejectUnknown(args, const {'id', 'dry_run'}, tool: 'delete_flight');
         final id = asText(args['id']);
         if (id == null) throw _ToolError('Missing or invalid id', field: 'id');
-        if (db.query('SELECT id FROM flights WHERE id = ?', [id]).isEmpty) {
+        if (db.query(
+            'SELECT id FROM flights WHERE ${_localRowWhere(db, 'flights')}',
+            [id]).isEmpty) {
           throw _ToolError('Flight not found: $id',
               code: 'not_found', field: 'id');
         }
@@ -5650,7 +5674,9 @@ Future<void> runServer(String dbPath, {bool readonly = true}) async {
             tool: 'update_aircraft');
         final id = asText(args['id']);
         if (id == null) throw _ToolError('Missing or invalid id', field: 'id');
-        final rows = db.query('SELECT * FROM aircraft WHERE id = ?', [id]);
+        final rows = db.query(
+            'SELECT * FROM aircraft WHERE ${_localRowWhere(db, 'aircraft')}',
+            [id]);
         if (rows.isEmpty) {
           throw _ToolError('Aircraft not found: $id',
               code: 'not_found', field: 'id');
@@ -5697,7 +5723,7 @@ Future<void> runServer(String dbPath, {bool readonly = true}) async {
         final guard = _optimisticGuard(args);
         final changed = db.execute(
           'UPDATE aircraft SET ${assignments.join(', ')}, updated_at = ? '
-          'WHERE id = ?${guard.$1}',
+          'WHERE ${_localRowWhere(db, 'aircraft')}${guard.$1}',
           [...values, nowEpochSeconds(), id, ...guard.$2],
         );
         _requireUpdated(db,
@@ -5725,7 +5751,9 @@ Future<void> runServer(String dbPath, {bool readonly = true}) async {
         _rejectUnknown(args, const {'id', 'dry_run'}, tool: 'delete_aircraft');
         final id = asText(args['id']);
         if (id == null) throw _ToolError('Missing or invalid id', field: 'id');
-        if (db.query('SELECT id FROM aircraft WHERE id = ?', [id]).isEmpty) {
+        if (db.query(
+            'SELECT id FROM aircraft WHERE ${_localRowWhere(db, 'aircraft')}',
+            [id]).isEmpty) {
           throw _ToolError('Aircraft not found: $id',
               code: 'not_found', field: 'id');
         }
@@ -5802,7 +5830,8 @@ Future<void> runServer(String dbPath, {bool readonly = true}) async {
         final id = asText(args['id']);
         if (id == null) throw _ToolError('Missing or invalid id', field: 'id');
         final existing = db.query(
-            'SELECT name, first_name, last_name FROM crew_members WHERE id = ?',
+            'SELECT name, first_name, last_name FROM crew_members '
+            'WHERE ${_localRowWhere(db, 'crew_members')}',
             [id]);
         if (existing.isEmpty) {
           throw _ToolError('Crew member not found: $id',
@@ -5834,7 +5863,7 @@ Future<void> runServer(String dbPath, {bool readonly = true}) async {
         final now = nowEpochSeconds();
         final changed = db.execute(
           'UPDATE crew_members SET ${assignments.join(', ')}, updated_at = ? '
-          'WHERE id = ?${guard.$1}',
+          'WHERE ${_localRowWhere(db, 'crew_members')}${guard.$1}',
           [...values, now, id, ...guard.$2],
         );
         _requireUpdated(db,
@@ -5851,7 +5880,7 @@ Future<void> runServer(String dbPath, {bool readonly = true}) async {
           // that disagrees with the crew row.
           db.execute(
             'UPDATE flights SET crew_members_name = ?, updated_at = ? '
-            'WHERE crew_member_id = ?',
+            'WHERE crew_member_id = ?${_ownerAnd(db, 'flights')}',
             [derivedName, now, id],
           );
         }
@@ -5873,8 +5902,9 @@ Future<void> runServer(String dbPath, {bool readonly = true}) async {
         _rejectUnknown(args, const {'id', 'dry_run'}, tool: 'delete_crew');
         final id = asText(args['id']);
         if (id == null) throw _ToolError('Missing or invalid id', field: 'id');
-        if (db
-            .query('SELECT id FROM crew_members WHERE id = ?', [id]).isEmpty) {
+        if (db.query(
+            'SELECT id FROM crew_members WHERE ${_localRowWhere(db, 'crew_members')}',
+            [id]).isEmpty) {
           throw _ToolError('Crew member not found: $id',
               code: 'not_found', field: 'id');
         }
@@ -5949,7 +5979,8 @@ Future<void> runServer(String dbPath, {bool readonly = true}) async {
         final id = asText(args['id']);
         if (id == null) throw _ToolError('Missing or invalid id', field: 'id');
         if (db.query(
-            'SELECT id FROM custom_airports WHERE id = ?', [id]).isEmpty) {
+            'SELECT id FROM custom_airports WHERE ${_localRowWhere(db, 'custom_airports')}',
+            [id]).isEmpty) {
           throw _ToolError('Custom airport not found: $id',
               code: 'not_found', field: 'id');
         }
@@ -5962,7 +5993,7 @@ Future<void> runServer(String dbPath, {bool readonly = true}) async {
         final guard = _optimisticGuard(args);
         final changed = db.execute(
           'UPDATE custom_airports SET ${assignments.join(', ')}, updated_at = ? '
-          'WHERE id = ?${guard.$1}',
+          'WHERE ${_localRowWhere(db, 'custom_airports')}${guard.$1}',
           [...values, nowEpochSeconds(), id, ...guard.$2],
         );
         _requireUpdated(db,
@@ -5991,7 +6022,8 @@ Future<void> runServer(String dbPath, {bool readonly = true}) async {
         final id = asText(args['id']);
         if (id == null) throw _ToolError('Missing or invalid id', field: 'id');
         if (db.query(
-            'SELECT id FROM custom_airports WHERE id = ?', [id]).isEmpty) {
+            'SELECT id FROM custom_airports WHERE ${_localRowWhere(db, 'custom_airports')}',
+            [id]).isEmpty) {
           throw _ToolError('Custom airport not found: $id',
               code: 'not_found', field: 'id');
         }
@@ -6063,8 +6095,9 @@ Future<void> runServer(String dbPath, {bool readonly = true}) async {
             tool: 'update_saved_route');
         final id = asInt(args['id']);
         if (id == null) throw _ToolError('Missing or invalid id', field: 'id');
-        if (db
-            .query('SELECT id FROM saved_routes WHERE id = ?', [id]).isEmpty) {
+        if (db.query(
+            'SELECT id FROM saved_routes WHERE ${_localRowWhere(db, 'saved_routes')}',
+            [id]).isEmpty) {
           throw _ToolError('Saved route not found: $id',
               code: 'not_found', field: 'id');
         }
@@ -6076,7 +6109,7 @@ Future<void> runServer(String dbPath, {bool readonly = true}) async {
         final guard = _optimisticGuard(args);
         final changed = db.execute(
           'UPDATE saved_routes SET ${assignments.join(', ')}, updated_at = ? '
-          'WHERE id = ?${guard.$1}',
+          'WHERE ${_localRowWhere(db, 'saved_routes')}${guard.$1}',
           [...values, nowEpochSeconds(), id, ...guard.$2],
         );
         _requireUpdated(db,
@@ -6105,8 +6138,9 @@ Future<void> runServer(String dbPath, {bool readonly = true}) async {
             tool: 'delete_saved_route');
         final id = asInt(args['id']);
         if (id == null) throw _ToolError('Missing or invalid id', field: 'id');
-        if (db
-            .query('SELECT id FROM saved_routes WHERE id = ?', [id]).isEmpty) {
+        if (db.query(
+            'SELECT id FROM saved_routes WHERE ${_localRowWhere(db, 'saved_routes')}',
+            [id]).isEmpty) {
           throw _ToolError('Saved route not found: $id',
               code: 'not_found', field: 'id');
         }
@@ -6115,23 +6149,27 @@ Future<void> runServer(String dbPath, {bool readonly = true}) async {
         // a route a concurrent writer removed after the existence check ends
         // in a not_found error instead of unlinking flights for nothing.
         return db.transaction(() {
-          final deleted =
-              db.execute('DELETE FROM saved_routes WHERE id = ?', [id]);
+          final deleted = db.execute(
+              'DELETE FROM saved_routes '
+              'WHERE ${_localRowWhere(db, 'saved_routes')}',
+              [id]);
           if (deleted == 0) {
             throw _ToolError('Saved route not found: $id',
                 code: 'not_found', field: 'id');
           }
           // The unlink is a write to the flight, so it carries the stamp the
           // app's delta push selects on; without it the cloud keeps a route_id
-          // pointing at the route this call just deleted.
+          // pointing at the route this call just deleted. The owner rule keeps
+          // it off a flight another pilot owns.
+          final flightWhere = 'route_id = ?${_ownerAnd(db, 'flights')}';
           final affectedIds = [
             for (final row
-                in db.query('SELECT id FROM flights WHERE route_id = ?', [id]))
+                in db.query('SELECT id FROM flights WHERE $flightWhere', [id]))
               row['id'] as String,
           ];
           db.execute(
               'UPDATE flights SET route_id = NULL, updated_at = ? '
-              'WHERE route_id = ?',
+              'WHERE $flightWhere',
               [nowEpochSeconds(), id]);
           return <String, dynamic>{
             ..._deleted('saved_routes', id),
@@ -6286,7 +6324,7 @@ Future<void> runServer(String dbPath, {bool readonly = true}) async {
           }
           final keepRows = db.query(
               'SELECT id, name, first_name, last_name, archived '
-              'FROM crew_members WHERE id = ?',
+              'FROM crew_members WHERE ${_localRowWhere(db, 'crew_members')}',
               [intoId]);
           if (keepRows.isEmpty) {
             throw _ToolError('Crew member not found: $intoId',
@@ -6298,7 +6336,8 @@ Future<void> runServer(String dbPath, {bool readonly = true}) async {
           final discards = <Map<String, dynamic>>[];
           for (final id in fromIds) {
             final rows = db.query(
-                'SELECT id, name, archived FROM crew_members WHERE id = ?',
+                'SELECT id, name, archived FROM crew_members '
+                'WHERE ${_localRowWhere(db, 'crew_members')}',
                 [id]);
             if (rows.isEmpty) {
               throw _ToolError('Crew member not found: $id',
@@ -6326,29 +6365,30 @@ Future<void> runServer(String dbPath, {bool readonly = true}) async {
           for (final discard in discards) {
             final discardId = discard['id'] as String;
             final discardName = (asText(discard['name']) ?? '').trim();
+            final linkedWhere = 'crew_member_id = ?${_ownerAnd(db, 'flights')}';
             affectedIds.addAll([
               for (final row in db.query(
-                  'SELECT id FROM flights WHERE crew_member_id = ?',
-                  [discardId]))
+                  'SELECT id FROM flights WHERE $linkedWhere', [discardId]))
                 row['id'] as String,
             ]);
             repointed += db.execute(
               'UPDATE flights SET crew_member_id = ?, crew_members_name = ?, '
-              'updated_at = ? WHERE crew_member_id = ?',
+              'updated_at = ? WHERE $linkedWhere',
               [intoId, keepName, nowEpochSeconds(), discardId],
             );
             if (discardName.isNotEmpty) {
+              final namedWhere = 'crew_members_name = ? '
+                  'AND crew_member_id IS NOT NULL AND crew_member_id != ?'
+                  '${_ownerAnd(db, 'flights')}';
               affectedIds.addAll([
                 for (final row in db.query(
-                    'SELECT id FROM flights WHERE crew_members_name = ? '
-                    'AND crew_member_id IS NOT NULL AND crew_member_id != ?',
+                    'SELECT id FROM flights WHERE $namedWhere',
                     [discardName, intoId]))
                   row['id'] as String,
               ]);
               renamed += db.execute(
                 'UPDATE flights SET crew_member_id = ?, crew_members_name = ?, '
-                'updated_at = ? WHERE crew_members_name = ? '
-                'AND crew_member_id IS NOT NULL AND crew_member_id != ?',
+                'updated_at = ? WHERE $namedWhere',
                 [intoId, keepName, nowEpochSeconds(), discardName, intoId],
               );
             }
@@ -6432,7 +6472,8 @@ Future<void> runServer(String dbPath, {bool readonly = true}) async {
             for (final id in flightIds) {
               final rows = db.query(
                   'SELECT id, date, route, aircraft_id,'
-                  ' aircraft_registration FROM flights WHERE id = ?',
+                  ' aircraft_registration FROM flights '
+                  'WHERE ${_localRowWhere(db, 'flights')}',
                   [id]);
               if (rows.isEmpty) {
                 throw _ToolError('Flight not found: $id',
@@ -6448,10 +6489,11 @@ Future<void> runServer(String dbPath, {bool readonly = true}) async {
             }
             candidates.addAll(db.query(
               'SELECT id, date, route, aircraft_id, aircraft_registration '
-              'FROM flights WHERE (aircraft_id IS NULL AND '
+              'FROM flights WHERE ((aircraft_id IS NULL AND '
               "trim(coalesce(aircraft_registration, '')) != '') OR "
               "(aircraft_id IS NOT NULL AND "
-              "trim(coalesce(aircraft_registration, '')) = '') "
+              "trim(coalesce(aircraft_registration, '')) = ''))"
+              '${_ownerAnd(db, 'flights')} '
               'ORDER BY date DESC, id',
             ));
           }
@@ -6475,7 +6517,7 @@ Future<void> runServer(String dbPath, {bool readonly = true}) async {
             void linkTo(String targetId, String display) {
               db.execute(
                 'UPDATE flights SET aircraft_id = ?, aircraft_registration = ?,'
-                ' updated_at = ? WHERE id = ?',
+                ' updated_at = ? WHERE ${_localRowWhere(db, 'flights')}',
                 [targetId, display, nowEpochSeconds(), id],
               );
               linked++;
@@ -6501,7 +6543,7 @@ Future<void> runServer(String dbPath, {bool readonly = true}) async {
               } else {
                 db.execute(
                   'UPDATE flights SET aircraft_registration = ?, updated_at = ?'
-                  ' WHERE id = ?',
+                  ' WHERE ${_localRowWhere(db, 'flights')}',
                   [displayOf(rows.first), nowEpochSeconds(), id],
                 );
                 reverseFixed++;
@@ -6595,7 +6637,7 @@ Future<void> runServer(String dbPath, {bool readonly = true}) async {
             for (final id in flightIds) {
               final rows = db.query(
                   'SELECT id, date, route, crew_member_id, crew_members_name '
-                  'FROM flights WHERE id = ?',
+                  'FROM flights WHERE ${_localRowWhere(db, 'flights')}',
                   [id]);
               if (rows.isEmpty) {
                 throw _ToolError('Flight not found: $id',
@@ -6608,6 +6650,7 @@ Future<void> runServer(String dbPath, {bool readonly = true}) async {
               "SELECT id, date, route, crew_member_id, crew_members_name FROM"
               " flights WHERE crew_member_id IS NULL AND"
               " trim(coalesce(crew_members_name, '')) != ''"
+              '${_ownerAnd(db, 'flights')}'
               ' ORDER BY date DESC, id',
             ));
           }
@@ -6624,7 +6667,7 @@ Future<void> runServer(String dbPath, {bool readonly = true}) async {
             if (matches.length == 1) {
               db.execute(
                 'UPDATE flights SET crew_member_id = ?, updated_at = ? '
-                'WHERE id = ?',
+                'WHERE ${_localRowWhere(db, 'flights')}',
                 [matches.single.id, nowEpochSeconds(), id],
               );
               linked++;
@@ -6744,7 +6787,7 @@ Future<void> runServer(String dbPath, {bool readonly = true}) async {
                 '- ids for flights, aircraft, crew_members, custom_airports and flights_settings are RFC 4122 version 4 UUIDs, lowercase and hyphenated, the shape the cloud schema requires before a row can sync. A create tool accepts an optional UUID v4 id so an import can keep its own, and refuses any other shape. saved_routes keeps its integer id.\n'
                 '- day_order is the order of a flight within its date: a create takes the next free order for that day, and an update recomputes it when the date moves the flight to another day. updated_at records the last write.\n'
                 '- Flights are ordered date DESC, day_order DESC, id, the same as the app. Flights on the same date are newest-first within the day.\n'
-                '- Reads return local rows only (owner_id NULL or "local") unless include_shared is true. Paged reads return count (rows on this page), total (all matching rows), has_more and offset, and default to 20 rows with a maximum of 200; the list reads state in their own limit description how many they return and report total and has_more. A listed flight is a summary, unless full: true.\n'
+                '- Reads return local rows only (owner_id NULL or "local") unless include_shared is true. Write tools target local rows only: an id read with include_shared that another pilot owns answers not_found, so it can be read but never updated or deleted. Paged reads return count (rows on this page), total (all matching rows), has_more and offset, and default to 20 rows with a maximum of 200; the list reads state in their own limit description how many they return and report total and has_more. A listed flight is a summary, unless full: true.\n'
                 '- flights.route is free text. It is a route pair only when it is exactly "AAA - BBB": two segments split on " - ", each 3 or 4 characters and equal in length, the same rule the app applies. Anything else is a description and has no direction, so departure_icao and arrival_icao are null and the route filters cannot match it. The two codes are derived, not stored: full rows and get_flight carry them, the twelve-field summary does not. Write tools warn when a route will be stored as a description.\n'
                 '- aircraft.registration is the BARE registration (e.g. country_code=VH, registration=XZO). The app displays country_code + "-" + registration.\n'
                 '- flights.aircraft_registration is the display registration (e.g. VH-XZO). Write tools accept either form and set aircraft_id from the matching aircraft row; flights.crew_members_name is matched the same way to set crew_member_id. When more than one active row matches a name or registration, the link is left unset and the warning lists the candidates, so pass aircraft_id or crew_member_id to choose. An id passed with a name or registration is authoritative: the name must resolve to that same row (or have the id among its candidates), and a name that resolves elsewhere is refused with code conflict naming both fields and both candidates, before anything is written.\n'
