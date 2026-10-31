@@ -938,7 +938,10 @@ class _Auditor {
 
   final String dbPath;
 
-  void record(
+  /// Records one entry. Returns null when the log was written, or a short
+  /// description of the failure: the write already committed, so the caller
+  /// decides how to report an unrecorded change rather than undoing it.
+  String? record(
     String tool,
     Map<String, dynamic> args, {
     String? id,
@@ -947,7 +950,7 @@ class _Auditor {
     List<String>? ids,
     List<String>? refs,
   }) {
-    appendAudit(dbPath, {
+    return appendAudit(dbPath, {
       'ts': DateTime.now().toUtc().toIso8601String(),
       'tool': tool,
       'args': args,
@@ -958,6 +961,34 @@ class _Auditor {
       if (error != null) 'error': error,
     });
   }
+}
+
+/// A committed write whose audit entry could not be written. The change is
+/// saved, so the response stays a success and carries the failure instead:
+/// [audit_failed] and a [warning] naming the log. When [lostRefs] is set, the
+/// log also held the batch's `client_ref` values, so a retry can no longer tell
+/// from the log which rows already landed.
+Map<String, Object?> _unrecordedWrite(
+  Object? result, {
+  required String dbPath,
+  required String failure,
+  required bool lostRefs,
+}) {
+  final warning = StringBuffer('The write was saved, but its audit entry could '
+      'not be recorded at ${auditPathFor(dbPath)}: $failure');
+  if (lostRefs) {
+    warning.write(' The log is the only record of an applied batch\'s '
+        'client_ref values, so a retry of this batch cannot tell which rows '
+        'already landed and may duplicate them.');
+  }
+  return {
+    if (result is Map)
+      ...Map<String, Object?>.from(result)
+    else
+      'result': result,
+    'audit_failed': true,
+    'warning': warning.toString(),
+  };
 }
 
 /// Runs a write callback in one transaction, auditing the outcome and converting
@@ -990,10 +1021,18 @@ CallToolResult _runWrite(
     final id = result is Map ? result['id'] : null;
     final ids = result is Map ? result['affected_ids'] : null;
     final refs = result is Map ? result['created_refs'] : null;
-    auditor.record(tool, args,
+    final auditFailure = auditor.record(tool, args,
         id: id?.toString(),
         ids: ids is List ? ids.cast<String>() : null,
         refs: refs is List ? refs.cast<String>() : null);
+    if (auditFailure != null) {
+      return _ok(_unrecordedWrite(
+        result,
+        dbPath: auditor.dbPath,
+        failure: auditFailure,
+        lostRefs: refs is List && refs.isNotEmpty,
+      ));
+    }
     return _ok(result);
   } on _DryRun catch (dry) {
     final ids = dry.result['affected_ids'];
@@ -3304,7 +3343,7 @@ String _falconHelpText({required Set<String> tools, required bool readonly}) {
   final text = StringBuffer()
     ..writeln('You are working in the pilot\'s own Falcon logbook. Falcon is a '
         'pilot logbook on this computer, and you read the database the desktop '
-        'app writes. ${readonly ? 'You can look, not change anything.' : 'Writes are on: you can create and change rows, and every write is recorded.'}')
+        'app writes. ${readonly ? 'You can look, not change anything.' : 'Writes are on: you can create and change rows, and every write is recorded; a write whose audit entry cannot be written still saves and returns a warning saying so.'}')
     ..writeln()
     ..writeln('What the pilot can ask for:');
   for (final group in _helpGroups) {
@@ -6470,7 +6509,7 @@ Future<void> runServer(String dbPath, {bool readonly = true}) async {
                 '- data_quality_report is one read-only call over every defect class an imported logbook can have: drafts, missing or mismatched splits, absurd totals, unlinked aircraft and crew, duplicate crew and flights, unparsable routes, future dates, dangling route links, simulator oddities, orphaned registration text. Each class carries a stable id, a count and a sample of up to 4 rows; a count is the finding, not the full list.\n'
                 '- The repair tools merge_crew, link_flights_to_aircraft and link_flights_to_crew default to dry_run: true and say so on the response; pass dry_run: false to apply the same diff. They run in one transaction, stamp updated_at, tombstone deletions so sync propagates them, never create rows beyond the operation named, and never delete flights: duplicate flights are reported for a human to decide.\n'
                 '- Planned times (scheduled_departure_utc, scheduled_arrival_utc, scheduled_block_minutes) come with Falcon-Logbook/app#231 and schema 20. The two instants are unix epoch seconds UTC and render as ISO-8601 with an explicit offset; the block is integer minutes. They exist only on a migrated database, so a write naming them on an older file is refused by name rather than silently dropped. A leg with planned times stays a draft: total_time empty, the block kept as the plan.\n'
-                '- validate_flight_drafts and apply_flight_batch take a roster as flights, an array of objects using create_flight field names, up to 500 rows. Each row also accepts client_ref (an identity for retries) and aircraft_type (a hint, never stored). validate writes nothing and answers per row with ok, issues of {field, code, message, severity} and warnings; severity error is a row apply refuses. apply is atomic by default (one bad row writes nothing, applied: 0), allows partial with allow_partial: true, skips a duplicate or an already imported client_ref instead of overwriting, records one audit entry per batch with batch_id and the created ids, and previews with dry_run: true (its default). A roster leg is written as a draft through the same row builder as create_flight, so updated_at and sync behave the same.\n'
+                '- validate_flight_drafts and apply_flight_batch take a roster as flights, an array of objects using create_flight field names, up to 500 rows. Each row also accepts client_ref (an identity for retries) and aircraft_type (a hint, never stored). validate writes nothing and answers per row with ok, issues of {field, code, message, severity} and warnings; severity error is a row apply refuses. apply is atomic by default (one bad row writes nothing, applied: 0), allows partial with allow_partial: true, skips a duplicate or an already imported client_ref instead of overwriting, records one audit entry per batch with batch_id and the created ids (and warns in the response when that entry cannot be written), and previews with dry_run: true (its default). A roster leg is written as a draft through the same row builder as create_flight, so updated_at and sync behave the same.\n'
                 '- A failed call returns {error, field, detail}: error is a stable code (unknown_field, invalid_value, not_found, conflict, constraint, busy, internal), field is the argument at fault, and unknown_field also names the tool. detail is one sentence, and the accepted list is capped at eight names plus a count. A conflict adds current, the row as it stands now.',
           ),
         ],
