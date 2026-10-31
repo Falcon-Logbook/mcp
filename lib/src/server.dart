@@ -72,8 +72,10 @@ const _flightColumns = <_Column>[
       note: 'Other crew member display name.'),
   _Column('route', _Kind.text, note: 'Route text, e.g. "YSSY - NZQN".'),
   _Column('flight_number', _Kind.text),
+  // 0 is refused by the write path, so the schema says 1: a caller that plans
+  // its call from the schema must not have to learn that from a round trip.
   _Column('total_time', _Kind.integer,
-      min: 0,
+      min: 1,
       max: maxFlightMinutes,
       note: 'Minutes, 1 to $maxFlightMinutes (8760 hours). Omit it to create a '
           'draft, or pass draft: true on an update to clear it.'),
@@ -1294,7 +1296,9 @@ Map<String, JsonSchema> _flightWriteProperties(FalconDb db,
     for (final entry in _hoursAliases.entries)
       if (available.contains(entry.key))
         entry.value: JsonSchema.number(
-          minimum: 0,
+          // The alias reaches the same refusal as the column it converts to,
+          // so it carries the same floor; every other minute column accepts 0.
+          minimum: entry.key == 'total_time' ? 1 : 0,
           description:
               notes ? 'Hours, converted to ${entry.key} minutes.' : null,
         ),

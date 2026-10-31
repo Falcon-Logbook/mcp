@@ -153,19 +153,45 @@ void main() {
         reason: 'a one-sided split is stored with a warning, not refused');
   });
 
-  test('refuses total_time 0 and names draft: true instead', () async {
+  test('refuses total_time 0 at the schema, without a round trip', () async {
     final server = await start();
     final before = flightCount();
 
-    final zero = await server
-        .call('create_flight', {'date': '2026-10-27', 'total_time': 0});
-    expect(zero.isError, isTrue);
-    expect('${zero.payload}', contains('draft: true'));
+    // The column advertises minimum 1, so the SDK refuses 0 before the tool
+    // runs. #65: the schema and the write path must agree on the floor.
+    for (final args in [
+      {'date': '2026-10-27', 'total_time': 0},
+      {'date': '2026-10-27', 'total_time_hours': 0},
+    ]) {
+      final zero = await server.call('create_flight', args);
+      expect(zero.isError, isTrue, reason: '$args');
+      final message = '${zero.payload}';
+      expect(message, contains('below minimum 1'), reason: message);
+    }
     expect(flightCount(), before);
 
     final normal = await server
         .call('create_flight', {'date': '2026-10-27', 'total_time': 30});
     expect(normal.isError, isFalse, reason: '${normal.payload}');
+  });
+
+  test('the write path still refuses total_time 0 on a batch row', () async {
+    final server = await start();
+    final before = flightCount();
+
+    // A batch row arrives with an untyped item schema, so the schema cannot
+    // refuse it: the column's floor is applied when the row is coerced.
+    final result = payloadOf(await server.call('apply_flight_batch', {
+      'dry_run': false,
+      'flights': [
+        {'date': '2026-10-27', 'total_time': 0},
+      ],
+    }));
+    expect(result['applied'], 0);
+    final failed = (result['failed'] as List).cast<Map<String, dynamic>>();
+    expect('${failed.single['reason']}', contains('total_time'));
+    expect('${failed.single['reason']}', contains('>= 1'));
+    expect(flightCount(), before, reason: 'a refused batch writes nothing');
   });
 
   test('canonicalises block times to HH:MM and refuses anything else',
