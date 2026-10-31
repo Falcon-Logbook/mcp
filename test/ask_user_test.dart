@@ -435,6 +435,86 @@ void main() {
     });
   });
 
+  group('answers without questions', () {
+    /// The end of a guided write: one optional question, then the confirmation
+    /// that has to be given before anything is written.
+    List<Question> writingFlow() => [
+          AskQuestions.aircraft(const [QuestionOption('ac-1', 'VH-XZO')]),
+          AskQuestions.confirmPlan,
+        ];
+
+    /// A store the server has just handed [questions] to, the way a client
+    /// with no form is asked.
+    Future<AskStateStore> asked(List<Question> questions) async {
+      final state = AskStateStore();
+      final result = await ask(
+        {
+          'questions': [for (final question in questions) question.toJson()],
+        },
+        state: state,
+      );
+      expect(payloadOf(result)['status'], 'needs_input');
+      return state;
+    }
+
+    test('an empty answer set is refused, naming the required question',
+        () async {
+      final state = await asked(writingFlow());
+      await expectLater(
+        ask({'answers': const <String, Object?>{}}, state: state),
+        throwsA(isA<AskUserError>()
+            .having((error) => error.field, 'field', 'answers.confirm_plan')
+            .having((error) => error.message, 'message',
+                contains('confirm_plan is required'))),
+      );
+    });
+
+    test('a partial answer set missing a required question is refused',
+        () async {
+      final state = await asked(writingFlow());
+      await expectLater(
+        ask({
+          'answers': {AskQuestions.aircraftId: 'ac-1'}
+        }, state: state),
+        throwsA(isA<AskUserError>().having((error) => error.message, 'message',
+            contains('confirm_plan is required'))),
+      );
+    });
+
+    test('a complete answer set is answered', () async {
+      final state = await asked(writingFlow());
+      final result = await ask({
+        'answers': {
+          AskQuestions.aircraftId: 'ac-1',
+          AskQuestions.confirmPlanId: true,
+        },
+      }, state: state);
+      expect(payloadOf(result), {
+        'status': 'answered',
+        'answers': {
+          AskQuestions.aircraftId: 'ac-1',
+          AskQuestions.confirmPlanId: true,
+        },
+        'defaulted': <String>[],
+      });
+    });
+
+    test('a required question no flow asked is not required', () async {
+      // The roster asks nothing required. Answering it without resending the
+      // questions must not be judged against column_date, duration_format,
+      // confirm_plan or delete_rows, which belong to other flows.
+      final state = await asked(roster());
+      final result = await ask({
+        'answers': {AskQuestions.aircraftId: 'ac-1'},
+      }, state: state);
+      expect(payloadOf(result), {
+        'status': 'answered',
+        'answers': {AskQuestions.aircraftId: 'ac-1'},
+        'defaulted': <String>[],
+      });
+    });
+  });
+
   group('question parsing', () {
     test('a malformed question is rejected by field', () {
       final cases = <String, Object?>{

@@ -196,6 +196,60 @@ void main() {
     expect(cancelled['structuredContent'], {'status': 'cancelled'});
   });
 
+  test('a required question cannot be skipped by not resending the questions',
+      () async {
+    final server = await McpProcess.startStateless(dbPath);
+    addTearDown(() async {
+      await server.stop();
+    });
+
+    // The confirmation a guided write asks before it changes the logbook.
+    final writingFlow = [
+      ...questions,
+      {
+        'id': 'confirm_plan',
+        'header': 'Confirm',
+        'question': 'Review the plan above and confirm',
+        'type': 'boolean',
+        'default': false,
+        'required': true,
+      },
+    ];
+
+    final asked =
+        resultOf(await server.callRaw('ask_user', {'questions': writingFlow}));
+    expect((asked['structuredContent'] as Map)['status'], 'needs_input');
+
+    // Answers alone, the shape issue #6 documents: the flow's required
+    // question is still enforced, or a flow that reads `answered` as consent
+    // would write having never been confirmed.
+    Map<String, dynamic> envelopeOf(String payload) =>
+        jsonDecode(payload) as Map<String, dynamic>;
+
+    final empty =
+        await server.call('ask_user', {'answers': <String, dynamic>{}});
+    expect(empty.isError, isTrue, reason: '${empty.payload}');
+    expect(
+        envelopeOf(empty.payload as String)['field'], 'answers.confirm_plan');
+    expect(envelopeOf(empty.payload as String)['detail'],
+        contains('confirm_plan is required'));
+
+    final partial = await server.call('ask_user', {
+      'answers': {'aircraft': 'ac-1'},
+    });
+    expect(partial.isError, isTrue, reason: '${partial.payload}');
+
+    final complete = await server.call('ask_user', {
+      'answers': {'aircraft': 'ac-1', 'confirm_plan': true},
+    });
+    expect(complete.isError, isFalse, reason: '${complete.payload}');
+    expect(complete.payload, {
+      'status': 'answered',
+      'answers': {'aircraft': 'ac-1', 'confirm_plan': true},
+      'defaulted': <String>[],
+    });
+  });
+
   test('a multi-select answer survives the round trip', () async {
     final server = await McpProcess.startStateless(
       dbPath,
