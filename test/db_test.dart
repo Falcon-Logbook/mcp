@@ -70,6 +70,99 @@ void main() {
     );
   });
 
+  test('a writable logbook starts in write mode without changing the file', () {
+    final before = File(dbPath).readAsBytesSync();
+
+    final db = openDb(dbPath);
+    addTearDown(db.close);
+    expect(db.readonly, isFalse);
+    // The probe takes the write lock and rolls it back, so the logbook is
+    // byte-identical and no journal is left beside it: a probe that did write
+    // would show up here.
+    expect(File(dbPath).readAsBytesSync(), before);
+    expect(
+      tempDir.listSync().map((entry) => entry.path.split('/').last),
+      ['falcon_db.sqlite'],
+    );
+  });
+
+  test(
+      'a write-protected logbook fails at startup in write mode with a '
+      'permission message', () {
+    final copy =
+        File(dbPath).copySync('${tempDir.path}/readonly file.sqlite').path;
+    Process.runSync('chmod', ['444', copy]);
+    addTearDown(() => Process.runSync('chmod', ['644', copy]));
+
+    // SQLite would open this file read-write and quietly fall back to
+    // read-only, so the write is what has to fail, before the banner claims
+    // readwrite.
+    expect(
+      () => openDb(copy),
+      throwsA(
+        isA<FalconDbException>().having(
+          (error) => error.message,
+          'message',
+          allOf(
+            contains('Cannot write to the logbook'),
+            contains('not writable'),
+            contains('read-only'),
+            contains('--db'),
+            contains('FALCON_DB_PATH'),
+            contains('--readonly'),
+          ),
+        ),
+      ),
+    );
+  },
+      skip: _permissionsIgnored
+          ? 'running as root ignores the file mode, so the write would succeed '
+              'and nothing would be proven'
+          : null);
+
+  test('a write-protected directory fails at startup in write mode', () {
+    final dir = Directory('${tempDir.path}/readonly mount')..createSync();
+    final copy = File(dbPath).copySync('${dir.path}/falcon_db.sqlite').path;
+    // The file itself is writable; only the directory cannot take the journal
+    // or -wal SQLite needs to begin a write.
+    Process.runSync('chmod', ['555', dir.path]);
+    addTearDown(() => Process.runSync('chmod', ['755', dir.path]));
+
+    expect(
+      () => openDb(copy),
+      throwsA(
+        isA<FalconDbException>().having(
+          (error) => error.message,
+          'message',
+          contains('not writable'),
+        ),
+      ),
+    );
+  },
+      skip: _permissionsIgnored
+          ? 'running as root ignores the directory mode, so the write would '
+              'succeed and nothing would be proven'
+          : null);
+
+  test('a write-protected logbook still opens in read-only mode', () {
+    final copy =
+        File(dbPath).copySync('${tempDir.path}/readonly read.sqlite').path;
+    Process.runSync('chmod', ['444', copy]);
+    addTearDown(() => Process.runSync('chmod', ['644', copy]));
+
+    final db = openDb(copy, readonly: true);
+    addTearDown(db.close);
+    expect(db.schemaVersion, fixtureSchemaVersion);
+    expect(
+      db.query("SELECT route FROM flights WHERE id = 'fl-1'").single['route'],
+      'YSSY - NZQN',
+    );
+  },
+      skip: _permissionsIgnored
+          ? 'running as root ignores the file mode, so the read would succeed '
+              'with or without read-only mode'
+          : null);
+
   test('a WAL logbook is read over a normal read-only connection', () {
     _setWal(dbPath);
     // A commit still in the -wal is visible only to a connection that honours
