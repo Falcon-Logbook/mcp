@@ -6245,7 +6245,16 @@ Future<void> runServer(String dbPath, {bool readonly = true}) async {
               continue;
             }
             if (currentId != null) continue;
-            final matches = _aircraftCandidates(db, registration!);
+            if (registration == null || registration.isEmpty) {
+              // An explicit flight_id can name a flight with neither a link
+              // nor any registration text, so there is nothing to resolve.
+              unmatched.add({
+                'flight_id': id,
+                'detail': 'flight has no aircraft and no registration text',
+              });
+              continue;
+            }
+            final matches = _aircraftCandidates(db, registration);
             var chosen = matches;
             if (matches.length > 1 && preferred.isNotEmpty) {
               final inCountry = matches

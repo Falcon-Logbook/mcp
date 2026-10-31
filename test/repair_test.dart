@@ -463,6 +463,61 @@ void main() {
           'VH-XZO');
     });
 
+    test(
+        'an explicit flight_id with no link and no text is reported, not '
+        'thrown', () async {
+      // Issue #60: fl-draft has aircraft_id IS NULL and empty registration
+      // text, so there is nothing to resolve. The preview must report it.
+      final server = await start(write: true);
+
+      final preview = payloadOf(await server.call('link_flights_to_aircraft', {
+        'flight_ids': ['fl-draft']
+      }));
+
+      expect(preview['dry_run'], isTrue);
+      expect(preview['linked'], 0);
+      final unmatched = preview['unmatched'] as List;
+      expect(unmatched.single['flight_id'], 'fl-draft');
+      expect(unmatched.single['detail'],
+          'flight has no aircraft and no registration text');
+
+      final applied = payloadOf(await server.call('link_flights_to_aircraft', {
+        'flight_ids': ['fl-draft'],
+        'dry_run': false
+      }));
+      expect(applied['linked'], 0);
+      expect((applied['unmatched'] as List).single['flight_id'], 'fl-draft');
+
+      final row = withFixtureDb(
+          dbPath,
+          (db) => db
+              .select('SELECT aircraft_id, aircraft_registration FROM flights '
+                  "WHERE id = 'fl-draft'")).single;
+      expect(row['aircraft_id'], isNull);
+      expect(row['aircraft_registration'], isNull);
+    });
+
+    test('a batch with one unlinkable flight still links the others', () async {
+      insert("INSERT INTO flights (id, date, route, aircraft_registration, "
+          "created_at) VALUES ('fl-link', 1761408000, 'YSSY - NZQN', "
+          "'VH-XZO', 1700000000)");
+      final server = await start(write: true);
+
+      final applied = payloadOf(await server.call('link_flights_to_aircraft', {
+        'flight_ids': ['fl-draft', 'fl-link'],
+        'dry_run': false
+      }));
+
+      expect(applied['linked'], 1);
+      expect((applied['unmatched'] as List).single['flight_id'], 'fl-draft');
+      final row = withFixtureDb(
+              dbPath,
+              (db) => db.select(
+                  'SELECT aircraft_id FROM flights WHERE id = ?', ['fl-link']))
+          .single;
+      expect(row['aircraft_id'], 'ac-1');
+    });
+
     test('never creates aircraft and never deletes anything', () async {
       insert("INSERT INTO flights (id, date, route, aircraft_registration, "
           "created_at) VALUES ('fl-nope', 1761408000, 'YSSY - NZQN', "
