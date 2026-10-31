@@ -1,6 +1,7 @@
 import 'dart:convert';
 import 'dart:io';
 
+import 'package:falcon_mcp/falcon_mcp.dart' show dateToEpoch;
 import 'package:test/test.dart';
 
 import 'support/harness.dart';
@@ -77,6 +78,49 @@ void main() {
           reason: 'the error must name the accepted forms');
     }
     expect(flightCount(), before, reason: 'a refused write must not insert');
+  });
+
+  test('refuses an impossible day in timestamp form and stores nothing',
+      () async {
+    // #37: DateTime.tryParse turned 30 February into 2 March and month 13 into
+    // next January, so a write landed on a day the caller never named.
+    final server = await start();
+    final before = flightCount();
+
+    for (final date in ['2026-02-30T00:00:00', '2026-13-01T00:00:00']) {
+      final result = await server.call('create_flight', {
+        'date': date,
+        'total_time': 60,
+      });
+      expect(result.isError, isTrue, reason: '$date must be refused');
+      expect('${result.payload}', contains('date'));
+      expect(flightCount(), before, reason: '$date must not insert');
+    }
+
+    final created = await server.call('create_flight', {
+      'date': '2026-10-27',
+      'total_time': 60,
+    });
+    expect(created.isError, isFalse, reason: '${created.payload}');
+    final id = payloadOf(created)['id'] as String;
+    final storedDay = flightRow(id)['date'] as int;
+    expect(storedDay, dateToEpoch('2026-10-27'));
+
+    final updated = await server.call('update_flight', {
+      'id': id,
+      'date': '2026-02-30T00:00:00',
+    });
+    expect(updated.isError, isTrue, reason: '${updated.payload}');
+    expect(flightRow(id)['date'], storedDay,
+        reason: 'a refused update must leave the day alone');
+
+    // A real timestamp still names the day it lands on in the logbook zone.
+    final accepted = await server.call('update_flight', {
+      'id': id,
+      'date': '2026-10-28T12:34:00',
+    });
+    expect(accepted.isError, isFalse, reason: '${accepted.payload}');
+    expect(flightRow(id)['date'], dateToEpoch('2026-10-28'));
   });
 
   test('accepts the app limits exactly and refuses one past them', () async {
