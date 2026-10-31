@@ -29,6 +29,12 @@ void main() {
     return server;
   }
 
+  /// A year from today, at the day start the `date` column stores. The
+  /// future_dates class compares against the wall clock, so the fixture has to
+  /// move with it instead of naming an epoch that goes stale.
+  final futureEpoch =
+      epochForDayStart(DateTime.now().add(const Duration(days: 365)));
+
   Map<String, dynamic> payloadOf(({bool isError, Object? payload}) result) =>
       result.isError
           ? throw StateError('call failed: ${result.payload}')
@@ -65,7 +71,7 @@ void main() {
           "NULL, 'VH-XZO', NULL, 1700000000)");
       insert("INSERT INTO flights (id, date, route, total_time, day_time, "
           "night_time, aircraft_registration, created_at) VALUES "
-          "('fl-future', 1893456000, 'YSSY - NZQN', 100, 100, NULL, "
+          "('fl-future', $futureEpoch, 'YSSY - NZQN', 100, 100, NULL, "
           "'VH-NOPE', 1700000000)");
       insert("INSERT INTO flights (id, date, route, total_time, day_time, "
           "night_time, aircraft_registration, created_at) VALUES "
@@ -166,7 +172,7 @@ void main() {
           "NULL, NULL, 1700000000), "
           "('fl-route-bad', 1762272000, 'not an airport pair', 60, 60, 0, "
           "NULL, NULL, 0, NULL, NULL, 1700000000), "
-          "('fl-future', 1893456000, NULL, 60, 60, 0, NULL, NULL, 0, NULL, "
+          "('fl-future', $futureEpoch, NULL, 60, 60, 0, NULL, NULL, 0, NULL, "
           "NULL, 1700000000), "
           "('fl-dangle', 1762358400, 'YSSY - YBBN', 60, 60, 0, NULL, NULL, "
           "0, NULL, 999, 1700000000), "
@@ -191,7 +197,7 @@ void main() {
               'fl-crew' => 1762099200,
               'fl-dup1' || 'fl-dup2' => 1762185600,
               'fl-route-bad' => 1762272000,
-              'fl-future' => 1893456000,
+              'fl-future' => futureEpoch,
               'fl-dangle' => 1762358400,
               'fl-sim-nodur' => 1762444800,
               'fl-sim-notsimaircraft' => 1762531200,
