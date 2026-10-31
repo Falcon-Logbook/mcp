@@ -2844,11 +2844,18 @@ Map<String, dynamic> _deleted(String table, Object id) => {
       'table': table,
     };
 
-/// The `expected_updated_at` argument every update tool accepts.
-JsonSchema get _expectedUpdatedAtSchema => JsonSchema.integer(
-    minimum: 0,
-    description: 'The updated_at you read. A conflict returns the current row '
-        'when it changed since. Omit to write unconditionally.');
+/// The `expected_updated_at` argument every update tool accepts: the ISO-8601
+/// text a read returned, or the same instant as unix epoch seconds.
+JsonSchema get _expectedUpdatedAtSchema => JsonUnion(
+      [
+        JsonSchema.integer(minimum: 0),
+        JsonSchema.string(),
+      ],
+      description: 'The updated_at you read, as ISO-8601 text '
+          '(e.g. 2026-10-27T00:00:00.000+1100) or unix epoch seconds. A '
+          'conflict returns the current row when it changed since. Omit to '
+          'write unconditionally.',
+    );
 
 /// The `dry_run` argument every write tool accepts.
 JsonSchema get _dryRunSchema => JsonSchema.boolean(
@@ -2882,14 +2889,33 @@ class _DryRun {
 /// The fragment expects the statement's WHERE clause to end with `id = ?` and
 /// the id to be bound last before these values.
 (String, List<Object?>) _optimisticGuard(Map<String, dynamic> args) {
-  final expected = asInt(args['expected_updated_at']);
+  final expected = _expectedUpdatedAtOf(args);
   if (expected == null) return ('', const []);
   return (' AND updated_at = ?', [expected]);
 }
 
-/// The expected_updated_at argument, for the error message.
-int? _expectedUpdatedAtOf(Map<String, dynamic> args) =>
-    asInt(args['expected_updated_at']);
+/// The expected_updated_at argument as the epoch seconds the column stores.
+///
+/// Accepts the two forms a caller can name the instant with: the ISO-8601 text
+/// reads return ([epochToIso]) and unix epoch seconds (an integer, an integral
+/// double or a digit string, as [asInt] allows). Anything else is refused
+/// rather than treated as absent, because a guard silently dropped turns a
+/// protected write into an unconditional one. Returns null only when the
+/// argument was omitted.
+int? _expectedUpdatedAtOf(Map<String, dynamic> args) {
+  final value = args['expected_updated_at'];
+  if (value == null) return null;
+  final expected = asInt(value) ?? isoInstantToEpoch(value);
+  if (expected == null || expected < 0) {
+    throw _ToolError(
+      'expected_updated_at must be the updated_at a read returned, as '
+      'ISO-8601 text (for example 2026-10-27T00:00:00.000+1100) or unix epoch '
+      'seconds; got ${jsonEncode(value)}',
+      field: 'expected_updated_at',
+    );
+  }
+  return expected;
+}
 
 /// Throws unless [changed] says the update wrote the row it aimed at.
 ///
@@ -5937,9 +5963,12 @@ Future<void> runServer(String dbPath, {bool readonly = true}) async {
         };
         // The guard only makes sense on the update path: a row this call
         // inserts itself carries a stamp from now, not from the caller's
-        // read, so expecting one could never match.
-        final guard =
-            existing.isEmpty ? ('', const <Object?>[]) : _optimisticGuard(args);
+        // read, so expecting one could never match. The argument is parsed
+        // either way, so a malformed value is refused instead of ignored.
+        final expected = _expectedUpdatedAtOf(args);
+        final guard = existing.isEmpty || expected == null
+            ? ('', const <Object?>[])
+            : (' AND updated_at = ?', [expected]);
         db.transaction(() {
           if (db.query(
               'SELECT id FROM flights_settings WHERE id = ?', [id]).isEmpty) {
@@ -5960,7 +5989,7 @@ Future<void> runServer(String dbPath, {bool readonly = true}) async {
               changed: changed,
               label: 'Flight settings',
               tool: 'update_flight_settings',
-              expected: existing.isEmpty ? null : _expectedUpdatedAtOf(args));
+              expected: existing.isEmpty ? null : expected);
         });
         return {
           'status': 'updated',
@@ -6497,7 +6526,7 @@ Future<void> runServer(String dbPath, {bool readonly = true}) async {
                 '- Deleting a flight, aircraft, crew member or custom airport also records a sync tombstone when a Postgres sync provider has been used, so the deletion propagates.\n'
                 '- A field means the same thing wherever it appears: create_flight and update_flight take the same flight fields with the same types and limits, the per-field notes are written once on create_flight, and what a field means is written here.\n'
                 '- Use get_schema for table names and their column counts; pass table for one table\'s columns, and detail: "full" for its default and pk columns too.\n'
-                '- Update tools accept expected_updated_at: the updated_at of the row as the caller read it. The write then applies only to an unchanged row, so a concurrent change from the app or another writer fails with a conflict that returns the current row, instead of being silently overwritten. Omitting it writes unconditionally, as before.\n'
+                '- Update tools accept expected_updated_at: the updated_at of the row as the caller read it, either exactly as the row rendered it (ISO-8601, for example 2023-11-14T22:15:00.000+1100) or the same instant as unix epoch seconds. The two forms are compared as instants, so the stamp from a read can be passed straight back. The write then applies only to an unchanged row, so a concurrent change from the app or another writer fails with a conflict that returns the current row, instead of being silently overwritten. Omitting it writes unconditionally, as before, and any other value is refused with invalid_value rather than ignored.\n'
                 '- Every write tool accepts dry_run: true: it resolves, validates and answers exactly as the write would (the row as written, computed ids, warnings), marks the response dry_run: true, and commits nothing. A preview error is the write error, so a clean preview means the write will apply; an id a preview generated is not reserved, so pass your own or let the real call make one.\n'
                 '- data_quality_report is one read-only call over every defect class an imported logbook can have: drafts, missing or mismatched splits, absurd totals, unlinked aircraft and crew, duplicate crew and flights, unparsable routes, future dates, dangling route links, simulator oddities, orphaned registration text. Each class carries a stable id, a count and a sample of up to 4 rows; a count is the finding, not the full list.\n'
                 '- The repair tools merge_crew, link_flights_to_aircraft and link_flights_to_crew default to dry_run: true and say so on the response; pass dry_run: false to apply the same diff. They run in one transaction, stamp updated_at, tombstone deletions so sync propagates them, never create rows beyond the operation named, and never delete flights: duplicate flights are reported for a human to decide.\n'

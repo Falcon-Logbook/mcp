@@ -353,13 +353,16 @@ void main() {
       // `units` to both roster tools: `validate_flight_drafts` carries its
       // 1,224 B here too, and `apply_flight_batch` grows 796 B with the same
       // two arguments and its reworded description, at 47,880 B measured.
+      // #56 lets `expected_updated_at` name the ISO stamp a read returns as
+      // well as epoch seconds: the six update tools carry a two-type schema
+      // and the accepted forms, at 48,958 B measured.
       // Same rule as above: measured plus 1,024 B, so wording has room and a
-      // tool does not: 47,880 B measured, so 48,904 B.
+      // tool does not: 48,958 B measured, so 49,982 B.
       final writeMode =
           bytesOf(jsonEncode((await writer.send('tools/list', {}))['result']));
-      expect(writeMode, lessThanOrEqualTo(48904),
+      expect(writeMode, lessThanOrEqualTo(49982),
           reason: 'the write-mode catalog costs $writeMode B, against '
-              '47,880 B measured plus 1,024 B of wording headroom');
+              '48,958 B measured plus 1,024 B of wording headroom');
     });
   });
 

@@ -193,6 +193,59 @@ int? asInt(Object? value) {
   return null;
 }
 
+final RegExp _isoInstant = RegExp(
+  r'^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2}):(\d{2})'
+  r'(?:\.(\d{1,3}))?(Z|[+-]\d{2}:?\d{2})$',
+);
+
+/// Parses the ISO-8601 instant form [epochToIso] renders (for example
+/// `2026-10-27T00:00:00.000+1100`) back into unix epoch seconds.
+///
+/// Strict on purpose: the text must carry a time with seconds and an explicit
+/// offset (`Z` or `+hh:mm`/`+hhmm`), and every calendar field must round-trip,
+/// so a date-only value, a naive local time (whose instant depends on the host
+/// zone) or an impossible date such as 2023-02-30 is refused with null rather
+/// than silently parsed into a different instant.
+int? isoInstantToEpoch(Object? value) {
+  if (value is! String) return null;
+  final match = _isoInstant.firstMatch(value.trim());
+  if (match == null) return null;
+  final year = int.parse(match.group(1)!);
+  final month = int.parse(match.group(2)!);
+  final day = int.parse(match.group(3)!);
+  final hour = int.parse(match.group(4)!);
+  final minute = int.parse(match.group(5)!);
+  final second = int.parse(match.group(6)!);
+  final millisecond = int.parse(match.group(7) ?? '0');
+  final instant =
+      DateTime.utc(year, month, day, hour, minute, second, millisecond);
+  // DateTime normalises out-of-range fields (month 13 -> next January, hour 24
+  // -> next midnight), so reject anything that does not read back unchanged.
+  if (instant.year != year ||
+      instant.month != month ||
+      instant.day != day ||
+      instant.hour != hour ||
+      instant.minute != minute ||
+      instant.second != second) {
+    return null;
+  }
+  // The columns this guard compares hold whole seconds, so a sub-second
+  // instant names a moment no stored stamp can equal.
+  if (millisecond != 0) return null;
+
+  final zone = match.group(8)!;
+  var offsetSeconds = 0;
+  if (zone != 'Z') {
+    final digits = zone.substring(1).replaceAll(':', '');
+    final offsetHours = int.parse(digits.substring(0, 2));
+    final offsetMinutes = int.parse(digits.substring(2));
+    if (offsetHours > 23 || offsetMinutes > 59) return null;
+    offsetSeconds = offsetHours * 3600 + offsetMinutes * 60;
+    if (zone.startsWith('-')) offsetSeconds = -offsetSeconds;
+  }
+  return instant.millisecondsSinceEpoch ~/ 1000 - offsetSeconds;
+}
+
 /// Coerces loose JSON input into a double without throwing.
 double? asDouble(Object? value) {
   if (value == null) return null;
