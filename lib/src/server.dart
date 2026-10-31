@@ -5729,17 +5729,30 @@ Future<void> runServer(String dbPath, {bool readonly = true}) async {
         // The delete's affected-row count decides whether anything happened:
         // a route a concurrent writer removed after the existence check ends
         // in a not_found error instead of unlinking flights for nothing.
-        db.transaction(() {
+        return db.transaction(() {
           final deleted =
               db.execute('DELETE FROM saved_routes WHERE id = ?', [id]);
           if (deleted == 0) {
             throw _ToolError('Saved route not found: $id',
                 code: 'not_found', field: 'id');
           }
+          // The unlink is a write to the flight, so it carries the stamp the
+          // app's delta push selects on; without it the cloud keeps a route_id
+          // pointing at the route this call just deleted.
+          final affectedIds = [
+            for (final row
+                in db.query('SELECT id FROM flights WHERE route_id = ?', [id]))
+              row['id'] as String,
+          ];
           db.execute(
-              'UPDATE flights SET route_id = NULL WHERE route_id = ?', [id]);
+              'UPDATE flights SET route_id = NULL, updated_at = ? '
+              'WHERE route_id = ?',
+              [nowEpochSeconds(), id]);
+          return <String, dynamic>{
+            ..._deleted('saved_routes', id),
+            'affected_ids': affectedIds,
+          };
         });
-        return _deleted('saved_routes', id);
       }),
     );
 
