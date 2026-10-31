@@ -66,15 +66,75 @@ class FalconDb {
         'Pass --db <path>, set FALCON_DB_PATH, or configure the path in the Falcon app.',
       );
     }
-    _db = sqlite3.open(
-      path,
-      mode: readonly ? OpenMode.readOnly : OpenMode.readWrite,
-    );
+    if (readonly) {
+      _db = _openReadOnly();
+      return;
+    }
+    _db = sqlite3.open(path, mode: OpenMode.readWrite);
     _db.execute('PRAGMA busy_timeout = 5000');
     // The app turns foreign keys on, and relies on ON DELETE SET NULL to clear
     // flights.aircraft_id / flights.crew_member_id. Without this a delete
     // leaves dangling references.
-    if (!readonly) _db.execute('PRAGMA foreign_keys = ON');
+    _db.execute('PRAGMA foreign_keys = ON');
+  }
+
+  /// Opens the logbook for reading, preferring an ordinary read-only
+  /// connection so the `-wal` is honoured and a live writer is coordinated
+  /// with.
+  ///
+  /// An ordinary read-only connection still writes to the logbook's directory:
+  /// a WAL database creates and maps `-shm`, and may create `-wal`, so a
+  /// successful read-only start can leave `falcon_db.sqlite-wal` and
+  /// `falcon_db.sqlite-shm` beside the logbook. In a directory that cannot be
+  /// written to that same connection fails, which is the case the immutable
+  /// retry exists for.
+  Database _openReadOnly() {
+    Database? db;
+    try {
+      db = sqlite3.open(path, mode: OpenMode.readOnly);
+      db.execute('PRAGMA busy_timeout = 5000');
+      // Opening is lazy: the first read is what touches `-shm`, so prove the
+      // connection can read before accepting it.
+      db.select('PRAGMA user_version');
+      return db;
+    } on SqliteException catch (error) {
+      try {
+        db?.dispose();
+      } catch (_) {
+        // The connection never worked; the open error is what matters.
+      }
+      if (!_isLockedOutByDirectory(error)) rethrow;
+      return _openImmutable(error);
+    }
+  }
+
+  /// Last resort for a logbook whose directory cannot be written to:
+  /// `immutable=1` promises SQLite the file cannot change, so it takes no
+  /// locks and creates no `-shm`/`-wal`, and the read works on a read-only
+  /// mount.
+  ///
+  /// The promise has a cost: an immutable connection never checks for a
+  /// writer, ignores a `-wal` left behind by one, and can therefore miss
+  /// recent commits or read a half-written file. It is worth it only when the
+  /// alternative is refusing to read an otherwise readable logbook.
+  Database _openImmutable(SqliteException firstError) {
+    final uri = _immutableUri(path);
+    try {
+      final db = sqlite3.open(uri, mode: OpenMode.readOnly, uri: true);
+      db.execute('PRAGMA busy_timeout = 5000');
+      return db;
+    } on SqliteException catch (error) {
+      throw FalconDbException(
+        'Cannot read the logbook at $path: ${firstError.message}\n'
+        'A logbook in WAL mode needs a writable directory even for reads, '
+        'because SQLite creates and maps the -shm file there (and may create '
+        '-wal), so a read-only mount fails.\n'
+        'Copy the logbook somewhere writable and point --db at the copy.\n'
+        'The immutable fallback ($uri) also failed: ${error.message}. '
+        'immutable=1 reads the file without locks, so it cannot coordinate '
+        'with a live writer or see commits still in -wal.',
+      );
+    }
   }
 
   final String path;
@@ -246,3 +306,26 @@ bool _isBoolColumn(String column) =>
 
 FalconDb openDb(String path, {bool readonly = false}) =>
     FalconDb(path, readonly: readonly);
+
+/// The `immutable=1` URI SQLite needs to open [path] without touching its
+/// directory.
+///
+/// The path is made absolute first (a relative `file:` URI resolves against the
+/// working directory, which is not what a caller passed), then percent-encoded
+/// by [Uri.file] so a logbook in a directory with a space or a `?` in its name
+/// still opens. `file:///...` is the absolute path SQLite's URI parser expects.
+String _immutableUri(String path) =>
+    '${Uri.file(File(path).absolute.path)}?immutable=1';
+
+/// Whether [error] is SQLite refusing to write the directory (or unable to
+/// open a file there), which is the only failure the immutable retry can fix.
+///
+/// [SqliteException.resultCode] strips the extended code, so
+/// `SQLITE_READONLY_DIRECTORY` and `SQLITE_READONLY_CANTINIT` count as
+/// `SQLITE_READONLY` here.
+bool _isLockedOutByDirectory(SqliteException error) {
+  const sqliteReadonly = 8;
+  const sqliteCantOpen = 14;
+  return error.resultCode == sqliteReadonly ||
+      error.resultCode == sqliteCantOpen;
+}

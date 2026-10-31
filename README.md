@@ -107,7 +107,12 @@ mapped rows and writes them.
 ## How it stays yours
 
 - **Read-only by default.** Writes happen only when you turn them on, with `--no-readonly` or
-  `FALCON_READONLY=false`. An explicit flag wins over the environment variable.
+  `FALCON_READONLY=false`. An explicit flag wins over the environment variable. A read-only start
+  can still leave `-wal` and `-shm` files beside the logbook, because SQLite maps them even for
+  reads. When the directory cannot be written to at all (a read-only mount), the logbook is read
+  through SQLite's `immutable=1` fallback instead: no locks and no side files, but no coordination
+  with a live writer either, so keep the app closed and expect commits still in `-wal` to be
+  missing.
 - **Local and offline.** The server reads your SQLite file directly. It opens no sockets and sends
   nothing anywhere: no cloud, no account, no telemetry, and it never talks to a sync server.
 - **Works with the app open or closed.**
