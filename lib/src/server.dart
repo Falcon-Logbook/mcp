@@ -3383,17 +3383,38 @@ class _FalconServer extends McpServer {
   }
 }
 
+/// The startup gate's message for a [version] the server cannot use.
+///
+/// A file with no `user_version` is usually not a Falcon logbook at all, so
+/// telling the user to update either app is useless: name the path and how it
+/// was chosen instead. A real version outside the supported window has one
+/// clear owner - below the floor the app has not migrated the file yet, above
+/// the ceiling this server is too old - so each case names only that side.
+String schemaGateMessage(String dbPath, int version) {
+  final supported = '$minSchemaVersion-$maxSchemaVersion';
+  if (version == 0) {
+    return 'No Falcon schema version in $dbPath: the file has no schema '
+        'version, so it does not look like a Falcon logbook.\n'
+        'The path came from --db, then FALCON_DB_PATH, then the app\'s '
+        'db_path.conf, then the platform default. '
+        'Pass --db <path> or set FALCON_DB_PATH to the Falcon app database.';
+  }
+  if (version < minSchemaVersion) {
+    return 'Falcon DB schema version $version at $dbPath is older than the '
+        'supported $supported. Update the Falcon app so it migrates the '
+        'database, then start this server again.';
+  }
+  return 'Falcon DB schema version $version at $dbPath is newer than the '
+      'supported $supported. Update this MCP server to match the Falcon app.';
+}
+
 Future<void> runServer(String dbPath, {bool readonly = true}) async {
   final db = openDb(dbPath, readonly: readonly);
 
   final version = db.schemaVersion;
   if (version < minSchemaVersion || version > maxSchemaVersion) {
     db.close();
-    throw FalconDbException(
-      'Falcon DB schema version mismatch at $dbPath: found $version, '
-      'supported $minSchemaVersion-$maxSchemaVersion. '
-      'Update the Falcon app or this MCP server so they match.',
-    );
+    throw FalconDbException(schemaGateMessage(dbPath, version));
   }
 
   final auditor = _Auditor(dbPath);

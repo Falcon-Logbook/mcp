@@ -491,4 +491,65 @@ void main() {
     final listed = await server.call('list_flights', {'limit': 5});
     expect(listed.isError, isFalse, reason: '${listed.payload}');
   });
+
+  // The startup gate is the only diagnostic a user sees when the server
+  // refuses to run, so each refusal has to name the fault it can act on.
+  group('schema gate', () {
+    Future<ProcessResult> startWith(String path) => Process.run(
+          Platform.resolvedExecutable,
+          ['run', 'bin/falcon_mcp.dart', '--db', path],
+        );
+
+    test('a file with no schema version is reported as not a logbook',
+        () async {
+      final path = '${tempDir.path}/not_a_logbook.sqlite';
+      File(path).createSync();
+
+      final result = await startWith(path);
+      final stderr = '${result.stderr}';
+
+      expect(result.exitCode, isNot(0));
+      expect(stderr, contains(path));
+      expect(stderr, contains('no schema version'));
+      expect(stderr, contains('does not look like a Falcon logbook'));
+      expect(stderr, contains('--db'));
+      expect(stderr, contains('FALCON_DB_PATH'));
+      expect(stderr, contains('db_path.conf'));
+      expect(stderr, contains('platform default'));
+      expect(stderr, isNot(contains('Update this MCP server')),
+          reason: 'a non-Falcon file cannot be fixed by updating the server');
+      expect('${result.stdout}', isEmpty,
+          reason: 'stdout is the MCP channel and stays clean');
+    });
+
+    test('a below-floor database asks for an app update', () async {
+      withFixtureDb(dbPath, (db) => db.execute('PRAGMA user_version = 17'));
+
+      final result = await startWith(dbPath);
+      final stderr = '${result.stderr}';
+
+      expect(result.exitCode, isNot(0));
+      expect(stderr, contains(dbPath));
+      expect(stderr, contains('17'));
+      expect(stderr, contains('older than the supported 18-20'));
+      expect(stderr, contains('Update the Falcon app'));
+      expect(stderr, isNot(contains('Update this MCP server')),
+          reason: '18 is the floor, so only the app can migrate the file');
+    });
+
+    test('an above-ceiling database asks for a server update', () async {
+      withFixtureDb(dbPath, (db) => db.execute('PRAGMA user_version = 21'));
+
+      final result = await startWith(dbPath);
+      final stderr = '${result.stderr}';
+
+      expect(result.exitCode, isNot(0));
+      expect(stderr, contains(dbPath));
+      expect(stderr, contains('21'));
+      expect(stderr, contains('newer than the supported 18-20'));
+      expect(stderr, contains('Update this MCP server'));
+      expect(stderr, isNot(contains('Update the Falcon app')),
+          reason: 'the app is already ahead; the server is the stale side');
+    });
+  });
 }
