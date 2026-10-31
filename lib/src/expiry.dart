@@ -42,12 +42,34 @@ String expiryStatusForDays(int days,
 /// `settings` when `expiry_settings` has a row, `defaults` when it does not.
 typedef ExpiryThresholds = ({int green, int orange, String source});
 
-/// Reads the green/orange thresholds without ever writing the settings row.
+/// The `expiry_settings` row a read should use, or null when the table has
+/// none.
 ///
 /// A read path must not insert it: the app's `ensureSingletonRow` does, and in
 /// read-only mode the same insert raises SQLITE_READONLY and turns a read into a
 /// failure. Two rows can exist after a sync (each device inserts its own uuid),
-/// so local rows win and the newest wins among them.
+/// so a local row wins over a shared one and the newest `updated_at` wins among
+/// equals. `get_settings` returns this same row, so the thresholds it reports
+/// and the ones `list_expiries` computes with cannot disagree.
+Map<String, dynamic>? readExpirySettingsRow(FalconDb db) {
+  final columns = db.columnsOf('expiry_settings');
+  if (columns.isEmpty) return null;
+  final order = [
+    if (columns.contains('updated_at')) 'updated_at DESC',
+    if (columns.contains('id')) 'id',
+  ];
+  final local = columns.contains('owner_id')
+      ? "(owner_id IS NULL OR owner_id = 'local')"
+      : null;
+  final rows = db.query(
+    'SELECT * FROM expiry_settings'
+    '${local == null ? '' : ' WHERE $local'}'
+    '${order.isEmpty ? '' : ' ORDER BY ${order.join(', ')}'} LIMIT 1',
+  );
+  return rows.isEmpty ? null : rows.first;
+}
+
+/// Reads the green/orange thresholds from [readExpirySettingsRow].
 ExpiryThresholds readExpiryThresholds(FalconDb db) {
   const fallback = (
     green: defaultExpiryGreen,
@@ -60,20 +82,8 @@ ExpiryThresholds readExpiryThresholds(FalconDb db) {
       !columns.contains('orange_threshold')) {
     return fallback;
   }
-  final order = [
-    if (columns.contains('updated_at')) 'updated_at DESC',
-    if (columns.contains('id')) 'id',
-  ];
-  final local = columns.contains('owner_id')
-      ? "(owner_id IS NULL OR owner_id = 'local')"
-      : null;
-  final rows = db.query(
-    'SELECT green_threshold, orange_threshold FROM expiry_settings'
-    '${local == null ? '' : ' WHERE $local'}'
-    '${order.isEmpty ? '' : ' ORDER BY ${order.join(', ')}'} LIMIT 1',
-  );
-  if (rows.isEmpty) return fallback;
-  final row = rows.first;
+  final row = readExpirySettingsRow(db);
+  if (row == null) return fallback;
   return (
     green: asInt(row['green_threshold']) ?? defaultExpiryGreen,
     orange: asInt(row['orange_threshold']) ?? defaultExpiryOrange,

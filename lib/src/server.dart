@@ -4464,11 +4464,13 @@ Future<void> runServer(String dbPath, {bool readonly = true}) async {
   server.registerTool(
     'get_settings',
     description:
-        'Get one settings table\'s row: ${_settingsTables.join(', ')}. Each holds '
-        'a single row, and a fresh database has none until the app opens that '
-        'screen, so an empty table answers {} rather than an error. Never '
-        'creates the row. aircraft_type_settings is keyed by aircraft type '
-        'rather than being a singleton, so it is not here.',
+        'Get one settings table\'s row: ${_settingsTables.join(', ')}. A fresh '
+        'database has none until the app opens that screen, so an empty table '
+        'answers {} rather than an error. Never creates the row. '
+        'expiry_settings can hold more than one row after a sync, and the read '
+        'picks the local row first, then the newest updated_at, the same '
+        'resolution list_expiries uses. aircraft_type_settings is keyed by '
+        'aircraft type rather than being a singleton, so it is not here.',
     inputSchema: JsonSchema.object(properties: {
       'table': JsonSchema.string(
           description: 'Settings table to read, one of the names above.'),
@@ -4492,10 +4494,17 @@ Future<void> runServer(String dbPath, {bool readonly = true}) async {
               code: 'not_found',
               field: 'table');
         }
-        // The same read the app's settings getters make: the first row, and
-        // nothing inserted when there is none.
-        final rows = db.query('SELECT * FROM $table LIMIT 1');
-        return _ok(rows.isEmpty ? <String, dynamic>{} : rows.first);
+        // A settings table normally holds one row, but expiry_settings can
+        // hold several after a sync: resolve it exactly as list_expiries does,
+        // so both reads report the same thresholds.
+        final Map<String, dynamic>? row;
+        if (table == 'expiry_settings') {
+          row = readExpirySettingsRow(db);
+        } else {
+          final rows = db.query('SELECT * FROM $table LIMIT 1');
+          row = rows.isEmpty ? null : rows.first;
+        }
+        return _ok(row ?? <String, dynamic>{});
       } on _ToolError catch (error) {
         return _failWith(error);
       } catch (error) {
@@ -6452,7 +6461,7 @@ Future<void> runServer(String dbPath, {bool readonly = true}) async {
                 '- Expiry status is computed at read time, never stored: whole calendar days from today to due_date in the logbook zone, below the orange threshold is red (which includes today and every overdue day), below the green threshold is orange, green above it. Thresholds come from expiry_settings (a local row first, then the newest), or 90 and 30 days when that table has no row. list_expiries includes overdue rows by default.\n'
                 '- Currency thresholds are HOURS for the four time metrics, because the app divides those values by 60, and counts for the other four. is_exceeded means the rule needs attention: for a requirement that is being below the threshold, for a limit it is reaching it. currency_status reproduces the app\'s currency page, which applies no owner filter and counts drafts as flights, so its numbers can mix owners on a synced logbook.\n'
                 '- entity_totals.flights_complete counts COMPLETE flights, because it counts the rows its minutes come from; logbook_stats.flights counts every row including drafts, and its flights_complete is the same number. Aircraft and type group on flights.aircraft_id and crew groups on flights.crew_member_id, so a flight that only carries registration text is in the registration group alone. It pages with limit, offset, count, total and has_more like the flight lists, and the registration it reports for an aircraft is the app\'s display form (country code and tail joined, without doubling a tail that already carries the code).\n'
-                '- get_settings reads one allowlisted single-row settings table at a time (aircraft_settings, app_settings, crew_settings, expiry_settings, flights_settings, general_settings, routes_settings, sidebar_settings) and returns {} when the app has never written that row, which means the app defaults apply; it never creates the row. aircraft_type_settings is keyed by type, not a singleton, and is not readable here.\n'
+                '- get_settings reads one allowlisted settings table at a time (aircraft_settings, app_settings, crew_settings, expiry_settings, flights_settings, general_settings, routes_settings, sidebar_settings) and returns {} when the app has never written that row, which means the app defaults apply; it never creates the row. aircraft_type_settings is keyed by type, not a singleton, and is not readable here.\n'
                 '- Deleting a flight, aircraft, crew member or custom airport also records a sync tombstone when a Postgres sync provider has been used, so the deletion propagates.\n'
                 '- A field means the same thing wherever it appears: create_flight and update_flight take the same flight fields with the same types and limits, the per-field notes are written once on create_flight, and what a field means is written here.\n'
                 '- Use get_schema for table names and their column counts; pass table for one table\'s columns, and detail: "full" for its default and pk columns too.\n'
