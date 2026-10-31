@@ -284,6 +284,23 @@ void main() {
       }
     });
 
+    test('total_time advertises the floor the write path enforces', () async {
+      final server = await start(write: true);
+      final tools = await catalog(server);
+      for (final tool in ['create_flight', 'update_flight']) {
+        final properties =
+            ((tools[tool]!['inputSchema'] as Map)['properties'] as Map)
+                .cast<String, Map<String, dynamic>>();
+        // #65: the handler refuses 0, so the schema must too. The rest of the
+        // minute columns genuinely accept 0 and keep it.
+        expect(properties['total_time']!['minimum'], 1, reason: tool);
+        expect(properties['total_time_hours']!['minimum'], 1, reason: tool);
+        for (final name in ['day_time', 'night_time', 'day_time_hours']) {
+          expect(properties[name]!['minimum'], 0, reason: '$tool $name');
+        }
+      }
+    });
+
     test('the catalogs stay inside their byte budgets', () async {
       final reader = await start();
       final writer = await start(write: true);
