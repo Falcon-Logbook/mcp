@@ -408,6 +408,82 @@ void main() {
     expect(replay['structuredContent'], isNot(contains('answers')));
   });
 
+  test('a rejected answer keeps the form waiting for the corrected one',
+      () async {
+    final server = await McpProcess.startStateless(
+      dbPath,
+      clientCapabilities: {
+        'elicitation': {
+          'form': <String, dynamic>{},
+        },
+      },
+    );
+    addTearDown(() async {
+      await server.stop();
+    });
+
+    final asked = resultOf(await server.callRaw('ask_user', {
+      'questions': questions,
+    }));
+    final state = asked['requestState'] as String;
+
+    // An option that was never offered: refused by name, not answered.
+    final refused = resultOf(await server.callRaw(
+      'ask_user',
+      {'questions': questions},
+      extra: {
+        'requestState': state,
+        'inputResponses': {
+          'questions': {
+            'action': 'accept',
+            'content': {'aircraft': 'ac-9', 'time_basis': 'utc'},
+          },
+        },
+      },
+    ));
+    expect(refused['isError'], isTrue, reason: 'a bad answer is an error');
+    expect(jsonEncode(refused), contains('ac-9'));
+    expect(jsonEncode(refused), isNot(contains('"answered"')));
+
+    // The same state, corrected: the user retries instead of losing the form.
+    final retry = resultOf(await server.callRaw(
+      'ask_user',
+      {'questions': questions},
+      extra: {
+        'requestState': state,
+        'inputResponses': {
+          'questions': {
+            'action': 'accept',
+            'content': {'aircraft': 'ac-1', 'time_basis': 'utc'},
+          },
+        },
+      },
+    ));
+    expect(retry['isError'], isNot(true));
+    expect(retry['structuredContent'], {
+      'status': 'answered',
+      'answers': {'aircraft': 'ac-1', 'time_basis': 'utc'},
+      'defaulted': <String>[],
+    });
+
+    // And the token is spent now: a replay is still refused.
+    final replay = resultOf(await server.callRaw(
+      'ask_user',
+      {'questions': questions},
+      extra: {
+        'requestState': state,
+        'inputResponses': {
+          'questions': {
+            'action': 'accept',
+            'content': {'aircraft': 'ac-1', 'time_basis': 'utc'},
+          },
+        },
+      },
+    ));
+    expect(replay['structuredContent']['status'], 'needs_input');
+    expect(replay['structuredContent'], isNot(contains('answers')));
+  });
+
   test('a legacy client with elicitation is asked inside the call', () async {
     final server = await McpProcess.start(dbPath, capabilities: {
       'elicitation': {

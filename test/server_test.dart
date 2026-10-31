@@ -1,6 +1,7 @@
 import 'dart:convert';
 import 'dart:io';
 
+import 'package:falcon_mcp/falcon_mcp.dart' show auditPathFor;
 import 'package:test/test.dart';
 
 import 'support/harness.dart';
@@ -170,6 +171,63 @@ void main() {
     expect(lines, hasLength(3));
     expect(lines.first, contains('"tool":"create_flight"'));
     expect(lines.first, contains('"result":"ok"'));
+    // A recorded write reports no audit trouble.
+    expect((created.payload as Map).containsKey('warning'), isFalse);
+    expect((created.payload as Map).containsKey('audit_failed'), isFalse);
+  });
+
+  test('a committed write warns when its audit entry cannot be written',
+      () async {
+    // The audit path is a directory, so the append fails after the transaction
+    // has committed. The write must still land and the response must say the
+    // record is missing rather than swallow the failure.
+    Directory(auditPathFor(dbPath)).createSync();
+    final server = await McpProcess.start(dbPath, write: true);
+    addTearDown(() async {
+      await server.stop();
+    });
+
+    final created = await server.call('create_flight', {
+      'date': '2026-10-27',
+      'aircraft_registration': 'xzo',
+      'flight_type': 'route',
+      'route': 'YSSY - NZQN',
+      'total_time': 95,
+    });
+    expect(created.isError, isFalse, reason: '${created.payload}');
+    final payload = created.payload as Map;
+    expect(payload['audit_failed'], isTrue);
+    expect('${payload['warning']}', contains(auditPathFor(dbPath)));
+    expect('${payload['warning']}', isNot(contains('client_ref')),
+        reason: 'a create has no imported refs to lose');
+
+    // The row landed even though its record did not.
+    final id = payload['id'] as String;
+    withFixtureDb(dbPath, (db) {
+      expect(
+          db.select('SELECT id FROM flights WHERE id = ?', [id]), hasLength(1));
+    });
+
+    // A batch whose audit entry is lost also loses the log's only copy of its
+    // client_ref values, so the warning says a retry may duplicate the rows.
+    final applied = await server.call('apply_flight_batch', {
+      'dry_run': false,
+      'mode': 'import',
+      'flights': [
+        {
+          'client_ref': 'imp-1',
+          'date': '2026-11-02',
+          'route': 'YSSY - NZQN',
+          'total_time': 90,
+        },
+      ],
+    });
+    expect(applied.isError, isFalse, reason: '${applied.payload}');
+    final batch = applied.payload as Map;
+    expect(batch['applied'], 1);
+    expect(batch['created_refs'], ['imp-1']);
+    expect(batch['audit_failed'], isTrue);
+    expect('${batch['warning']}', contains('client_ref'));
   });
 
   test('deletes record tombstones and unlink dependent rows', () async {

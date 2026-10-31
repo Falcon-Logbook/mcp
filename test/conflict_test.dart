@@ -65,6 +65,117 @@ void main() {
         reason: 'a successful write stamps the row again');
   });
 
+  test('the ISO stamp a read returns updates the row', () async {
+    // Issue #56: reads render updated_at as ISO-8601 text, so that text is
+    // what a caller following falcon://conventions has to pass back.
+    final server = await start();
+    stamp('flights', 'fl-1', 1700000100);
+
+    final read = (await server.call('get_flight', {'id': 'fl-1'})).payload
+        as Map<String, dynamic>;
+    final iso = read['updated_at'] as String;
+    expect(iso, contains('T'));
+
+    final result = await server.call('update_flight', {
+      'id': 'fl-1',
+      'expected_updated_at': iso,
+      'route': 'YSSY - YBBN',
+    });
+
+    expect(result.isError, isFalse, reason: '${result.payload}');
+    expect(rowOf('flights', 'fl-1')!['route'], 'YSSY - YBBN');
+    expect(rowOf('flights', 'fl-1')!['updated_at'], greaterThan(1700000100));
+  });
+
+  test('the same instant in another offset form also matches', () async {
+    final server = await start();
+    stamp('flights', 'fl-1', 1700000100);
+
+    final result = await server.call('update_flight', {
+      'id': 'fl-1',
+      'expected_updated_at': '2023-11-14T22:15:00.000Z',
+      'route': 'YSSY - YBBN',
+    });
+
+    expect(result.isError, isFalse, reason: '${result.payload}');
+    expect(rowOf('flights', 'fl-1')!['updated_at'], greaterThan(1700000100));
+  });
+
+  test('a stale ISO stamp conflicts and the current stamp retries', () async {
+    final server = await start();
+    stamp('flights', 'fl-1', 1700000100);
+    final stale = ((await server.call('get_flight', {'id': 'fl-1'})).payload
+        as Map<String, dynamic>)['updated_at'] as String;
+
+    // A concurrent app write moves the row on after the caller's read.
+    stamp('flights', 'fl-1', 1700000200);
+
+    final result = await server.call('update_flight', {
+      'id': 'fl-1',
+      'expected_updated_at': stale,
+      'route': 'YSSY - YBBN',
+    });
+
+    expect(result.isError, isTrue);
+    final payload = errorPayloadOf(result);
+    expect(payload['error'], 'conflict');
+    expect(payload['field'], 'expected_updated_at');
+    final current = payload['current'] as Map<String, dynamic>;
+    expect(current['id'], 'fl-1');
+    final currentStamp = current['updated_at'] as String;
+    expect(currentStamp, isNot(stale));
+    expect(rowOf('flights', 'fl-1')!['route'], 'YSSY - NZQN');
+
+    // The value the conflict handed back is directly retryable.
+    final retried = await server.call('update_flight', {
+      'id': 'fl-1',
+      'expected_updated_at': currentStamp,
+      'route': 'YSSY - YBBN',
+    });
+    expect(retried.isError, isFalse, reason: '${retried.payload}');
+    expect(rowOf('flights', 'fl-1')!['route'], 'YSSY - YBBN');
+  });
+
+  test('a value in neither accepted form is refused, not ignored', () async {
+    final server = await start();
+    stamp('flights', 'fl-1', 1700000100);
+
+    for (final value in <Object>[
+      '',
+      'yesterday',
+      '1700000100 seconds',
+      '2023-11-14',
+      '2023-11-14T22:15:00',
+      '2023-02-30T22:15:00.000+1100',
+      '2023-11-14T22:15:00.500+1100',
+      '2023-11-14T22:15:00.000+2500',
+      '2023-11-14T25:15:00.000+1100',
+    ]) {
+      final result = await server.call('update_flight', {
+        'id': 'fl-1',
+        'expected_updated_at': value,
+        'route': 'YSSY - YBBN',
+      });
+      expect(result.isError, isTrue, reason: 'accepted $value');
+      final payload = errorPayloadOf(result);
+      expect(payload['error'], 'invalid_value', reason: 'accepted $value');
+      expect(payload['field'], 'expected_updated_at',
+          reason: 'accepted $value');
+    }
+
+    // A negative epoch is outside the schema and refused before the handler.
+    final negative = await server.call('update_flight', {
+      'id': 'fl-1',
+      'expected_updated_at': -1,
+      'route': 'YSSY - YBBN',
+    });
+    expect(negative.isError, isTrue);
+
+    // None of the refused calls wrote anything.
+    expect(rowOf('flights', 'fl-1')!['route'], 'YSSY - NZQN');
+    expect(rowOf('flights', 'fl-1')!['updated_at'], 1700000100);
+  });
+
   test('a stale expected_updated_at is a conflict with the current row',
       () async {
     final server = await start();

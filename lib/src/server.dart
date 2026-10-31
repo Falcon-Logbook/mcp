@@ -58,18 +58,26 @@ const _flightColumns = <_Column>[
       min: 0, note: 'Order within the day; 0 is first.'),
   _Column('aircraft_id', _Kind.text,
       note:
-          'Aircraft row id. Derived automatically from aircraft_registration when it matches.'),
+          'Aircraft row id. Authoritative: derived from aircraft_registration '
+          'when that is the only one sent, kept as sent when both are, and a '
+          'registration naming a different aircraft is refused as a conflict.'),
   _Column('aircraft_registration', _Kind.text,
       note:
-          'Registration as displayed, e.g. VH-XZO. Matched against the aircraft table to set aircraft_id.'),
+          'Registration as displayed, e.g. VH-XZO. Matched against the aircraft '
+          'table to set aircraft_id; with aircraft_id it only has to name the '
+          'same aircraft.'),
   _Column('flight_type', _Kind.text, note: "'route' or 'details'."),
   _Column('crew_role', _Kind.text,
       note: "'pilotInCommand', 'copilot' or 'student'."),
   _Column('crew_member_id', _Kind.text,
       note:
-          'Crew row id. Derived automatically from crew_members_name when it matches.'),
+          'Crew row id. Authoritative: derived from crew_members_name when that '
+          'is the only one sent, kept as sent when both are, and a name that '
+          'matches a different crew member is refused as a conflict.'),
   _Column('crew_members_name', _Kind.text,
-      note: 'Other crew member display name.'),
+      note:
+          'Other crew member display name. With crew_member_id it only has to '
+          'name the same person.'),
   _Column('route', _Kind.text, note: 'Route text, e.g. "YSSY - NZQN".'),
   _Column('flight_number', _Kind.text),
   // 0 is refused by the write path, so the schema says 1: a caller that plans
@@ -233,7 +241,8 @@ const Set<String> _minuteColumns = {
 /// Time fields that also accept an `_hours` argument, converted once at the
 /// boundary. The column itself keeps its minutes name, so a caller can pass
 /// `1.5` hours without doing the arithmetic that turns a 1.5 hour flight into
-/// 1 minute.
+/// 1 minute. The value must convert to a whole minute: a fractional minute is
+/// refused, never rounded, the same rule the import path applies.
 ///
 /// `scheduled_block_minutes` is the planned block, so its alias is only
 /// advertised on a database that has the column.
@@ -954,7 +963,10 @@ class _Auditor {
 
   final String dbPath;
 
-  void record(
+  /// Records one entry. Returns null when the log was written, or a short
+  /// description of the failure: the write already committed, so the caller
+  /// decides how to report an unrecorded change rather than undoing it.
+  String? record(
     String tool,
     Map<String, dynamic> args, {
     String? id,
@@ -968,7 +980,7 @@ class _Auditor {
     // is allowed to lose a line, but a lost ref would let a retry write a
     // duplicate row. Only an applied batch creates refs; a dry run creates none.
     if (outcome == 'ok' && refs != null) appendClientRefs(dbPath, refs: refs);
-    appendAudit(dbPath, {
+    return appendAudit(dbPath, {
       'ts': DateTime.now().toUtc().toIso8601String(),
       'tool': tool,
       'args': _boundedArgs(args),
@@ -1026,6 +1038,34 @@ String _fingerprint(Object? value) {
       reverse.toRadixString(16).padLeft(8, '0');
 }
 
+/// A committed write whose audit entry could not be written. The change is
+/// saved, so the response stays a success and carries the failure instead:
+/// [audit_failed] and a [warning] naming the log. When [lostRefs] is set, the
+/// log also held the batch's `client_ref` values, so a retry can no longer tell
+/// from the log which rows already landed.
+Map<String, Object?> _unrecordedWrite(
+  Object? result, {
+  required String dbPath,
+  required String failure,
+  required bool lostRefs,
+}) {
+  final warning = StringBuffer('The write was saved, but its audit entry could '
+      'not be recorded at ${auditPathFor(dbPath)}: $failure');
+  if (lostRefs) {
+    warning.write(' The log is the only record of an applied batch\'s '
+        'client_ref values, so a retry of this batch cannot tell which rows '
+        'already landed and may duplicate them.');
+  }
+  return {
+    if (result is Map)
+      ...Map<String, Object?>.from(result)
+    else
+      'result': result,
+    'audit_failed': true,
+    'warning': warning.toString(),
+  };
+}
+
 /// Runs a write callback in one transaction, auditing the outcome and converting
 /// validation failures into tool errors instead of crashes.
 ///
@@ -1056,10 +1096,18 @@ CallToolResult _runWrite(
     final id = result is Map ? result['id'] : null;
     final ids = result is Map ? result['affected_ids'] : null;
     final refs = result is Map ? result['created_refs'] : null;
-    auditor.record(tool, args,
+    final auditFailure = auditor.record(tool, args,
         id: id?.toString(),
         ids: ids is List ? ids.cast<String>() : null,
         refs: refs is List ? refs.cast<String>() : null);
+    if (auditFailure != null) {
+      return _ok(_unrecordedWrite(
+        result,
+        dbPath: auditor.dbPath,
+        failure: auditFailure,
+        lostRefs: refs is List && refs.isNotEmpty,
+      ));
+    }
     return _ok(result);
   } on _DryRun catch (dry) {
     final ids = dry.result['affected_ids'];
@@ -1084,8 +1132,10 @@ CallToolResult _runWrite(
 // Domain helpers
 // ============================================================
 
+final _keyNoise = RegExp(r'[^A-Z0-9]');
+
 String _normalizeKey(String value) =>
-    value.toUpperCase().replaceAll(RegExp(r'[^A-Z0-9]'), '');
+    value.toUpperCase().replaceAll(_keyNoise, '');
 
 /// The rows that tie for a name or registration, as one short line for a
 /// warning: id, display text, and for aircraft the country and archived flag.
@@ -1181,65 +1231,107 @@ List<String> _idListArg(Map<String, dynamic> args, String key) {
   return ids;
 }
 
-/// Every aircraft whose stored registration or display form normalises to the
-/// same key as [registration], active rows only when any are active.
-///
-/// [registration] may be written bare (`XZO`) or in display form (`VH-XZO`), in
-/// any case.
-List<({String id, String display, String countryCode, bool archived})>
-    _aircraftCandidates(FalconDb db, String registration) {
-  final wanted = _normalizeKey(registration);
-  if (wanted.isEmpty) return const [];
-  final rows = db.query(
-    'SELECT id, country_code, registration, archived FROM aircraft '
-    'ORDER BY archived ASC, registration',
-  );
-  final matches =
-      <({String id, String display, String countryCode, bool archived})>[];
+/// An aircraft row as a registration matcher sees it.
+typedef _AircraftMatch = ({
+  String id,
+  String display,
+  String countryCode,
+  bool archived
+});
+
+/// A crew row as a name matcher sees it.
+typedef _CrewMatch = ({String id, String name, bool archived});
+
+/// Aircraft rows indexed by every normalised key they answer to: the stored
+/// registration and its display form. Built once, so matching many flights does
+/// not rescan the aircraft table per flight.
+Map<String, List<_AircraftMatch>> _aircraftIndex(
+    List<Map<String, dynamic>> rows) {
+  final index = <String, List<_AircraftMatch>>{};
   for (final row in rows) {
     final reg = asText(row['registration']);
     if (reg == null) continue;
     final countryCode = asText(row['country_code']) ?? '';
-    final display = _displayRegistration(countryCode, reg);
-    if (_normalizeKey(reg) == wanted || _normalizeKey(display) == wanted) {
-      matches.add((
-        id: row['id'] as String,
-        display: display,
-        countryCode: countryCode,
-        archived: asBool(row['archived']) ?? false,
-      ));
+    final match = (
+      id: row['id'] as String,
+      display: _displayRegistration(countryCode, reg),
+      countryCode: countryCode,
+      archived: asBool(row['archived']) ?? false,
+    );
+    for (final key in {_normalizeKey(reg), _normalizeKey(match.display)}) {
+      if (key.isEmpty) continue;
+      final bucket = index.putIfAbsent(key, () => []);
+      if (!bucket.any((entry) => entry.id == match.id)) bucket.add(match);
     }
   }
-  return _activeOr(matches, (match) => match.archived);
+  return index;
 }
 
-/// Every crew member whose name, first-last or last-first form normalises to the
-/// same key as [name], active rows only when any are active.
-List<({String id, String name, bool archived})> _crewCandidates(
-    FalconDb db, String name) {
-  final wanted = _normalizeKey(name);
-  if (wanted.isEmpty) return const [];
-  final rows = db.query(
-    'SELECT id, name, first_name, last_name, archived FROM crew_members '
-    'ORDER BY archived ASC, name',
-  );
-  final matches = <({String id, String name, bool archived})>[];
+/// Crew rows indexed by every normalised name form a member answers to: the
+/// saved name, first-last and last-first. Built once, like [_aircraftIndex].
+Map<String, List<_CrewMatch>> _crewIndex(List<Map<String, dynamic>> rows) {
+  final index = <String, List<_CrewMatch>>{};
   for (final row in rows) {
-    final forms = <String>[
-      row['name'] as String? ?? '',
-      '${row['first_name'] ?? ''} ${row['last_name'] ?? ''}',
-      '${row['last_name'] ?? ''} ${row['first_name'] ?? ''}',
-    ];
-    final trimmed = forms.map(asText).whereType<String>();
-    if (!trimmed.any((form) => _normalizeKey(form) == wanted)) continue;
-    matches.add((
+    final match = (
       id: row['id'] as String,
       name: asText(row['name']) ?? '',
       archived: asBool(row['archived']) ?? false,
-    ));
+    );
+    final forms = <String>[
+      match.name,
+      '${row['first_name'] ?? ''} ${row['last_name'] ?? ''}',
+      '${row['last_name'] ?? ''} ${row['first_name'] ?? ''}',
+    ];
+    final keys = {
+      for (final form in forms.map(asText).whereType<String>())
+        _normalizeKey(form),
+    };
+    for (final key in keys) {
+      if (key.isEmpty) continue;
+      final bucket = index.putIfAbsent(key, () => []);
+      if (!bucket.any((entry) => entry.id == match.id)) bucket.add(match);
+    }
   }
-  return _activeOr(matches, (match) => match.archived);
+  return index;
 }
+
+/// The index entries for [registration], active rows only when any are active.
+///
+/// [registration] may be written bare (`XZO`) or in display form (`VH-XZO`), in
+/// any case.
+List<_AircraftMatch> _aircraftMatches(
+    Map<String, List<_AircraftMatch>> index, String registration) {
+  final wanted = _normalizeKey(registration);
+  if (wanted.isEmpty) return const [];
+  return _activeOr(index[wanted] ?? const [], (match) => match.archived);
+}
+
+/// The index entries for [name], active rows only when any are active.
+List<_CrewMatch> _crewMatches(
+    Map<String, List<_CrewMatch>> index, String name) {
+  final wanted = _normalizeKey(name);
+  if (wanted.isEmpty) return const [];
+  return _activeOr(index[wanted] ?? const [], (match) => match.archived);
+}
+
+/// Every aircraft whose stored registration or display form normalises to the
+/// same key as [registration], active rows only when any are active.
+List<_AircraftMatch> _aircraftCandidates(FalconDb db, String registration) =>
+    _aircraftMatches(
+        _aircraftIndex(db.query(
+          'SELECT id, country_code, registration, archived FROM aircraft '
+          'ORDER BY archived ASC, registration',
+        )),
+        registration);
+
+/// Every crew member whose name, first-last or last-first form normalises to the
+/// same key as [name], active rows only when any are active.
+List<_CrewMatch> _crewCandidates(FalconDb db, String name) => _crewMatches(
+    _crewIndex(db.query(
+      'SELECT id, name, first_name, last_name, archived FROM crew_members '
+      'ORDER BY archived ASC, name',
+    )),
+    name);
 
 /// The rows to match against: the active ones when there are any, all of them
 /// otherwise. An archived row is the fallback because the pilot may have retired
@@ -1251,6 +1343,11 @@ List<T> _activeOr<T>(List<T> rows, bool Function(T row) archived) {
   ];
   return active.isEmpty ? rows : active;
 }
+
+/// Whether [table] holds [id]. An id a caller sent is checked before use, so a
+/// bad one is refused the same way whether or not a name came with it.
+bool _rowExists(FalconDb db, String table, String id) =>
+    db.query('SELECT id FROM $table WHERE id = ?', [id]).isNotEmpty;
 
 /// The aircraft a write should link to, or the rows that tie when the
 /// registration names more than one.
@@ -1306,6 +1403,19 @@ List<String> _crewIdsNamed(FalconDb db, String name) =>
 /// count is the finding; four rows is enough to start acting on it.
 const _reportSampleCap = 4;
 
+/// One `data_quality_report` class while the logbook is scanned: the full
+/// count, and only the first [_reportSampleCap] renderings. A big logbook must
+/// not build a sample entry per row to throw all but four of them away.
+class _DefectLog {
+  int count = 0;
+  final List<Map<String, dynamic>> sample = [];
+
+  void add(Map<String, dynamic> Function() build) {
+    count++;
+    if (sample.length < _reportSampleCap) sample.add(build());
+  }
+}
+
 /// Converts every `*_hours` argument to the minutes the column stores, so the
 /// conversion happens once. Supplying both forms of one field is an error.
 Map<String, dynamic> _minutesFromHours(Map<String, dynamic> args) {
@@ -1323,9 +1433,29 @@ Map<String, dynamic> _minutesFromHours(Map<String, dynamic> args) {
       throw _ToolError('$alias must be a number of hours', field: alias);
     }
     if (hours < 0) throw _ToolError('$alias must be >= 0', field: alias);
-    out[entry.key] = (hours * 60).round();
+    final exact = hours * 60;
+    final minutes = _wholeMinutes(exact);
+    if (minutes == null) {
+      final nearest = exact.round();
+      throw _ToolError(
+          '$alias $hours is ${_exactMinutes(exact)} minutes, which is not a '
+          'whole minute. A duration is refused, never rounded; the nearest '
+          'valid value is $nearest minutes.',
+          field: alias);
+    }
+    out[entry.key] = minutes;
   }
   return out;
+}
+
+/// [exact] minutes as an integer, or null when it is not a whole minute.
+///
+/// The tolerance is the same one the import path uses, so a decimal-hours
+/// value is accepted or refused identically whether it arrives as an
+/// `_hours` alias or as an import cell.
+int? _wholeMinutes(double exact) {
+  final rounded = exact.round();
+  return (exact - rounded).abs() > 1e-6 ? null : rounded;
 }
 
 /// Applies `draft: true`: the flight's total time is cleared, which is the only
@@ -1366,8 +1496,10 @@ Map<String, JsonSchema> _flightWriteProperties(FalconDb db,
           // The alias reaches the same refusal as the column it converts to,
           // so it carries the same floor; every other minute column accepts 0.
           minimum: entry.key == 'total_time' ? 1 : 0,
-          description:
-              notes ? 'Hours, converted to ${entry.key} minutes.' : null,
+          description: notes
+              ? 'Hours, converted to ${entry.key} whole minutes. A value that '
+                  'is not a whole number of minutes is refused, never rounded.'
+              : null,
         ),
     'draft': JsonSchema.boolean(
       description: notes
@@ -1423,61 +1555,133 @@ const Set<String> _splitFields = {'total_time', 'day_time', 'night_time'};
         field: 'total_time');
   }
 
+  // An explicit id wins. The registration or name sent next to it is how the
+  // row displays, so it has to name that same row: when the two disagree, the
+  // write is refused rather than the id being replaced by whatever the name
+  // happens to match. A tie with the explicit id among its candidates is how a
+  // caller resolves the ambiguity the warnings ask about.
+  final suppliedAircraftId =
+      fields.containsKey('aircraft_id') ? asText(fields['aircraft_id']) : null;
+  if (suppliedAircraftId != null &&
+      !_rowExists(db, 'aircraft', suppliedAircraftId)) {
+    throw _ToolError('Aircraft not found: $suppliedAircraftId',
+        code: 'not_found', field: 'aircraft_id');
+  }
   if (fields.containsKey('aircraft_registration')) {
     final text = asText(fields['aircraft_registration']);
     if (text == null) {
       values['aircraft_registration'] = null;
-      values['aircraft_id'] = null;
+      values['aircraft_id'] = suppliedAircraftId;
     } else {
       final match = _matchAircraft(db, text);
-      values['aircraft_registration'] = match.display ?? text;
-      values['aircraft_id'] = match.id;
-      if (match.candidates.length > 1) {
-        warnings.add(
-            '${match.candidates.length} aircraft match "$text", so the flight '
-            'is not linked: ${_candidatesText(match.candidates)}. Pass '
-            'aircraft_id to choose one.');
-      } else if (match.id == null) {
-        warnings.add(
-            'No aircraft matched "$text"; the flight is not linked to an aircraft.');
+      if (suppliedAircraftId == null) {
+        values['aircraft_registration'] = match.display ?? text;
+        values['aircraft_id'] = match.id;
+        if (match.candidates.length > 1) {
+          warnings.add(
+              '${match.candidates.length} aircraft match "$text", so the flight '
+              'is not linked: ${_candidatesText(match.candidates)}. Pass '
+              'aircraft_id to choose one.');
+        } else if (match.id == null) {
+          warnings.add(
+              'No aircraft matched "$text"; the flight is not linked to an aircraft.');
+        }
+      } else {
+        final matched = match.candidates.isNotEmpty
+            ? match.candidates
+            : [
+                {'id': match.id, 'registration': match.display},
+              ];
+        final chosen = [
+          for (final row in matched)
+            if (row['id'] == suppliedAircraftId) row,
+        ];
+        final agrees = match.id == suppliedAircraftId || chosen.isNotEmpty;
+        if (!agrees && (match.id != null || match.candidates.isNotEmpty)) {
+          throw _ToolError(
+            'aircraft_registration "$text" and aircraft_id '
+            '"$suppliedAircraftId" name different aircraft: the registration '
+            'resolves to ${_candidatesText(matched)}, not to aircraft '
+            '"$suppliedAircraftId". Send the registration of the aircraft the '
+            'id names, or drop one of the two fields. Nothing was written.',
+            code: 'conflict',
+            field: 'aircraft_id',
+            tool: tool,
+            data: {
+              'aircraft_id': suppliedAircraftId,
+              'aircraft_registration': text,
+              'candidates': matched,
+            },
+          );
+        }
+        values['aircraft_id'] = suppliedAircraftId;
+        values['aircraft_registration'] = chosen.isEmpty
+            ? (match.display ?? text)
+            : (asText(chosen.single['registration']) ?? text);
       }
     }
   } else if (fields.containsKey('aircraft_id')) {
-    final aircraftId = asText(fields['aircraft_id']);
-    if (aircraftId != null &&
-        db.query(
-            'SELECT id FROM aircraft WHERE id = ?', [aircraftId]).isEmpty) {
-      throw _ToolError('Aircraft not found: $aircraftId',
-          code: 'not_found', field: 'aircraft_id');
-    }
-    values['aircraft_id'] = aircraftId;
+    values['aircraft_id'] = suppliedAircraftId;
   }
 
+  final suppliedCrewId = fields.containsKey('crew_member_id')
+      ? asText(fields['crew_member_id'])
+      : null;
+  if (suppliedCrewId != null &&
+      !_rowExists(db, 'crew_members', suppliedCrewId)) {
+    throw _ToolError('Crew member not found: $suppliedCrewId',
+        code: 'not_found', field: 'crew_member_id');
+  }
   if (fields.containsKey('crew_members_name')) {
     final name = asText(fields['crew_members_name']);
     if (name == null) {
       values['crew_members_name'] = null;
-      values['crew_member_id'] = null;
+      values['crew_member_id'] = suppliedCrewId;
     } else {
       final match = _matchCrewMemberId(db, name);
-      values['crew_members_name'] = name;
-      values['crew_member_id'] = match.id;
-      if (match.candidates.length > 1) {
-        warnings.add(
-            '${match.candidates.length} crew members match "$name", so the '
-            'flight is not linked: ${_candidatesText(match.candidates)}. Pass '
-            'crew_member_id to choose one.');
+      if (suppliedCrewId == null) {
+        values['crew_members_name'] = name;
+        values['crew_member_id'] = match.id;
+        if (match.candidates.length > 1) {
+          warnings.add(
+              '${match.candidates.length} crew members match "$name", so the '
+              'flight is not linked: ${_candidatesText(match.candidates)}. Pass '
+              'crew_member_id to choose one.');
+        }
+      } else {
+        final agrees = match.id == suppliedCrewId ||
+            match.candidates.any((row) => row['id'] == suppliedCrewId);
+        if (!agrees && (match.id != null || match.candidates.isNotEmpty)) {
+          final matched = match.candidates.isNotEmpty
+              ? match.candidates
+              : [
+                  for (final row in db.query(
+                      'SELECT id, name FROM crew_members WHERE id = ?',
+                      [match.id]))
+                    {'id': row['id'], 'name': row['name']},
+                ];
+          throw _ToolError(
+            'crew_members_name "$name" and crew_member_id "$suppliedCrewId" '
+            'name different crew members: the name resolves to '
+            '${_candidatesText(matched)}, not to crew member '
+            '"$suppliedCrewId". Send the name of the crew member the id names, '
+            'or drop one of the two fields. Nothing was written.',
+            code: 'conflict',
+            field: 'crew_member_id',
+            tool: tool,
+            data: {
+              'crew_member_id': suppliedCrewId,
+              'crew_members_name': name,
+              'candidates': matched,
+            },
+          );
+        }
+        values['crew_members_name'] = name;
+        values['crew_member_id'] = suppliedCrewId;
       }
     }
   } else if (fields.containsKey('crew_member_id')) {
-    final crewId = asText(fields['crew_member_id']);
-    if (crewId != null &&
-        db.query(
-            'SELECT id FROM crew_members WHERE id = ?', [crewId]).isEmpty) {
-      throw _ToolError('Crew member not found: $crewId',
-          code: 'not_found', field: 'crew_member_id');
-    }
-    values['crew_member_id'] = crewId;
+    values['crew_member_id'] = suppliedCrewId;
   }
 
   for (final entry in <String, Set<String>>{
@@ -1722,14 +1926,22 @@ List<dynamic> _rosterFlightRows(Map<String, dynamic> args) {
 /// The stable issue code for a refusal `_flightValues` raised on one row.
 /// Every class a roster can hit has a code an agent can branch on; anything
 /// else is one bad value.
-String _rosterIssueCode(_ToolError error) => switch (error.field) {
-      'crew_role' => 'invalid_crew_role',
-      'flight_type' => 'invalid_flight_type',
-      'calc_time_mode' => 'invalid_calc_time_mode',
-      'aircraft_id' => 'aircraft_not_found',
-      'crew_member_id' => 'crew_not_found',
-      _ => error.code == 'unknown_field' ? 'unknown_field' : 'invalid_row',
+String _rosterIssueCode(_ToolError error) {
+  if (error.code == 'conflict') {
+    return switch (error.field) {
+      'crew_member_id' => 'crew_id_conflict',
+      _ => 'aircraft_id_conflict',
     };
+  }
+  return switch (error.field) {
+    'crew_role' => 'invalid_crew_role',
+    'flight_type' => 'invalid_flight_type',
+    'calc_time_mode' => 'invalid_calc_time_mode',
+    'aircraft_id' => 'aircraft_not_found',
+    'crew_member_id' => 'crew_not_found',
+    _ => error.code == 'unknown_field' ? 'unknown_field' : 'invalid_row',
+  };
+}
 
 /// The active tails of [type], for the row that names a type but no
 /// registration. Empty when the fleet has no such type, which is still said.
@@ -2073,8 +2285,8 @@ String _exactMinutes(double exact) =>
       return (value: null, code: 'unit_mismatch', message: mismatch());
     }
     final exact = hours * 60;
-    final rounded = exact.round();
-    if ((exact - rounded).abs() > 1e-6) {
+    final rounded = _wholeMinutes(exact);
+    if (rounded == null) {
       return (
         value: null,
         code: 'unit_implausible',
@@ -2532,7 +2744,18 @@ List<_RosterRow> _rosterRows(
           !RegExp(r'^\d+ crew members match ').hasMatch(warning) &&
           !warning.startsWith('route "')));
     } on _ToolError catch (error) {
-      row.add(_rosterIssueCode(error), error.detail, field: error.field);
+      final candidates = error.data?['candidates'];
+      row.add(
+        _rosterIssueCode(error),
+        error.detail,
+        field: error.field,
+        candidates: candidates is List
+            ? [
+                for (final candidate in candidates)
+                  candidate as Map<String, dynamic>
+              ]
+            : const [],
+      );
       continue;
     }
 
@@ -2616,8 +2839,11 @@ List<_RosterRow> _rosterRows(
       row.add('split_mismatch', error.detail);
     }
 
+    // A row carries a registration and, possibly, the aircraft it links to. An
+    // explicit aircraft_id already answered the question these warnings ask,
+    // so the row is only questioned about a name that has no id beside it.
     final registration = asText(values['aircraft_registration']);
-    if (registration != null) {
+    if (registration != null && asText(values['aircraft_id']) == null) {
       final matches = _aircraftCandidates(db, registration);
       if (matches.isEmpty) {
         row.add(
@@ -2641,7 +2867,7 @@ List<_RosterRow> _rosterRows(
           ],
         );
       }
-    } else if (aircraftType != null) {
+    } else if (registration == null && aircraftType != null) {
       final tails = _aircraftOfType(db, aircraftType);
       row.add(
         'aircraft_missing',
@@ -2659,7 +2885,7 @@ List<_RosterRow> _rosterRows(
     }
 
     final crewName = asText(values['crew_members_name']);
-    if (crewName != null) {
+    if (crewName != null && asText(values['crew_member_id']) == null) {
       final matches = _crewCandidates(db, crewName);
       if (matches.isEmpty) {
         row.add(
@@ -2896,11 +3122,18 @@ Map<String, dynamic> _deleted(String table, Object id) => {
       'table': table,
     };
 
-/// The `expected_updated_at` argument every update tool accepts.
-JsonSchema get _expectedUpdatedAtSchema => JsonSchema.integer(
-    minimum: 0,
-    description: 'The updated_at you read. A conflict returns the current row '
-        'when it changed since. Omit to write unconditionally.');
+/// The `expected_updated_at` argument every update tool accepts: the ISO-8601
+/// text a read returned, or the same instant as unix epoch seconds.
+JsonSchema get _expectedUpdatedAtSchema => JsonUnion(
+      [
+        JsonSchema.integer(minimum: 0),
+        JsonSchema.string(),
+      ],
+      description: 'The updated_at you read, as ISO-8601 text '
+          '(e.g. 2026-10-27T00:00:00.000+1100) or unix epoch seconds. A '
+          'conflict returns the current row when it changed since. Omit to '
+          'write unconditionally.',
+    );
 
 /// The `dry_run` argument every write tool accepts.
 JsonSchema get _dryRunSchema => JsonSchema.boolean(
@@ -2934,14 +3167,33 @@ class _DryRun {
 /// The fragment expects the statement's WHERE clause to end with `id = ?` and
 /// the id to be bound last before these values.
 (String, List<Object?>) _optimisticGuard(Map<String, dynamic> args) {
-  final expected = asInt(args['expected_updated_at']);
+  final expected = _expectedUpdatedAtOf(args);
   if (expected == null) return ('', const []);
   return (' AND updated_at = ?', [expected]);
 }
 
-/// The expected_updated_at argument, for the error message.
-int? _expectedUpdatedAtOf(Map<String, dynamic> args) =>
-    asInt(args['expected_updated_at']);
+/// The expected_updated_at argument as the epoch seconds the column stores.
+///
+/// Accepts the two forms a caller can name the instant with: the ISO-8601 text
+/// reads return ([epochToIso]) and unix epoch seconds (an integer, an integral
+/// double or a digit string, as [asInt] allows). Anything else is refused
+/// rather than treated as absent, because a guard silently dropped turns a
+/// protected write into an unconditional one. Returns null only when the
+/// argument was omitted.
+int? _expectedUpdatedAtOf(Map<String, dynamic> args) {
+  final value = args['expected_updated_at'];
+  if (value == null) return null;
+  final expected = asInt(value) ?? isoInstantToEpoch(value);
+  if (expected == null || expected < 0) {
+    throw _ToolError(
+      'expected_updated_at must be the updated_at a read returned, as '
+      'ISO-8601 text (for example 2026-10-27T00:00:00.000+1100) or unix epoch '
+      'seconds; got ${jsonEncode(value)}',
+      field: 'expected_updated_at',
+    );
+  }
+  return expected;
+}
 
 /// Throws unless [changed] says the update wrote the row it aimed at.
 ///
@@ -3379,7 +3631,7 @@ String _falconHelpText({required Set<String> tools, required bool readonly}) {
   final text = StringBuffer()
     ..writeln('You are working in the pilot\'s own Falcon logbook. Falcon is a '
         'pilot logbook on this computer, and you read the database the desktop '
-        'app writes. ${readonly ? 'You can look, not change anything.' : 'Writes are on: you can create and change rows, and every write is recorded.'}')
+        'app writes. ${readonly ? 'You can look, not change anything.' : 'Writes are on: you can create and change rows, and every write is recorded; a write whose audit entry cannot be written still saves and returns a warning saying so.'}')
     ..writeln()
     ..writeln('What the pilot can ask for:');
   for (final group in _helpGroups) {
@@ -4763,6 +5015,29 @@ Future<void> runServer(String dbPath, {bool readonly = true}) async {
         );
         final routesTable = db.hasTable('saved_routes');
 
+        // Every lookup the loop needs, loaded once: matching in memory keeps
+        // the report linear in the rows it examines rather than paying a query
+        // per flight for each check (#54).
+        final aircraftRows = db.query(
+          'SELECT id, country_code, registration, archived, simulator '
+          'FROM aircraft ORDER BY archived ASC, registration',
+        );
+        final aircraftIndex = _aircraftIndex(aircraftRows);
+        final aircraftSimulator = {
+          for (final row in aircraftRows)
+            row['id'] as String: asBool(row['simulator']) ?? false,
+        };
+        final crewIndex = _crewIndex(db.query(
+          'SELECT id, name, first_name, last_name, archived FROM crew_members '
+          'ORDER BY archived ASC, name',
+        ));
+        final routeIds = routesTable
+            ? {
+                for (final row in db.query('SELECT id FROM saved_routes'))
+                  '${row['id']}',
+              }
+            : const <String>{};
+
         // One rendering per flight, reused by the sample rows: id, date,
         // route, so an agent can act on a class without a second lookup.
         Map<String, dynamic> sample(Map<String, dynamic> row,
@@ -4774,31 +5049,41 @@ Future<void> runServer(String dbPath, {bool readonly = true}) async {
               ...?extra,
             };
 
-        void addClass(String id, String label, List<Map<String, dynamic>> rows,
-            {int? count}) {
-          if (rows.isEmpty && (count ?? 0) == 0) return;
+        void addClass(
+            String id, String label, List<Map<String, dynamic>> rows) {
+          if (rows.isEmpty) return;
           classes.add({
             'id': id,
             'label': label,
-            'count': count ?? rows.length,
+            'count': rows.length,
             'sample': [
               for (final row in rows.take(_reportSampleCap)) row,
             ],
           });
         }
 
-        final drafts = <Map<String, dynamic>>[];
-        final missingSplit = <Map<String, dynamic>>[];
-        final splitMismatch = <Map<String, dynamic>>[];
-        final absurdTotals = <Map<String, dynamic>>[];
-        final aircraftMatchable = <Map<String, dynamic>>[];
-        final aircraftUnmatched = <Map<String, dynamic>>[];
-        final crewMatchable = <Map<String, dynamic>>[];
-        final routeUnparsable = <Map<String, dynamic>>[];
-        final futureDates = <Map<String, dynamic>>[];
-        final danglingRoute = <Map<String, dynamic>>[];
-        final simulatorOdd = <Map<String, dynamic>>[];
-        final orphanedText = <Map<String, dynamic>>[];
+        void addLog(String id, String label, _DefectLog log) {
+          if (log.count == 0) return;
+          classes.add({
+            'id': id,
+            'label': label,
+            'count': log.count,
+            'sample': log.sample,
+          });
+        }
+
+        final drafts = _DefectLog();
+        final missingSplit = _DefectLog();
+        final splitMismatch = _DefectLog();
+        final absurdTotals = _DefectLog();
+        final aircraftMatchable = _DefectLog();
+        final aircraftUnmatched = _DefectLog();
+        final crewMatchable = _DefectLog();
+        final routeUnparsable = _DefectLog();
+        final futureDates = _DefectLog();
+        final danglingRoute = _DefectLog();
+        final simulatorOdd = _DefectLog();
+        final orphanedText = _DefectLog();
         final today = _todayLocalMidnightEpoch();
         for (final flight in flights) {
           final total = asInt(flight['total_time']);
@@ -4809,66 +5094,63 @@ Future<void> runServer(String dbPath, {bool readonly = true}) async {
           final registration = asText(flight['aircraft_registration'])?.trim();
           final crewId = asText(flight['crew_member_id']);
           final crewName = asText(flight['crew_members_name'])?.trim();
-          if (total == null) drafts.add(sample(flight));
+          if (total == null) drafts.add(() => sample(flight));
           if (total != null && !sim && (day == null || night == null)) {
-            missingSplit.add(sample(flight));
+            missingSplit.add(() => sample(flight));
           }
           if (total != null && day != null && night != null && !sim) {
-            if (day + night != total) splitMismatch.add(sample(flight));
+            if (day + night != total) splitMismatch.add(() => sample(flight));
           }
           if (total != null && (total == 0 || total > maxFlightMinutes)) {
-            absurdTotals.add(sample(flight));
+            absurdTotals.add(() => sample(flight));
           }
           if (aircraftId == null &&
               registration != null &&
               registration.isNotEmpty) {
-            final matches = _aircraftCandidates(db, registration);
+            final matches = _aircraftMatches(aircraftIndex, registration);
             final extra = <String, dynamic>{
               'aircraft_registration': registration,
               'candidates': matches.length,
             };
             if (matches.isEmpty) {
-              aircraftUnmatched.add(sample(flight, extra));
+              aircraftUnmatched.add(() => sample(flight, extra));
             } else {
-              aircraftMatchable.add(sample(flight, extra));
+              aircraftMatchable.add(() => sample(flight, extra));
             }
           }
           if (crewId == null &&
               crewName != null &&
               crewName.isNotEmpty &&
-              _crewCandidates(db, crewName).isNotEmpty) {
-            crewMatchable.add(sample(flight));
+              _crewMatches(crewIndex, crewName).isNotEmpty) {
+            crewMatchable.add(() => sample(flight));
           }
           final route = asText(flight['route'])?.trim();
           if (route != null && route.isNotEmpty && parseRoute(route) == null) {
-            routeUnparsable.add(sample(flight));
+            routeUnparsable.add(() => sample(flight));
           }
           final date = _localDate(flight['date']);
           if (date != null && date.millisecondsSinceEpoch ~/ 1000 > today) {
-            futureDates.add(sample(flight));
+            futureDates.add(() => sample(flight));
           }
           if (routesTable &&
               flight['route_id'] != null &&
-              db.query('SELECT id FROM saved_routes WHERE id = ?',
-                  [flight['route_id']]).isEmpty) {
-            danglingRoute.add(sample(flight));
+              !routeIds.contains('${flight['route_id']}')) {
+            danglingRoute.add(() => sample(flight));
           }
           if (sim && total == null) {
-            simulatorOdd.add(sample(flight, {'reason': 'no_duration'}));
+            simulatorOdd.add(() => sample(flight, {'reason': 'no_duration'}));
           } else if (sim &&
               aircraftId != null &&
-              db.query(
-                  'SELECT id FROM aircraft WHERE id = ? '
-                  'AND coalesce(simulator, 0) = 0',
-                  [aircraftId]).isNotEmpty) {
-            simulatorOdd.add(sample(flight, {'reason': 'aircraft_not_sim'}));
+              aircraftSimulator[aircraftId] == false) {
+            simulatorOdd
+                .add(() => sample(flight, {'reason': 'aircraft_not_sim'}));
           }
           if ((aircraftId != null) !=
               (registration != null && registration.isNotEmpty)) {
-            orphanedText.add(sample(flight, {
-              'aircraft_id': aircraftId,
-              'aircraft_registration': registration,
-            }));
+            orphanedText.add(() => sample(flight, {
+                  'aircraft_id': aircraftId,
+                  'aircraft_registration': registration,
+                }));
           }
         }
 
@@ -4923,26 +5205,26 @@ Future<void> runServer(String dbPath, {bool readonly = true}) async {
               },
         ];
 
-        addClass('drafts', 'Flights with no total_time (drafts)', drafts);
-        addClass('missing_split',
+        addLog('drafts', 'Flights with no total_time (drafts)', drafts);
+        addLog('missing_split',
             'Complete flights with a missing day/night split', missingSplit);
-        addClass(
+        addLog(
             'split_mismatch',
             'Flights whose day + night does not equal the total',
             splitMismatch);
-        addClass(
+        addLog(
             'absurd_totals',
             'Totals of zero, or above the app cap of $maxFlightMinutes minutes',
             absurdTotals);
-        addClass(
+        addLog(
             'aircraft_matchable',
             'Flights whose registration text matches an aircraft row, unlinked',
             aircraftMatchable);
-        addClass(
+        addLog(
             'aircraft_unmatched',
             'Flights whose registration text matches no aircraft row',
             aircraftUnmatched);
-        addClass(
+        addLog(
             'crew_matchable',
             'Flights whose crew name matches a crew member, unlinked',
             crewMatchable);
@@ -4950,18 +5232,18 @@ Future<void> runServer(String dbPath, {bool readonly = true}) async {
             duplicateCrew);
         addClass('duplicate_flights',
             'Same date, route, registration and total', duplicateFlights);
-        addClass(
+        addLog(
             'route_unparsable',
             'Routes the app reads as free text, not an airport pair',
             routeUnparsable);
-        addClass('future_dates', 'Flights dated after today', futureDates);
-        addClass('dangling_route_link',
-            'Route links pointing at no saved route', danglingRoute);
-        addClass(
+        addLog('future_dates', 'Flights dated after today', futureDates);
+        addLog('dangling_route_link', 'Route links pointing at no saved route',
+            danglingRoute);
+        addLog(
             'simulator_oddities',
             'Simulator sessions with no duration, or on a non-sim aircraft',
             simulatorOdd);
-        addClass(
+        addLog(
             'orphaned_aircraft_text',
             'One of the aircraft pair (link, registration text) set, other empty',
             orphanedText);
@@ -5052,7 +5334,10 @@ Future<void> runServer(String dbPath, {bool readonly = true}) async {
           'Create a flight. Times are minutes; total_time_hours, day_time_hours '
           'and night_time_hours are accepted instead. Sets aircraft_id and '
           'crew_member_id automatically when the registration or crew name '
-          'matches, and names the candidates when a match is ambiguous. '
+          'matches, and names the candidates when a match is ambiguous. An id '
+          'you pass is authoritative: with a registration or name beside it, it '
+          'must name the same row, and a conflict error names both fields and '
+          'both candidates otherwise. '
           'day_order is computed for the date. Returns the row as written as '
           'flight, with draft telling you whether it counts as a draft, and '
           'warnings for anything odd but legal.',
@@ -5989,9 +6274,12 @@ Future<void> runServer(String dbPath, {bool readonly = true}) async {
         };
         // The guard only makes sense on the update path: a row this call
         // inserts itself carries a stamp from now, not from the caller's
-        // read, so expecting one could never match.
-        final guard =
-            existing.isEmpty ? ('', const <Object?>[]) : _optimisticGuard(args);
+        // read, so expecting one could never match. The argument is parsed
+        // either way, so a malformed value is refused instead of ignored.
+        final expected = _expectedUpdatedAtOf(args);
+        final guard = existing.isEmpty || expected == null
+            ? ('', const <Object?>[])
+            : (' AND updated_at = ?', [expected]);
         db.transaction(() {
           if (db.query(
               'SELECT id FROM flights_settings WHERE id = ?', [id]).isEmpty) {
@@ -6012,7 +6300,7 @@ Future<void> runServer(String dbPath, {bool readonly = true}) async {
               changed: changed,
               label: 'Flight settings',
               tool: 'update_flight_settings',
-              expected: existing.isEmpty ? null : _expectedUpdatedAtOf(args));
+              expected: existing.isEmpty ? null : expected);
         });
         return {
           'status': 'updated',
@@ -6297,7 +6585,16 @@ Future<void> runServer(String dbPath, {bool readonly = true}) async {
               continue;
             }
             if (currentId != null) continue;
-            final matches = _aircraftCandidates(db, registration!);
+            if (registration == null || registration.isEmpty) {
+              // An explicit flight_id can name a flight with neither a link
+              // nor any registration text, so there is nothing to resolve.
+              unmatched.add({
+                'flight_id': id,
+                'detail': 'flight has no aircraft and no registration text',
+              });
+              continue;
+            }
+            final matches = _aircraftCandidates(db, registration);
             var chosen = matches;
             if (matches.length > 1 && preferred.isNotEmpty) {
               final inCountry = matches
@@ -6514,7 +6811,7 @@ Future<void> runServer(String dbPath, {bool readonly = true}) async {
             text: 'FALCON DB CONVENTIONS\n\n'
                 '- Dates are calendar dates: stored as unix epoch seconds of the logbook zone\'s local midnight, returned as YYYY-MM-DD. Timestamps are stored as unix epoch seconds and returned as ISO-8601 with an explicit offset, for example 2026-10-27T00:00:00.000+1100. The logbook time zone is the zone the Falcon app wrote local midnights in, declared by the FALCON_TZ environment variable (an IANA name such as Australia/Sydney); when FALCON_TZ is unset the server\'s system zone applies. The flights.date column holds logbook-zone midnight of the flight date; tool inputs accept YYYY-MM-DD and are converted the same way. Calendar dates, filtered windows and counts are identical whatever zone the server itself runs in.\n'
                 '- Read filters accept only YYYY-MM-DD (or a named period) and reject anything else instead of ignoring it. Every filtered response echoes the applied window as range {from, to}.\n'
-                '- Flight time columns (total_time, day_time, night_time, actual_instrument, simulated_instrument, ground_instrument, icus_day_time, icus_night_time) are integer MINUTES. Responses state this in a units object. Write tools also accept an _hours form of any of them, for example total_time_hours or icus_night_time_hours.\n'
+                '- Flight time columns (total_time, day_time, night_time, actual_instrument, simulated_instrument, ground_instrument, icus_day_time, icus_night_time) are integer MINUTES. Responses state this in a units object. Write tools also accept an _hours form of any of them, for example total_time_hours or icus_night_time_hours. The hours value must be a whole number of minutes (1.5 is 90, 1.005 is not a whole minute): a fractional minute is refused, never rounded, and the error names the nearest valid value.\n'
                 '- Flight time is capped at 525600 minutes (8760 hours) and takeoff/landing counts at 10000, the same limits the app enforces. A value outside either is refused, and the error names the limit.\n'
                 '- day_time and night_time must add up to total_time when both are supplied: the app cannot display any other split, so it is refused. A one-sided split (for example day_time equal to total_time with no night_time) is stored as given and reported in warnings, because the app saves those itself. find_missing_times lists every row the app cannot show complete, with a reason per row.\n'
                 '- time_start and time_stop are 24-hour clock times stored as HH:MM. Write tools accept 9, 930, 9:30, 09:30 or 0930 and refuse anything else, so 9am is rejected rather than stored. They pair with calc_time_mode (utc, local, time, hobbsTacho) and hobbs_start/hobbs_stop when that mode was used. They are not stored as durations.\n'
@@ -6525,7 +6822,7 @@ Future<void> runServer(String dbPath, {bool readonly = true}) async {
                 '- Reads return local rows only (owner_id NULL or "local") unless include_shared is true. Paged reads return count (rows on this page), total (all matching rows), has_more and offset, and default to 20 rows with a maximum of 200; the list reads state in their own limit description how many they return and report total and has_more. A listed flight is a summary, unless full: true.\n'
                 '- flights.route is free text. It is a route pair only when it is exactly "AAA - BBB": two segments split on " - ", each 3 or 4 characters and equal in length, the same rule the app applies. Anything else is a description and has no direction, so departure_icao and arrival_icao are null and the route filters cannot match it. The two codes are derived, not stored: full rows and get_flight carry them, the twelve-field summary does not. Write tools warn when a route will be stored as a description.\n'
                 '- aircraft.registration is the BARE registration (e.g. country_code=VH, registration=XZO). The app displays country_code + "-" + registration.\n'
-                '- flights.aircraft_registration is the display registration (e.g. VH-XZO). Write tools accept either form and set aircraft_id from the matching aircraft row; flights.crew_members_name is matched the same way to set crew_member_id. When more than one active row matches a name or registration, the link is left unset and the warning lists the candidates, so pass aircraft_id or crew_member_id to choose.\n'
+                '- flights.aircraft_registration is the display registration (e.g. VH-XZO). Write tools accept either form and set aircraft_id from the matching aircraft row; flights.crew_members_name is matched the same way to set crew_member_id. When more than one active row matches a name or registration, the link is left unset and the warning lists the candidates, so pass aircraft_id or crew_member_id to choose. An id passed with a name or registration is authoritative: the name must resolve to that same row (or have the id among its candidates), and a name that resolves elsewhere is refused with code conflict naming both fields and both candidates, before anything is written.\n'
                 '- Read filters on flights match without case: aircraft_registration takes bare (XZO) or display (VH-XZO), flight_type takes route or details, and a crew_members_name filter also matches flights linked to that crew row. departure_icao and arrival_icao match one direction only and never a description. Airport search ranks an exact code first, then a prefix, then name or city, and ties break on ICAO.\n'
                 '- flight_type values: route, details. crew_role values: pilotInCommand, copilot, student.\n'
                 '- find_missing_times lists every row the app cannot show complete, with a reason per row: draft (no total), missing_split (both sides null), half_split (one side null), split_mismatch (the sides do not add up), or simulator_no_duration. Simulator sessions are excluded unless include_simulator is true, because the app expects them to carry a total and no split.\n'
@@ -6540,12 +6837,13 @@ Future<void> runServer(String dbPath, {bool readonly = true}) async {
                 '- Deleting a flight, aircraft, crew member or custom airport also records a sync tombstone when a Postgres sync provider has been used, so the deletion propagates.\n'
                 '- A field means the same thing wherever it appears: create_flight and update_flight take the same flight fields with the same types and limits, the per-field notes are written once on create_flight, and what a field means is written here.\n'
                 '- Use get_schema for table names and their column counts; pass table for one table\'s columns, and detail: "full" for its default and pk columns too.\n'
-                '- Update tools accept expected_updated_at: the updated_at of the row as the caller read it. The write then applies only to an unchanged row, so a concurrent change from the app or another writer fails with a conflict that returns the current row, instead of being silently overwritten. Omitting it writes unconditionally, as before.\n'
+                '- Update tools accept expected_updated_at: the updated_at of the row as the caller read it, either exactly as the row rendered it (ISO-8601, for example 2023-11-14T22:15:00.000+1100) or the same instant as unix epoch seconds. The two forms are compared as instants, so the stamp from a read can be passed straight back. The write then applies only to an unchanged row, so a concurrent change from the app or another writer fails with a conflict that returns the current row, instead of being silently overwritten. Omitting it writes unconditionally, as before, and any other value is refused with invalid_value rather than ignored.\n'
                 '- Every write tool accepts dry_run: true: it resolves, validates and answers exactly as the write would (the row as written, computed ids, warnings), marks the response dry_run: true, and commits nothing. A preview error is the write error, so a clean preview means the write will apply; an id a preview generated is not reserved, so pass your own or let the real call make one.\n'
                 '- data_quality_report is one read-only call over every defect class an imported logbook can have: drafts, missing or mismatched splits, absurd totals, unlinked aircraft and crew, duplicate crew and flights, unparsable routes, future dates, dangling route links, simulator oddities, orphaned registration text. Each class carries a stable id, a count and a sample of up to 4 rows; a count is the finding, not the full list.\n'
                 '- The repair tools merge_crew, link_flights_to_aircraft and link_flights_to_crew default to dry_run: true and say so on the response; pass dry_run: false to apply the same diff. They run in one transaction, stamp updated_at, tombstone deletions so sync propagates them, never create rows beyond the operation named, and never delete flights: duplicate flights are reported for a human to decide.\n'
                 '- Planned times (scheduled_departure_utc, scheduled_arrival_utc, scheduled_block_minutes) come with Falcon-Logbook/app#231 and schema 20. The two instants are unix epoch seconds UTC and render as ISO-8601 with an explicit offset; the block is integer minutes. They exist only on a migrated database, so a write naming them on an older file is refused by name rather than silently dropped. A leg with planned times stays a draft: total_time empty, the block kept as the plan.\n'
-                '- validate_flight_drafts and apply_flight_batch take a roster as flights, an array of objects using create_flight field names, up to 500 rows. Each row also accepts client_ref (an identity for retries) and aircraft_type (a hint, never stored). validate writes nothing and answers per row with ok, issues of {field, code, message, severity} and warnings; severity error is a row apply refuses. apply is atomic by default (one bad row writes nothing, applied: 0), allows partial with allow_partial: true, skips a duplicate or an already imported client_ref instead of overwriting, records one audit entry per batch with batch_id, the row count and a sample of the rows rather than all of them (the created refs are listed in full, and a ref index beside the log answers retries without reading it), and previews with dry_run: true (its default). A roster leg is written as a draft through the same row builder as create_flight, so updated_at and sync behave the same.\n'
+                '- An explicit id is authoritative. When create_flight, update_flight or a roster row sends aircraft_id or crew_member_id beside aircraft_registration or crew_members_name, the name must name the same row or have the id among its candidates: a name that resolves elsewhere is refused with code conflict (aircraft_id_conflict or crew_id_conflict on a roster) naming both fields and the candidates, never silently resolved to one of them.\n'
+                '- validate_flight_drafts and apply_flight_batch take a roster as flights, an array of objects using create_flight field names, up to 500 rows. Each row also accepts client_ref (an identity for retries) and aircraft_type (a hint, never stored). validate writes nothing and answers per row with ok, issues of {field, code, message, severity} and warnings; severity error is a row apply refuses. apply is atomic by default (one bad row writes nothing, applied: 0), allows partial with allow_partial: true, skips a duplicate or an already imported client_ref instead of overwriting, records one audit entry per batch with batch_id, the row count and a sample of the rows rather than all of them (the created refs are listed in full, and a ref index beside the log answers retries without reading it; the response warns when that entry cannot be written), and previews with dry_run: true (its default). A roster leg is written as a draft through the same row builder as create_flight, so updated_at and sync behave the same.\n'
                 '- A failed call returns {error, field, detail}: error is a stable code (unknown_field, invalid_value, not_found, conflict, constraint, busy, internal), field is the argument at fault, and unknown_field also names the tool. detail is one sentence, and the accepted list is capped at eight names plus a count. A conflict adds current, the row as it stands now.',
           ),
         ],
@@ -6588,7 +6886,7 @@ Future<void> runServer(String dbPath, {bool readonly = true}) async {
                 'REPORT EVERY ROW THAT DID NOT MAKE IT\n'
                 'Silent partial success is the failure this flow exists to prevent. At the end, list every row that was skipped or failed, with its index, its client_ref if it had one, and the reason. Say how many landed, and name the batch_id.\n\n'
                 'TOOLS AND CODES\n'
-                'validate_flight_drafts writes nothing: flights (up to 500, create_flight field names), date_from, date_to, plus mode (roster by default; import checks a logbook file instead, see falcon://import) and units (the file\'s duration convention, used only in import mode). Every row answers ok, issues of {field, code, message, severity} and warnings; severity error means apply_flight_batch would refuse the row, warning means ask about it, info is stored as text. Codes: unknown_field, invalid_row, invalid_crew_role, invalid_flight_type, invalid_calc_time_mode, aircraft_not_found, crew_not_found, date_missing, date_out_of_range, date_order, aircraft_unmatched, aircraft_ambiguous, aircraft_missing, crew_unmatched, crew_ambiguous, route_unparsable, airport_unresolved, split_mismatch, duplicate_existing, duplicate_batch, scheduled_total_time, planned_times_unsupported.\n'
+                'validate_flight_drafts writes nothing: flights (up to 500, create_flight field names), date_from, date_to, plus mode (roster by default; import checks a logbook file instead, see falcon://import) and units (the file\'s duration convention, used only in import mode). Every row answers ok, issues of {field, code, message, severity} and warnings; severity error means apply_flight_batch would refuse the row, warning means ask about it, info is stored as text. Codes: unknown_field, invalid_row, invalid_crew_role, invalid_flight_type, invalid_calc_time_mode, aircraft_not_found, crew_not_found, aircraft_id_conflict, crew_id_conflict, date_missing, date_out_of_range, date_order, aircraft_unmatched, aircraft_ambiguous, aircraft_missing, crew_unmatched, crew_ambiguous, route_unparsable, airport_unresolved, split_mismatch, duplicate_existing, duplicate_batch, scheduled_total_time, planned_times_unsupported.\n'
                 'apply_flight_batch (write mode only) takes the same flights plus dry_run (default true: a preview with the same plan), allow_partial (default false: atomic) and batch_id. Per row it accepts client_ref, which makes a retry idempotent, and aircraft_type, a hint that is never stored. It returns batch_id, dry_run, applied, created ids, skipped and failed, each entry {index, reason}. A duplicate in the logbook or the batch is skipped, never overwritten.\n',
           ),
         ],
