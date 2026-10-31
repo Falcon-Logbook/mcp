@@ -377,13 +377,19 @@ String auditPathFor(String dbPath) {
 
 /// Appends one JSON line to the audit log next to [dbPath]. Never throws:
 /// auditing must not break a tool call that otherwise succeeded.
-void appendAudit(String dbPath, Map<String, dynamic> entry) {
+///
+/// Returns null when the line was written, or a short description of the
+/// failure when it was not. A write that already committed cannot be rolled
+/// back, so the caller turns a failure into a warning on its response instead
+/// of losing both the record and the knowledge that it is missing.
+String? appendAudit(String dbPath, Map<String, dynamic> entry) {
   try {
     final file = File(auditPathFor(dbPath));
     final line = jsonEncode(entry, toEncodable: (value) => value.toString());
     file.writeAsStringSync('$line\n', mode: FileMode.append, flush: true);
-  } catch (_) {
-    // Best effort only.
+    return null;
+  } catch (error) {
+    return '$error';
   }
 }
 

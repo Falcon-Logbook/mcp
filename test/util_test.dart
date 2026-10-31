@@ -285,6 +285,30 @@ void main() {
     });
   });
 
+  group('appendAudit', () {
+    test('returns null after writing the line', () {
+      final dir = Directory.systemTemp.createTempSync('falcon_mcp_audit_test');
+      addTearDown(() => dir.deleteSync(recursive: true));
+      final dbPath = '${dir.path}/falcon_db.sqlite';
+
+      expect(appendAudit(dbPath, {'tool': 'create_flight'}), isNull);
+      expect(File(auditPathFor(dbPath)).readAsLinesSync().single,
+          contains('"tool":"create_flight"'));
+    });
+
+    test('reports a failure instead of throwing', () {
+      final dir = Directory.systemTemp.createTempSync('falcon_mcp_audit_test');
+      addTearDown(() => dir.deleteSync(recursive: true));
+      final dbPath = '${dir.path}/falcon_db.sqlite';
+      // A directory where the log file belongs makes the append fail.
+      Directory(auditPathFor(dbPath)).createSync();
+
+      final failure = appendAudit(dbPath, {'tool': 'create_flight'});
+      expect(failure, isNotNull);
+      expect(failure, contains(auditPathFor(dbPath)));
+    });
+  });
+
   test('serverVersion matches pubspec', () {
     final pubspec = File('pubspec.yaml').readAsStringSync();
     expect(pubspec, contains('version: $serverVersion'));
