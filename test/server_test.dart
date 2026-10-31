@@ -311,6 +311,115 @@ void main() {
     });
   });
 
+  test('re-creating a deleted id clears its stale tombstone', () async {
+    // Deleting a bad import and replaying it with the same ids is the reason
+    // creates accept a caller-supplied id. The tombstone the delete wrote must
+    // not outlive the re-create, or the next push deletes the new row again.
+    withFixtureDb(dbPath, (db) {
+      db.execute(
+        "INSERT INTO sync_state (sync_table, provider, last_push_count, last_pull_count) "
+        "VALUES ('flights', 'postgres', 0, 0)",
+      );
+      db.execute(
+        "INSERT INTO sync_state (sync_table, provider, last_push_count, last_pull_count) "
+        "VALUES ('aircraft', 'postgres', 0, 0)",
+      );
+      db.execute(
+        "INSERT INTO sync_state (sync_table, provider, last_push_count, last_pull_count) "
+        "VALUES ('crew_members', 'postgres', 0, 0)",
+      );
+      db.execute(
+        "INSERT INTO sync_state (sync_table, provider, last_push_count, last_pull_count) "
+        "VALUES ('custom_airports', 'postgres', 0, 0)",
+      );
+    });
+
+    final server = await McpProcess.start(dbPath, write: true);
+    addTearDown(() async {
+      await server.stop();
+    });
+
+    const flightId = '3f1a6c1e-9b2d-4a57-8f0c-2d1e3b4a5c6d';
+    final created = await server.call('create_flight', {
+      'id': flightId,
+      'date': '2026-06-01',
+      'route': 'YSSY - YBBN',
+      'total_time': 60,
+    });
+    expect(created.isError, isFalse, reason: '${created.payload}');
+    final deleted = await server.call('delete_flight', {'id': flightId});
+    expect(deleted.isError, isFalse, reason: '${deleted.payload}');
+    final recreated = await server.call('create_flight', {
+      'id': flightId,
+      'date': '2026-06-02',
+      'route': 'YSSY - YBBN',
+      'total_time': 60,
+    });
+    expect(recreated.isError, isFalse, reason: '${recreated.payload}');
+
+    for (final entry in [
+      (
+        id: '2b7c5e9d-1a3f-4c8b-9d2e-6f0a4b7c8d91',
+        create: 'add_aircraft',
+        fields: <String, dynamic>{
+          'type': 'C172',
+          'country_code': 'VH',
+          'registration': 'YNQ',
+        },
+        delete: 'delete_aircraft',
+      ),
+      (
+        id: '8e4d2f6a-7c1b-4a9d-8f3e-5b2c1d0e9f87',
+        create: 'add_crew',
+        fields: <String, dynamic>{
+          'first_name': 'Sam',
+          'last_name': 'Replay',
+        },
+        delete: 'delete_crew',
+      ),
+      (
+        id: 'c1d2e3f4-a5b6-4c7d-8e9f-0a1b2c3d4e5f',
+        create: 'add_custom_airport',
+        fields: <String, dynamic>{'name': 'Replay Field', 'icao': 'YRPY'},
+        delete: 'delete_custom_airport',
+      ),
+    ]) {
+      final made =
+          await server.call(entry.create, {'id': entry.id, ...entry.fields});
+      expect(made.isError, isFalse, reason: '${made.payload}');
+      final gone = await server.call(entry.delete, {'id': entry.id});
+      expect(gone.isError, isFalse, reason: '${gone.payload}');
+      final again =
+          await server.call(entry.create, {'id': entry.id, ...entry.fields});
+      expect(again.isError, isFalse, reason: '${again.payload}');
+    }
+
+    withFixtureDb(dbPath, (db) {
+      // Every tombstone named a row that now exists again, so none survives.
+      expect(
+          db.select('SELECT sync_table, row_id FROM sync_deletions'), isEmpty);
+      expect(
+        db.select('SELECT id FROM flights WHERE id = ?', [flightId]).single,
+        {'id': flightId},
+      );
+      for (final id in [
+        '2b7c5e9d-1a3f-4c8b-9d2e-6f0a4b7c8d91',
+        '8e4d2f6a-7c1b-4a9d-8f3e-5b2c1d0e9f87',
+        'c1d2e3f4-a5b6-4c7d-8e9f-0a1b2c3d4e5f',
+      ]) {
+        expect(
+          db.select(
+              'SELECT id FROM aircraft WHERE id = ? '
+              'UNION ALL SELECT id FROM crew_members WHERE id = ? '
+              'UNION ALL SELECT id FROM custom_airports WHERE id = ?',
+              [id, id, id]),
+          hasLength(1),
+          reason: id,
+        );
+      }
+    });
+  });
+
   test('entity writes validate input and keep the app schema intact', () async {
     final server = await McpProcess.start(dbPath, write: true);
     addTearDown(() async {
