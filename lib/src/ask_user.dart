@@ -156,10 +156,15 @@ class _PendingAsk {
 }
 
 /// What a token was issued for. Ids and types are the part an answer depends
-/// on; wording and option order may change between a call and its retry.
-String _signatureOf(List<Question> questions) => [
+/// on; wording and option order may change between a call and its retry, and a
+/// client that stores the questions in a set may echo them in another order.
+/// Sorted so only the set of ids and types is compared. Ids are unique and
+/// neither they nor type names contain a space, so the joined form cannot
+/// collide across different sets.
+String _signatureOf(List<Question> questions) => ([
       for (final question in questions) '${question.id}:${question.type.name}'
-    ].join(' ');
+    ]..sort())
+        .join(' ');
 
 /// Runs one `ask_user` call over whichever of the three paths this connection
 /// allows.
