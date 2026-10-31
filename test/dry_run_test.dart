@@ -127,11 +127,15 @@ void main() {
     final before = tableCounts();
     final server = await start();
 
+    // Every value differs from the seeded row, so a preview that leaked the
+    // write would show up in the stored row rather than matching by accident.
     final result = await server.call('update_flight', {
       'dry_run': true,
       'id': 'fl-1',
       'route': 'YSSY - YBBN',
-      'total_time': 120,
+      'total_time': 45,
+      'day_time': 45,
+      'night_time': 0,
     });
 
     expect(result.isError, isFalse, reason: '${result.payload}');
@@ -139,14 +143,16 @@ void main() {
     expect(payload['dry_run'], isTrue);
     expect((payload['flight'] as Map)['route'], 'YSSY - YBBN',
         reason: 'the preview answers the row as the write would leave it');
-    expect(payload['flight']['total_time'], 120);
+    expect(payload['flight']['total_time'], 45,
+        reason: 'the preview reports the total it was given');
     final stored = withFixtureDb(
         dbPath,
         (db) =>
             db.select('SELECT * FROM flights WHERE id = ?', ['fl-1']).single);
     expect(stored['route'], 'YSSY - NZQN',
         reason: 'the stored row is untouched');
-    expect(stored['total_time'], 120);
+    expect(stored['total_time'], 120,
+        reason: 'the stored total is the seeded 120, not the previewed 45');
     expect(tableCounts(), before);
   });
 
