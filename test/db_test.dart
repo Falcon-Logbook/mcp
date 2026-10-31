@@ -64,9 +64,22 @@ void main() {
   test('read-only connections refuse writes', () {
     final db = openDb(dbPath, readonly: true);
     addTearDown(db.close);
+    // The exact refusal, not just any failure: a syntax error or a missing
+    // table would otherwise satisfy this and leave the read-only mode
+    // untested. SQLITE_READONLY is result code 8, and SQLite words it
+    // "attempt to write a readonly database".
     expect(
       () => db.execute("UPDATE flights SET route = 'x' WHERE id = 'fl-1'"),
-      throwsA(anything),
+      throwsA(
+        isA<SqliteException>()
+            .having((error) => error.resultCode, 'resultCode', 8)
+            .having((error) => error.message, 'message', contains('readonly')),
+      ),
+    );
+    // The refused write left the row alone.
+    expect(
+      db.query("SELECT route FROM flights WHERE id = 'fl-1'").single['route'],
+      'YSSY - NZQN',
     );
   });
 
