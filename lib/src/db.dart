@@ -70,12 +70,66 @@ class FalconDb {
       _db = _openReadOnly();
       return;
     }
-    _db = sqlite3.open(path, mode: OpenMode.readWrite);
-    _db.execute('PRAGMA busy_timeout = 5000');
+    final db = sqlite3.open(path, mode: OpenMode.readWrite);
+    db.execute('PRAGMA busy_timeout = 5000');
+    try {
+      _verifyWriteAccess(db);
+    } catch (_) {
+      db.dispose();
+      rethrow;
+    }
+    _db = db;
     // The app turns foreign keys on, and relies on ON DELETE SET NULL to clear
     // flights.aircraft_id / flights.crew_member_id. Without this a delete
     // leaves dangling references.
     _db.execute('PRAGMA foreign_keys = ON');
+  }
+
+  /// Proves [db] can write before the server reports itself as read-write.
+  ///
+  /// `SQLITE_OPEN_READWRITE` is a wish: when the file, its directory or the
+  /// mount does not allow writes, SQLite silently opens the logbook read-only
+  /// and the first save fails later as an unknown error. `BEGIN IMMEDIATE`
+  /// alone does not catch that, because it takes the lock without touching a
+  /// page, so the probe also writes a page: `PRAGMA user_version` with the
+  /// value it already has. That write is what makes SQLite create the journal
+  /// (and, in WAL mode, the -wal) beside the logbook, which a write-protected
+  /// file or directory refuses. The `ROLLBACK` that always follows discards it,
+  /// so the value and the bytes of the logbook are unchanged.
+  ///
+  /// The probe runs with a short busy timeout so a logbook another process is
+  /// saving to does not stall startup. A lock conflict is not a permission
+  /// problem and proves nothing either way, so it is left to the per-request
+  /// `busy` handling rather than failing startup.
+  void _verifyWriteAccess(Database db) {
+    db.execute('PRAGMA busy_timeout = 1000');
+    try {
+      db.execute('BEGIN IMMEDIATE');
+      final version = db.select('PRAGMA user_version').first['user_version'];
+      db.execute('PRAGMA user_version = $version');
+    } on SqliteException catch (error) {
+      if (_isContention(error)) return;
+      if (!_isWriteProtected(error)) rethrow;
+      throw FalconDbException(
+        'Cannot write to the logbook at $path: ${error.message}\n'
+        'The file, or the directory holding it, is not writable by this '
+        'process, so SQLite opened the logbook read-only and the first save '
+        'would fail. Check the file mode and ownership (the process may be '
+        'running as another user), and that the filesystem is not mounted '
+        'read-only or immutable.\n'
+        'Pass --db <path>, set FALCON_DB_PATH, or point it at a writable copy. '
+        'Start with --readonly to read a logbook you cannot write to.',
+      );
+    } finally {
+      // Unconditional: a lock left behind by the probe would turn every later
+      // call into a busy error, and an unproven BEGIN has nothing to release.
+      try {
+        db.execute('ROLLBACK');
+      } on SqliteException catch (_) {
+        // The BEGIN above never took the lock.
+      }
+      db.execute('PRAGMA busy_timeout = 5000');
+    }
   }
 
   /// Opens the logbook for reading, preferring an ordinary read-only
@@ -328,4 +382,20 @@ bool _isLockedOutByDirectory(SqliteException error) {
   const sqliteCantOpen = 14;
   return error.resultCode == sqliteReadonly ||
       error.resultCode == sqliteCantOpen;
+}
+
+/// Whether [error] is SQLite refusing to write because the logbook file, or the
+/// directory holding it, does not allow one. `SQLITE_PERM` covers a file the
+/// process may not open for writing at all.
+bool _isWriteProtected(SqliteException error) {
+  const sqlitePerm = 3;
+  return error.resultCode == sqlitePerm || _isLockedOutByDirectory(error);
+}
+
+/// Whether [error] is another connection holding the write lock, which says
+/// nothing about whether this process may write.
+bool _isContention(SqliteException error) {
+  const sqliteBusy = 5;
+  const sqliteLocked = 6;
+  return error.resultCode == sqliteBusy || error.resultCode == sqliteLocked;
 }
