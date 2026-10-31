@@ -425,4 +425,47 @@ void main() {
     // measured and asserted in catalog_cost_test.dart, where the flight write
     // schemas are also compared field by field.
   });
+
+  test('the conventions summary bullet does not claim the derived route codes',
+      () async {
+    seedLogbook();
+    final server = await start();
+
+    final response =
+        await server.send('resources/read', {'uri': 'falcon://conventions'});
+    final text = (((response['result'] as Map)['contents'] as List).single
+        as Map)['text'] as String;
+
+    // One sentence says what a listed flight is. It must not also claim the
+    // summary carries the two codes derived from route: issue #51 was that
+    // sentence contradicting the next one, and the next one is the truth.
+    final listed = text
+        .split('\n')
+        .where((line) => line.contains('A listed flight is a summary'))
+        .toList();
+    expect(listed, hasLength(1),
+        reason: 'the listed-flight summary is stated once');
+    for (final code in ['departure_icao', 'arrival_icao']) {
+      expect(listed.single, isNot(contains(code)),
+          reason: 'the $code rule belongs on the route bullet alone');
+    }
+
+    // The rule survives, once, as the negative statement.
+    expect(text, contains('the twelve-field summary does not'));
+
+    // And the code agrees with it: the summary omits both keys, the detail
+    // read carries them off the route.
+    final summary =
+        (payloadOf(await server.call('list_flights', {'limit': 200}))['flights']
+                as List)
+            .cast<Map<String, dynamic>>()
+            .firstWhere((row) => row['id'] == 'fl-1');
+    for (final code in ['departure_icao', 'arrival_icao']) {
+      expect(summary.keys, isNot(contains(code)));
+    }
+    final detail = payloadOf(
+        await server.call('get_flight', {'id': summary['id'] as String}));
+    expect(detail['departure_icao'], 'YSSY');
+    expect(detail['arrival_icao'], 'NZQN');
+  });
 }
