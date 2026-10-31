@@ -135,13 +135,27 @@ void main() {
 
     test('sums each period inside the app boundaries', () async {
       // A flight on the boundary day of each window, and one just outside it.
+      // The seeds are relative to today, so the calendar month expectation is
+      // derived from the month boundary below rather than assumed: the -29 and
+      // -30 day seeds are inside this month whenever today's day of month is 30
+      // or 31, and in the previous month the rest of the time.
+      final flights = <String, ({DateTime date, int minutes})>{
+        'fl-today': (date: inDays(0), minutes: 60),
+        'fl-29': (date: inDays(-29), minutes: 360),
+        'fl-30': (date: inDays(-30), minutes: 300),
+        // No month has more than 31 days, so 32 days back is always before the
+        // 1st of this month, whatever today's day of month is.
+        'fl-32': (date: inDays(-32), minutes: 180),
+        'fl-364': (date: inDays(-364), minutes: 240),
+        'fl-367': (date: inDays(-367), minutes: 120),
+      };
       insertFlights(dbPath, [
-        {'id': 'fl-today', 'date': inDays(0), 'total_time': 60},
-        {'id': 'fl-29', 'date': inDays(-29), 'total_time': 360},
-        {'id': 'fl-30', 'date': inDays(-30), 'total_time': 300},
-        {'id': 'fl-32', 'date': inDays(-32), 'total_time': 180},
-        {'id': 'fl-364', 'date': inDays(-364), 'total_time': 240},
-        {'id': 'fl-367', 'date': inDays(-367), 'total_time': 120},
+        for (final entry in flights.entries)
+          {
+            'id': entry.key,
+            'date': entry.value.date,
+            'total_time': entry.value.minutes,
+          },
       ]);
       insertRules([
         for (final period in currencyPeriods)
@@ -172,24 +186,38 @@ void main() {
         'from': formatCalendarDate(inDays(-29)),
         'to': formatCalendarDate(inDays(0)),
       });
-      // calendarMonth is the month to date: only today's flight, since 32 days
-      // back is always a previous month.
-      expect(rules['calendarMonth']!['current'], 1.0);
+      // calendarMonth is the month to date: every seed from the 1st up to
+      // today, and nothing from before the 1st. The boundary is the app's own,
+      // checked against plain calendar arithmetic, so the expectation holds on
+      // any day of the month.
+      final month = currencyBounds('calendarMonth', today);
+      // Compared field by field: the bounds are zone-aware DateTime subclasses,
+      // so their own `==` is stricter than the instants they hold.
+      final monthStart = DateTime(today.year, today.month);
+      final nextMonthStart = DateTime(today.year, today.month + 1);
+      expect((month.start.year, month.start.month, month.start.day),
+          (monthStart.year, monthStart.month, monthStart.day));
+      expect((month.end.year, month.end.month, month.end.day),
+          (nextMonthStart.year, nextMonthStart.month, nextMonthStart.day));
+      final monthFlights = flights.entries
+          .where((entry) =>
+              !entry.value.date.isBefore(month.start) &&
+              entry.value.date.isBefore(month.end))
+          .map((entry) => entry.key)
+          .toSet();
+      expect(monthFlights, contains('fl-today'));
+      expect(monthFlights, isNot(contains('fl-32')),
+          reason: 'the flight before the 1st is outside the month');
+      expect(monthFlights, isNot(contains('fl-367')),
+          reason: 'a flight a year back is outside the month');
+      final monthMinutes =
+          monthFlights.fold<int>(0, (sum, id) => sum + flights[id]!.minutes);
+      expect(rules['calendarMonth']!['current'], monthMinutes / 60,
+          reason: 'the month to date holds $monthFlights');
       // calendarYear is the year to date: a plain year comparison decides it.
-      final yearMinutes = [0, -29, -30, -32, -364, -367]
-          .where((offset) => inDays(offset).year == today.year)
-          .fold<int>(
-              0,
-              (sum, offset) =>
-                  sum +
-                  switch (offset) {
-                    -29 => 360,
-                    -30 => 300,
-                    -32 => 180,
-                    -364 => 240,
-                    -367 => 120,
-                    _ => 60,
-                  });
+      final yearMinutes = flights.values
+          .where((flight) => flight.date.year == today.year)
+          .fold<int>(0, (sum, flight) => sum + flight.minutes);
       expect(rules['calendarYear']!['current'], yearMinutes / 60);
       // allTime is everything, the 367-day flight included.
       expect(rules['allTime']!['current'], 21.0);
