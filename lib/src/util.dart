@@ -7,7 +7,7 @@ import 'package:timezone/timezone.dart' as tz;
 
 import 'zone.dart';
 
-final RegExp _dateOnly = RegExp(r'^(\d{4})-(\d{1,2})-(\d{1,2})$');
+final RegExp _datePrefix = RegExp(r'^(\d{4})-(\d{1,2})-(\d{1,2})(?=$|[T ])');
 
 /// Converts a date-ish input into the unix epoch seconds the Falcon database
 /// stores. Dates are interpreted in the logbook zone ([logbookZone]: the zone
@@ -21,19 +21,18 @@ int? dateToEpoch(Object? value, {bool endOfDay = false}) {
   final text = value.trim();
   if (text.isEmpty) return null;
 
-  final match = _dateOnly.firstMatch(text);
-  if (match != null) {
-    final year = int.parse(match.group(1)!);
-    final month = int.parse(match.group(2)!);
-    final day = int.parse(match.group(3)!);
-    final start = logbookDateAt(year, month, day);
-    // Field arithmetic normalises out-of-range values (month 13 -> next
-    // January), so reject anything that does not round-trip.
-    if (start.year != year || start.month != month || start.day != day) {
-      return null;
-    }
-    return _epochFor(start, endOfDay: endOfDay);
-  }
+  // Both forms must start with a `YYYY-M-D` calendar date, and that date goes
+  // through the same field check: `DateTime.tryParse` normalises an impossible
+  // day (30 February becomes 2 March, month 13 becomes next January) and reads
+  // a bare number such as `1761408000` as an ISO basic date, so neither can be
+  // trusted to refuse what it cannot represent.
+  final match = _datePrefix.firstMatch(text);
+  if (match == null) return null;
+  final start = _calendarDayFields(int.parse(match.group(1)!),
+      int.parse(match.group(2)!), int.parse(match.group(3)!));
+  if (start == null) return null;
+  // A date-only value is that whole day, so its timezone-free fields decide.
+  if (match.end == text.length) return _epochFor(start, endOfDay: endOfDay);
 
   final parsed = DateTime.tryParse(text);
   if (parsed == null) return null;
@@ -42,6 +41,18 @@ int? dateToEpoch(Object? value, {bool endOfDay = false}) {
   final zoned = tz.TZDateTime.from(parsed, logbookZone);
   return _epochFor(logbookDateAt(zoned.year, zoned.month, zoned.day),
       endOfDay: endOfDay);
+}
+
+/// Start of the logbook-zone day [year]-[month]-[day], or null when field
+/// arithmetic would move it (month 13, 30 February). Every date input goes
+/// through this, so a form that reaches the day by another route (the
+/// `DateTime.tryParse` fallback) refuses the same impossible days.
+DateTime? _calendarDayFields(int year, int month, int day) {
+  final start = logbookDateAt(year, month, day);
+  if (start.year != year || start.month != month || start.day != day) {
+    return null;
+  }
+  return start;
 }
 
 /// The only date form a read tool accepts, and the text every rejection names.

@@ -37,6 +37,22 @@ void main() {
       expect(dateToEpoch(1761408000), isNull);
     });
 
+    test('rejects impossible dates in timestamp form instead of shifting them',
+        () {
+      // #37: the DateTime.tryParse fallback used to normalise these.
+      expect(dateToEpoch('2026-02-30T00:00:00'), isNull);
+      expect(dateToEpoch('2026-13-01T00:00:00'), isNull);
+      expect(dateToEpoch('2026-04-31T00:00:00'), isNull);
+      expect(
+          dateToEpoch('2026-10-27T12:34:00+11:00', endOfDay: true), isNotNull,
+          reason: 'a real timestamp with an offset still parses');
+    });
+
+    test('rejects a bare epoch number in string form', () {
+      // #37: DateTime.tryParse reads this as an ISO basic date (year 176146).
+      expect(dateToEpoch('1761408000'), isNull);
+    });
+
     test('accepts an ISO timestamp and keeps its local day', () {
       expect(dateToEpoch('2026-10-27T12:34:00'), dateToEpoch('2026-10-27'));
     });
