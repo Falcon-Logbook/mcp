@@ -1018,8 +1018,10 @@ CallToolResult _runWrite(
 // Domain helpers
 // ============================================================
 
+final _keyNoise = RegExp(r'[^A-Z0-9]');
+
 String _normalizeKey(String value) =>
-    value.toUpperCase().replaceAll(RegExp(r'[^A-Z0-9]'), '');
+    value.toUpperCase().replaceAll(_keyNoise, '');
 
 /// The rows that tie for a name or registration, as one short line for a
 /// warning: id, display text, and for aircraft the country and archived flag.
@@ -1115,65 +1117,107 @@ List<String> _idListArg(Map<String, dynamic> args, String key) {
   return ids;
 }
 
-/// Every aircraft whose stored registration or display form normalises to the
-/// same key as [registration], active rows only when any are active.
-///
-/// [registration] may be written bare (`XZO`) or in display form (`VH-XZO`), in
-/// any case.
-List<({String id, String display, String countryCode, bool archived})>
-    _aircraftCandidates(FalconDb db, String registration) {
-  final wanted = _normalizeKey(registration);
-  if (wanted.isEmpty) return const [];
-  final rows = db.query(
-    'SELECT id, country_code, registration, archived FROM aircraft '
-    'ORDER BY archived ASC, registration',
-  );
-  final matches =
-      <({String id, String display, String countryCode, bool archived})>[];
+/// An aircraft row as a registration matcher sees it.
+typedef _AircraftMatch = ({
+  String id,
+  String display,
+  String countryCode,
+  bool archived
+});
+
+/// A crew row as a name matcher sees it.
+typedef _CrewMatch = ({String id, String name, bool archived});
+
+/// Aircraft rows indexed by every normalised key they answer to: the stored
+/// registration and its display form. Built once, so matching many flights does
+/// not rescan the aircraft table per flight.
+Map<String, List<_AircraftMatch>> _aircraftIndex(
+    List<Map<String, dynamic>> rows) {
+  final index = <String, List<_AircraftMatch>>{};
   for (final row in rows) {
     final reg = asText(row['registration']);
     if (reg == null) continue;
     final countryCode = asText(row['country_code']) ?? '';
-    final display = _displayRegistration(countryCode, reg);
-    if (_normalizeKey(reg) == wanted || _normalizeKey(display) == wanted) {
-      matches.add((
-        id: row['id'] as String,
-        display: display,
-        countryCode: countryCode,
-        archived: asBool(row['archived']) ?? false,
-      ));
+    final match = (
+      id: row['id'] as String,
+      display: _displayRegistration(countryCode, reg),
+      countryCode: countryCode,
+      archived: asBool(row['archived']) ?? false,
+    );
+    for (final key in {_normalizeKey(reg), _normalizeKey(match.display)}) {
+      if (key.isEmpty) continue;
+      final bucket = index.putIfAbsent(key, () => []);
+      if (!bucket.any((entry) => entry.id == match.id)) bucket.add(match);
     }
   }
-  return _activeOr(matches, (match) => match.archived);
+  return index;
 }
 
-/// Every crew member whose name, first-last or last-first form normalises to the
-/// same key as [name], active rows only when any are active.
-List<({String id, String name, bool archived})> _crewCandidates(
-    FalconDb db, String name) {
-  final wanted = _normalizeKey(name);
-  if (wanted.isEmpty) return const [];
-  final rows = db.query(
-    'SELECT id, name, first_name, last_name, archived FROM crew_members '
-    'ORDER BY archived ASC, name',
-  );
-  final matches = <({String id, String name, bool archived})>[];
+/// Crew rows indexed by every normalised name form a member answers to: the
+/// saved name, first-last and last-first. Built once, like [_aircraftIndex].
+Map<String, List<_CrewMatch>> _crewIndex(List<Map<String, dynamic>> rows) {
+  final index = <String, List<_CrewMatch>>{};
   for (final row in rows) {
-    final forms = <String>[
-      row['name'] as String? ?? '',
-      '${row['first_name'] ?? ''} ${row['last_name'] ?? ''}',
-      '${row['last_name'] ?? ''} ${row['first_name'] ?? ''}',
-    ];
-    final trimmed = forms.map(asText).whereType<String>();
-    if (!trimmed.any((form) => _normalizeKey(form) == wanted)) continue;
-    matches.add((
+    final match = (
       id: row['id'] as String,
       name: asText(row['name']) ?? '',
       archived: asBool(row['archived']) ?? false,
-    ));
+    );
+    final forms = <String>[
+      match.name,
+      '${row['first_name'] ?? ''} ${row['last_name'] ?? ''}',
+      '${row['last_name'] ?? ''} ${row['first_name'] ?? ''}',
+    ];
+    final keys = {
+      for (final form in forms.map(asText).whereType<String>())
+        _normalizeKey(form),
+    };
+    for (final key in keys) {
+      if (key.isEmpty) continue;
+      final bucket = index.putIfAbsent(key, () => []);
+      if (!bucket.any((entry) => entry.id == match.id)) bucket.add(match);
+    }
   }
-  return _activeOr(matches, (match) => match.archived);
+  return index;
 }
+
+/// The index entries for [registration], active rows only when any are active.
+///
+/// [registration] may be written bare (`XZO`) or in display form (`VH-XZO`), in
+/// any case.
+List<_AircraftMatch> _aircraftMatches(
+    Map<String, List<_AircraftMatch>> index, String registration) {
+  final wanted = _normalizeKey(registration);
+  if (wanted.isEmpty) return const [];
+  return _activeOr(index[wanted] ?? const [], (match) => match.archived);
+}
+
+/// The index entries for [name], active rows only when any are active.
+List<_CrewMatch> _crewMatches(
+    Map<String, List<_CrewMatch>> index, String name) {
+  final wanted = _normalizeKey(name);
+  if (wanted.isEmpty) return const [];
+  return _activeOr(index[wanted] ?? const [], (match) => match.archived);
+}
+
+/// Every aircraft whose stored registration or display form normalises to the
+/// same key as [registration], active rows only when any are active.
+List<_AircraftMatch> _aircraftCandidates(FalconDb db, String registration) =>
+    _aircraftMatches(
+        _aircraftIndex(db.query(
+          'SELECT id, country_code, registration, archived FROM aircraft '
+          'ORDER BY archived ASC, registration',
+        )),
+        registration);
+
+/// Every crew member whose name, first-last or last-first form normalises to the
+/// same key as [name], active rows only when any are active.
+List<_CrewMatch> _crewCandidates(FalconDb db, String name) => _crewMatches(
+    _crewIndex(db.query(
+      'SELECT id, name, first_name, last_name, archived FROM crew_members '
+      'ORDER BY archived ASC, name',
+    )),
+    name);
 
 /// The rows to match against: the active ones when there are any, all of them
 /// otherwise. An archived row is the fallback because the pilot may have retired
@@ -1239,6 +1283,19 @@ List<String> _crewIdsNamed(FalconDb db, String name) =>
 /// The most rows any one `data_quality_report` class shows in its sample. A
 /// count is the finding; four rows is enough to start acting on it.
 const _reportSampleCap = 4;
+
+/// One `data_quality_report` class while the logbook is scanned: the full
+/// count, and only the first [_reportSampleCap] renderings. A big logbook must
+/// not build a sample entry per row to throw all but four of them away.
+class _DefectLog {
+  int count = 0;
+  final List<Map<String, dynamic>> sample = [];
+
+  void add(Map<String, dynamic> Function() build) {
+    count++;
+    if (sample.length < _reportSampleCap) sample.add(build());
+  }
+}
 
 /// Converts every `*_hours` argument to the minutes the column stores, so the
 /// conversion happens once. Supplying both forms of one field is an error.
@@ -4688,6 +4745,29 @@ Future<void> runServer(String dbPath, {bool readonly = true}) async {
         );
         final routesTable = db.hasTable('saved_routes');
 
+        // Every lookup the loop needs, loaded once: matching in memory keeps
+        // the report linear in the rows it examines rather than paying a query
+        // per flight for each check (#54).
+        final aircraftRows = db.query(
+          'SELECT id, country_code, registration, archived, simulator '
+          'FROM aircraft ORDER BY archived ASC, registration',
+        );
+        final aircraftIndex = _aircraftIndex(aircraftRows);
+        final aircraftSimulator = {
+          for (final row in aircraftRows)
+            row['id'] as String: asBool(row['simulator']) ?? false,
+        };
+        final crewIndex = _crewIndex(db.query(
+          'SELECT id, name, first_name, last_name, archived FROM crew_members '
+          'ORDER BY archived ASC, name',
+        ));
+        final routeIds = routesTable
+            ? {
+                for (final row in db.query('SELECT id FROM saved_routes'))
+                  '${row['id']}',
+              }
+            : const <String>{};
+
         // One rendering per flight, reused by the sample rows: id, date,
         // route, so an agent can act on a class without a second lookup.
         Map<String, dynamic> sample(Map<String, dynamic> row,
@@ -4699,31 +4779,41 @@ Future<void> runServer(String dbPath, {bool readonly = true}) async {
               ...?extra,
             };
 
-        void addClass(String id, String label, List<Map<String, dynamic>> rows,
-            {int? count}) {
-          if (rows.isEmpty && (count ?? 0) == 0) return;
+        void addClass(
+            String id, String label, List<Map<String, dynamic>> rows) {
+          if (rows.isEmpty) return;
           classes.add({
             'id': id,
             'label': label,
-            'count': count ?? rows.length,
+            'count': rows.length,
             'sample': [
               for (final row in rows.take(_reportSampleCap)) row,
             ],
           });
         }
 
-        final drafts = <Map<String, dynamic>>[];
-        final missingSplit = <Map<String, dynamic>>[];
-        final splitMismatch = <Map<String, dynamic>>[];
-        final absurdTotals = <Map<String, dynamic>>[];
-        final aircraftMatchable = <Map<String, dynamic>>[];
-        final aircraftUnmatched = <Map<String, dynamic>>[];
-        final crewMatchable = <Map<String, dynamic>>[];
-        final routeUnparsable = <Map<String, dynamic>>[];
-        final futureDates = <Map<String, dynamic>>[];
-        final danglingRoute = <Map<String, dynamic>>[];
-        final simulatorOdd = <Map<String, dynamic>>[];
-        final orphanedText = <Map<String, dynamic>>[];
+        void addLog(String id, String label, _DefectLog log) {
+          if (log.count == 0) return;
+          classes.add({
+            'id': id,
+            'label': label,
+            'count': log.count,
+            'sample': log.sample,
+          });
+        }
+
+        final drafts = _DefectLog();
+        final missingSplit = _DefectLog();
+        final splitMismatch = _DefectLog();
+        final absurdTotals = _DefectLog();
+        final aircraftMatchable = _DefectLog();
+        final aircraftUnmatched = _DefectLog();
+        final crewMatchable = _DefectLog();
+        final routeUnparsable = _DefectLog();
+        final futureDates = _DefectLog();
+        final danglingRoute = _DefectLog();
+        final simulatorOdd = _DefectLog();
+        final orphanedText = _DefectLog();
         final today = _todayLocalMidnightEpoch();
         for (final flight in flights) {
           final total = asInt(flight['total_time']);
@@ -4734,66 +4824,63 @@ Future<void> runServer(String dbPath, {bool readonly = true}) async {
           final registration = asText(flight['aircraft_registration'])?.trim();
           final crewId = asText(flight['crew_member_id']);
           final crewName = asText(flight['crew_members_name'])?.trim();
-          if (total == null) drafts.add(sample(flight));
+          if (total == null) drafts.add(() => sample(flight));
           if (total != null && !sim && (day == null || night == null)) {
-            missingSplit.add(sample(flight));
+            missingSplit.add(() => sample(flight));
           }
           if (total != null && day != null && night != null && !sim) {
-            if (day + night != total) splitMismatch.add(sample(flight));
+            if (day + night != total) splitMismatch.add(() => sample(flight));
           }
           if (total != null && (total == 0 || total > maxFlightMinutes)) {
-            absurdTotals.add(sample(flight));
+            absurdTotals.add(() => sample(flight));
           }
           if (aircraftId == null &&
               registration != null &&
               registration.isNotEmpty) {
-            final matches = _aircraftCandidates(db, registration);
+            final matches = _aircraftMatches(aircraftIndex, registration);
             final extra = <String, dynamic>{
               'aircraft_registration': registration,
               'candidates': matches.length,
             };
             if (matches.isEmpty) {
-              aircraftUnmatched.add(sample(flight, extra));
+              aircraftUnmatched.add(() => sample(flight, extra));
             } else {
-              aircraftMatchable.add(sample(flight, extra));
+              aircraftMatchable.add(() => sample(flight, extra));
             }
           }
           if (crewId == null &&
               crewName != null &&
               crewName.isNotEmpty &&
-              _crewCandidates(db, crewName).isNotEmpty) {
-            crewMatchable.add(sample(flight));
+              _crewMatches(crewIndex, crewName).isNotEmpty) {
+            crewMatchable.add(() => sample(flight));
           }
           final route = asText(flight['route'])?.trim();
           if (route != null && route.isNotEmpty && parseRoute(route) == null) {
-            routeUnparsable.add(sample(flight));
+            routeUnparsable.add(() => sample(flight));
           }
           final date = _localDate(flight['date']);
           if (date != null && date.millisecondsSinceEpoch ~/ 1000 > today) {
-            futureDates.add(sample(flight));
+            futureDates.add(() => sample(flight));
           }
           if (routesTable &&
               flight['route_id'] != null &&
-              db.query('SELECT id FROM saved_routes WHERE id = ?',
-                  [flight['route_id']]).isEmpty) {
-            danglingRoute.add(sample(flight));
+              !routeIds.contains('${flight['route_id']}')) {
+            danglingRoute.add(() => sample(flight));
           }
           if (sim && total == null) {
-            simulatorOdd.add(sample(flight, {'reason': 'no_duration'}));
+            simulatorOdd.add(() => sample(flight, {'reason': 'no_duration'}));
           } else if (sim &&
               aircraftId != null &&
-              db.query(
-                  'SELECT id FROM aircraft WHERE id = ? '
-                  'AND coalesce(simulator, 0) = 0',
-                  [aircraftId]).isNotEmpty) {
-            simulatorOdd.add(sample(flight, {'reason': 'aircraft_not_sim'}));
+              aircraftSimulator[aircraftId] == false) {
+            simulatorOdd
+                .add(() => sample(flight, {'reason': 'aircraft_not_sim'}));
           }
           if ((aircraftId != null) !=
               (registration != null && registration.isNotEmpty)) {
-            orphanedText.add(sample(flight, {
-              'aircraft_id': aircraftId,
-              'aircraft_registration': registration,
-            }));
+            orphanedText.add(() => sample(flight, {
+                  'aircraft_id': aircraftId,
+                  'aircraft_registration': registration,
+                }));
           }
         }
 
@@ -4848,26 +4935,26 @@ Future<void> runServer(String dbPath, {bool readonly = true}) async {
               },
         ];
 
-        addClass('drafts', 'Flights with no total_time (drafts)', drafts);
-        addClass('missing_split',
+        addLog('drafts', 'Flights with no total_time (drafts)', drafts);
+        addLog('missing_split',
             'Complete flights with a missing day/night split', missingSplit);
-        addClass(
+        addLog(
             'split_mismatch',
             'Flights whose day + night does not equal the total',
             splitMismatch);
-        addClass(
+        addLog(
             'absurd_totals',
             'Totals of zero, or above the app cap of $maxFlightMinutes minutes',
             absurdTotals);
-        addClass(
+        addLog(
             'aircraft_matchable',
             'Flights whose registration text matches an aircraft row, unlinked',
             aircraftMatchable);
-        addClass(
+        addLog(
             'aircraft_unmatched',
             'Flights whose registration text matches no aircraft row',
             aircraftUnmatched);
-        addClass(
+        addLog(
             'crew_matchable',
             'Flights whose crew name matches a crew member, unlinked',
             crewMatchable);
@@ -4875,18 +4962,18 @@ Future<void> runServer(String dbPath, {bool readonly = true}) async {
             duplicateCrew);
         addClass('duplicate_flights',
             'Same date, route, registration and total', duplicateFlights);
-        addClass(
+        addLog(
             'route_unparsable',
             'Routes the app reads as free text, not an airport pair',
             routeUnparsable);
-        addClass('future_dates', 'Flights dated after today', futureDates);
-        addClass('dangling_route_link',
-            'Route links pointing at no saved route', danglingRoute);
-        addClass(
+        addLog('future_dates', 'Flights dated after today', futureDates);
+        addLog('dangling_route_link', 'Route links pointing at no saved route',
+            danglingRoute);
+        addLog(
             'simulator_oddities',
             'Simulator sessions with no duration, or on a non-sim aircraft',
             simulatorOdd);
-        addClass(
+        addLog(
             'orphaned_aircraft_text',
             'One of the aircraft pair (link, registration text) set, other empty',
             orphanedText);
