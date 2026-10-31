@@ -233,7 +233,8 @@ const Set<String> _minuteColumns = {
 /// Time fields that also accept an `_hours` argument, converted once at the
 /// boundary. The column itself keeps its minutes name, so a caller can pass
 /// `1.5` hours without doing the arithmetic that turns a 1.5 hour flight into
-/// 1 minute.
+/// 1 minute. The value must convert to a whole minute: a fractional minute is
+/// refused, never rounded, the same rule the import path applies.
 ///
 /// `scheduled_block_minutes` is the planned block, so its alias is only
 /// advertised on a database that has the column.
@@ -1257,9 +1258,29 @@ Map<String, dynamic> _minutesFromHours(Map<String, dynamic> args) {
       throw _ToolError('$alias must be a number of hours', field: alias);
     }
     if (hours < 0) throw _ToolError('$alias must be >= 0', field: alias);
-    out[entry.key] = (hours * 60).round();
+    final exact = hours * 60;
+    final minutes = _wholeMinutes(exact);
+    if (minutes == null) {
+      final nearest = exact.round();
+      throw _ToolError(
+          '$alias $hours is ${_exactMinutes(exact)} minutes, which is not a '
+          'whole minute. A duration is refused, never rounded; the nearest '
+          'valid value is $nearest minutes.',
+          field: alias);
+    }
+    out[entry.key] = minutes;
   }
   return out;
+}
+
+/// [exact] minutes as an integer, or null when it is not a whole minute.
+///
+/// The tolerance is the same one the import path uses, so a decimal-hours
+/// value is accepted or refused identically whether it arrives as an
+/// `_hours` alias or as an import cell.
+int? _wholeMinutes(double exact) {
+  final rounded = exact.round();
+  return (exact - rounded).abs() > 1e-6 ? null : rounded;
 }
 
 /// Applies `draft: true`: the flight's total time is cleared, which is the only
@@ -1300,8 +1321,10 @@ Map<String, JsonSchema> _flightWriteProperties(FalconDb db,
           // The alias reaches the same refusal as the column it converts to,
           // so it carries the same floor; every other minute column accepts 0.
           minimum: entry.key == 'total_time' ? 1 : 0,
-          description:
-              notes ? 'Hours, converted to ${entry.key} minutes.' : null,
+          description: notes
+              ? 'Hours, converted to ${entry.key} whole minutes. A value that '
+                  'is not a whole number of minutes is refused, never rounded.'
+              : null,
         ),
     'draft': JsonSchema.boolean(
       description: notes
@@ -2007,8 +2030,8 @@ String _exactMinutes(double exact) =>
       return (value: null, code: 'unit_mismatch', message: mismatch());
     }
     final exact = hours * 60;
-    final rounded = exact.round();
-    if ((exact - rounded).abs() > 1e-6) {
+    final rounded = _wholeMinutes(exact);
+    if (rounded == null) {
       return (
         value: null,
         code: 'unit_implausible',
@@ -6439,7 +6462,7 @@ Future<void> runServer(String dbPath, {bool readonly = true}) async {
             text: 'FALCON DB CONVENTIONS\n\n'
                 '- Dates are calendar dates: stored as unix epoch seconds of the logbook zone\'s local midnight, returned as YYYY-MM-DD. Timestamps are stored as unix epoch seconds and returned as ISO-8601 with an explicit offset, for example 2026-10-27T00:00:00.000+1100. The logbook time zone is the zone the Falcon app wrote local midnights in, declared by the FALCON_TZ environment variable (an IANA name such as Australia/Sydney); when FALCON_TZ is unset the server\'s system zone applies. The flights.date column holds logbook-zone midnight of the flight date; tool inputs accept YYYY-MM-DD and are converted the same way. Calendar dates, filtered windows and counts are identical whatever zone the server itself runs in.\n'
                 '- Read filters accept only YYYY-MM-DD (or a named period) and reject anything else instead of ignoring it. Every filtered response echoes the applied window as range {from, to}.\n'
-                '- Flight time columns (total_time, day_time, night_time, actual_instrument, simulated_instrument, ground_instrument, icus_day_time, icus_night_time) are integer MINUTES. Responses state this in a units object. Write tools also accept an _hours form of any of them, for example total_time_hours or icus_night_time_hours.\n'
+                '- Flight time columns (total_time, day_time, night_time, actual_instrument, simulated_instrument, ground_instrument, icus_day_time, icus_night_time) are integer MINUTES. Responses state this in a units object. Write tools also accept an _hours form of any of them, for example total_time_hours or icus_night_time_hours. The hours value must be a whole number of minutes (1.5 is 90, 1.005 is not a whole minute): a fractional minute is refused, never rounded, and the error names the nearest valid value.\n'
                 '- Flight time is capped at 525600 minutes (8760 hours) and takeoff/landing counts at 10000, the same limits the app enforces. A value outside either is refused, and the error names the limit.\n'
                 '- day_time and night_time must add up to total_time when both are supplied: the app cannot display any other split, so it is refused. A one-sided split (for example day_time equal to total_time with no night_time) is stored as given and reported in warnings, because the app saves those itself. find_missing_times lists every row the app cannot show complete, with a reason per row.\n'
                 '- time_start and time_stop are 24-hour clock times stored as HH:MM. Write tools accept 9, 930, 9:30, 09:30 or 0930 and refuse anything else, so 9am is rejected rather than stored. They pair with calc_time_mode (utc, local, time, hobbsTacho) and hobbs_start/hobbs_stop when that mode was used. They are not stored as durations.\n'

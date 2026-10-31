@@ -441,4 +441,101 @@ void main() {
     expect(settings['id'], 'settings-1',
         reason: 'an existing settings row keeps its id');
   });
+
+  group('the _hours aliases never round', () {
+    void addPlannedColumns() {
+      withFixtureDb(dbPath, (db) {
+        db.execute(
+            'ALTER TABLE flights ADD COLUMN scheduled_departure_utc INTEGER NULL');
+        db.execute(
+            'ALTER TABLE flights ADD COLUMN scheduled_arrival_utc INTEGER NULL');
+        db.execute(
+            'ALTER TABLE flights ADD COLUMN scheduled_block_minutes INTEGER NULL');
+      });
+    }
+
+    test('accept exact whole-minute values across every alias', () async {
+      addPlannedColumns();
+      final server = await start();
+
+      final complete = await server.call('create_flight', {
+        'date': '2026-07-01',
+        'total_time_hours': 1.5,
+        'day_time_hours': 1,
+        'night_time_hours': 0.5,
+      });
+      expect(complete.isError, isFalse, reason: '${complete.payload}');
+      final stored = flightRow(payloadOf(complete)['id'] as String);
+      expect(stored['total_time'], 90, reason: '1.5 hours is 90 minutes');
+      expect(stored['day_time'], 60, reason: '1 hour is 60 minutes');
+      expect(stored['night_time'], 30, reason: '0.5 hours is 30 minutes');
+
+      final planned = await server.call('create_flight', {
+        'date': '2026-07-02',
+        'scheduled_block_minutes_hours': 1.25,
+      });
+      expect(planned.isError, isFalse, reason: '${planned.payload}');
+      expect(
+          flightRow(
+              payloadOf(planned)['id'] as String)['scheduled_block_minutes'],
+          75,
+          reason: '1.25 hours is 75 minutes');
+    });
+
+    test('refuse a sub-minute value by field, naming the nearest whole minute',
+        () async {
+      final server = await start();
+      final before = flightCount();
+
+      // 1.005 hours is 60.3 minutes. It used to be stored as 60: a duration
+      // the pilot never entered.
+      final refused = await server.call('create_flight', {
+        'date': '2026-07-03',
+        'total_time_hours': 1.005,
+      });
+      expect(refused.isError, isTrue);
+      final message = '${refused.payload}';
+      expect(message, contains('total_time_hours'),
+          reason: 'the error names the field');
+      expect(message, contains('never rounded'), reason: message);
+      expect(message, contains('60.3'), reason: 'the exact minutes are named');
+      expect(message, contains('60 minutes'),
+          reason: 'the nearest valid value is named');
+      expect(flightCount(), before, reason: 'a refused write must not insert');
+
+      // The same conversion is used on update, so an existing value is not
+      // silently moved to the nearest minute either.
+      final created = await server
+          .call('create_flight', {'date': '2026-07-04', 'total_time': 90});
+      expect(created.isError, isFalse, reason: '${created.payload}');
+      final id = payloadOf(created)['id'] as String;
+      final update = await server
+          .call('update_flight', {'id': id, 'total_time_hours': 1.005});
+      expect(update.isError, isTrue);
+      expect('${update.payload}', contains('total_time_hours'));
+      expect(flightRow(id)['total_time'], 90,
+          reason: 'the refused update leaves the stored minutes alone');
+    });
+
+    test('refuse a sub-minute value on a batch row', () async {
+      final server = await start();
+      final before = flightCount();
+
+      final result = payloadOf(await server.call('apply_flight_batch', {
+        'dry_run': false,
+        'flights': [
+          {'date': '2026-07-05', 'total_time_hours': 2.02},
+        ],
+      }));
+      expect(result['applied'], 0);
+      final failed = (result['failed'] as List).cast<Map<String, dynamic>>();
+      final reason = '${failed.single['reason']}';
+      expect(reason, contains('total_time_hours'),
+          reason: 'the row failure names the field');
+      expect(reason, contains('never rounded'), reason: reason);
+      expect(reason, contains('121 minutes'),
+          reason: '2.02 hours is 121.2 minutes, nearest 121');
+      expect(flightCount(), before, reason: 'a refused batch writes nothing');
+    });
+  });
 }
