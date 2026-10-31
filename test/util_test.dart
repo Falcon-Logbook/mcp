@@ -253,6 +253,38 @@ void main() {
     });
   });
 
+  group('isoInstantToEpoch', () {
+    test('parses the form reads render, with either offset spelling', () {
+      expect(isoInstantToEpoch('2026-10-26T13:00:00.000+1100'), 1792980000);
+      expect(isoInstantToEpoch('2026-10-26T13:00:00+11:00'), 1792980000);
+      expect(isoInstantToEpoch('2023-11-14T22:15:00.000Z'), 1700000100);
+    });
+
+    test('round-trips the text epochToIso renders', () {
+      expect(isoInstantToEpoch(epochToIso(1700000100)), 1700000100);
+      expect(isoInstantToEpoch(epochToIso(1792980000)), 1792980000);
+    });
+
+    test('the same instant in different offsets parses alike', () {
+      expect(
+        isoInstantToEpoch('2026-10-26T02:00:00.000Z'),
+        isoInstantToEpoch('2026-10-26T13:00:00.000+1100'),
+      );
+    });
+
+    test('refuses values that do not name one stored instant', () {
+      expect(isoInstantToEpoch('2026-10-26'), isNull);
+      expect(isoInstantToEpoch('2026-10-26T13:00:00'), isNull);
+      expect(isoInstantToEpoch('2026-02-30T13:00:00.000+1100'), isNull);
+      expect(isoInstantToEpoch('2026-10-26T24:00:00.000+1100'), isNull);
+      expect(isoInstantToEpoch('2026-10-26T13:00:00.500+1100'), isNull);
+      expect(isoInstantToEpoch('2026-10-26T13:00:00.000+2500'), isNull);
+      expect(isoInstantToEpoch('1761438000'), isNull);
+      expect(isoInstantToEpoch(1761438000), isNull);
+      expect(isoInstantToEpoch('  '), isNull);
+    });
+  });
+
   group('appendAudit', () {
     test('returns null after writing the line', () {
       final dir = Directory.systemTemp.createTempSync('falcon_mcp_audit_test');

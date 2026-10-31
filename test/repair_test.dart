@@ -1,6 +1,7 @@
 import 'dart:convert';
 import 'dart:io';
 
+import 'package:falcon_mcp/falcon_mcp.dart';
 import 'package:test/test.dart';
 
 import 'support/harness.dart';
@@ -133,6 +134,328 @@ void main() {
       final report = payloadOf(await server.call('data_quality_report', {}));
       expect(report['total_flights'], 0);
       expect(report['classes'], isEmpty);
+    });
+
+    test('reports every class exactly on a fixture of messy rows', () async {
+      // One row per defect class, plus a second crew member that normalises
+      // like the fixture one. Dates ascend with each insert so the report's
+      // date-descending order is predictable.
+      insert("INSERT INTO crew_members (id, name, first_name, last_name, "
+          "created_at) VALUES ('cr-2', 'JANE  DOE', 'Jane', 'Doe', "
+          '1700000000)');
+      insert("INSERT INTO flights (id, date, route, total_time, day_time, "
+          "night_time, aircraft_registration, crew_members_name, "
+          "is_simulator, aircraft_id, route_id, created_at) VALUES "
+          "('fl-draft2', 1761580800, 'YSSY - YBBN', NULL, NULL, NULL, NULL, "
+          "NULL, 0, NULL, NULL, 1700000000), "
+          "('fl-missing', 1761667200, NULL, 60, 60, NULL, NULL, NULL, 0, "
+          "NULL, NULL, 1700000000), "
+          "('fl-mismatch', 1761753600, NULL, 60, 30, 20, NULL, NULL, 0, "
+          "NULL, NULL, 1700000000), "
+          "('fl-zero', 1761840000, NULL, 0, 0, 0, NULL, NULL, 0, NULL, NULL, "
+          "1700000000), "
+          "('fl-match', 1761926400, NULL, 90, 90, 0, 'VH-XZO', NULL, 0, "
+          "NULL, NULL, 1700000000), "
+          "('fl-unmatched', 1762012800, NULL, 90, 90, 0, 'VH-NOPE', NULL, 0, "
+          "NULL, NULL, 1700000000), "
+          "('fl-crew', 1762099200, NULL, 90, 90, 0, NULL, 'jane doe', 0, "
+          "NULL, NULL, 1700000000), "
+          "('fl-dup1', 1762185600, 'YSSY - YBBN', 45, 45, 0, NULL, NULL, 0, "
+          "NULL, NULL, 1700000000), "
+          "('fl-dup2', 1762185600, 'YSSY - YBBN', 45, 45, 0, NULL, NULL, 0, "
+          "NULL, NULL, 1700000000), "
+          "('fl-route-bad', 1762272000, 'not an airport pair', 60, 60, 0, "
+          "NULL, NULL, 0, NULL, NULL, 1700000000), "
+          "('fl-future', 1893456000, NULL, 60, 60, 0, NULL, NULL, 0, NULL, "
+          "NULL, 1700000000), "
+          "('fl-dangle', 1762358400, 'YSSY - YBBN', 60, 60, 0, NULL, NULL, "
+          "0, NULL, 999, 1700000000), "
+          "('fl-sim-nodur', 1762444800, NULL, NULL, NULL, NULL, NULL, NULL, "
+          "1, NULL, NULL, 1700000000), "
+          "('fl-sim-notsimaircraft', 1762531200, NULL, 60, 60, 0, NULL, "
+          "NULL, 1, 'ac-1', NULL, 1700000000)");
+
+      final server = await start();
+      final report = payloadOf(await server.call('data_quality_report', {}));
+
+      Map<String, dynamic> at(String id) => {
+            'id': id,
+            'date': epochToCalendarDate(switch (id) {
+              'fl-draft' => 1761494400,
+              'fl-draft2' => 1761580800,
+              'fl-missing' => 1761667200,
+              'fl-mismatch' => 1761753600,
+              'fl-zero' => 1761840000,
+              'fl-match' => 1761926400,
+              'fl-unmatched' => 1762012800,
+              'fl-crew' => 1762099200,
+              'fl-dup1' || 'fl-dup2' => 1762185600,
+              'fl-route-bad' => 1762272000,
+              'fl-future' => 1893456000,
+              'fl-dangle' => 1762358400,
+              'fl-sim-nodur' => 1762444800,
+              'fl-sim-notsimaircraft' => 1762531200,
+              _ => throw ArgumentError(id),
+            }),
+          };
+
+      expect(report['total_flights'], 16,
+          reason: 'the two fixture flights plus fourteen arranged');
+      expect(report['classes'], [
+        {
+          'id': 'drafts',
+          'label': 'Flights with no total_time (drafts)',
+          'count': 3,
+          'sample': [
+            at('fl-sim-nodur'),
+            {...at('fl-draft2'), 'route': 'YSSY - YBBN'},
+            {...at('fl-draft'), 'route': 'YSBK - YSSY'},
+          ],
+        },
+        {
+          'id': 'missing_split',
+          'label': 'Complete flights with a missing day/night split',
+          'count': 1,
+          'sample': [at('fl-missing')],
+        },
+        {
+          'id': 'split_mismatch',
+          'label': 'Flights whose day + night does not equal the total',
+          'count': 1,
+          'sample': [at('fl-mismatch')],
+        },
+        {
+          'id': 'absurd_totals',
+          'label':
+              'Totals of zero, or above the app cap of $maxFlightMinutes minutes',
+          'count': 1,
+          'sample': [at('fl-zero')],
+        },
+        {
+          'id': 'aircraft_matchable',
+          'label':
+              'Flights whose registration text matches an aircraft row, unlinked',
+          'count': 1,
+          'sample': [
+            {
+              ...at('fl-match'),
+              'aircraft_registration': 'VH-XZO',
+              'candidates': 1,
+            },
+          ],
+        },
+        {
+          'id': 'aircraft_unmatched',
+          'label': 'Flights whose registration text matches no aircraft row',
+          'count': 1,
+          'sample': [
+            {
+              ...at('fl-unmatched'),
+              'aircraft_registration': 'VH-NOPE',
+              'candidates': 0,
+            },
+          ],
+        },
+        {
+          'id': 'crew_matchable',
+          'label': 'Flights whose crew name matches a crew member, unlinked',
+          'count': 1,
+          'sample': [at('fl-crew')],
+        },
+        {
+          'id': 'duplicate_crew',
+          'label': 'Crew members whose names normalise alike',
+          'count': 1,
+          'sample': [
+            {
+              'name': 'JANEDOE',
+              'members': [
+                {'id': 'cr-2', 'name': 'JANE  DOE', 'archived': false},
+                {'id': 'cr-1', 'name': 'Jane Doe', 'archived': false},
+              ],
+            },
+          ],
+        },
+        {
+          'id': 'duplicate_flights',
+          'label': 'Same date, route, registration and total',
+          'count': 1,
+          'sample': [
+            {
+              'date': epochToCalendarDate(1762185600),
+              'route': 'YSSY - YBBN',
+              'aircraft_registration': null,
+              'total_time': 45,
+              'flight_ids': ['fl-dup1', 'fl-dup2'],
+            },
+          ],
+        },
+        {
+          'id': 'route_unparsable',
+          'label': 'Routes the app reads as free text, not an airport pair',
+          'count': 1,
+          'sample': [
+            {...at('fl-route-bad'), 'route': 'not an airport pair'},
+          ],
+        },
+        {
+          'id': 'future_dates',
+          'label': 'Flights dated after today',
+          'count': 1,
+          'sample': [at('fl-future')],
+        },
+        {
+          'id': 'dangling_route_link',
+          'label': 'Route links pointing at no saved route',
+          'count': 1,
+          'sample': [
+            {...at('fl-dangle'), 'route': 'YSSY - YBBN'},
+          ],
+        },
+        {
+          'id': 'simulator_oddities',
+          'label':
+              'Simulator sessions with no duration, or on a non-sim aircraft',
+          'count': 2,
+          'sample': [
+            {...at('fl-sim-notsimaircraft'), 'reason': 'aircraft_not_sim'},
+            {...at('fl-sim-nodur'), 'reason': 'no_duration'},
+          ],
+        },
+        {
+          'id': 'orphaned_aircraft_text',
+          'label':
+              'One of the aircraft pair (link, registration text) set, other empty',
+          'count': 3,
+          'sample': [
+            {
+              ...at('fl-sim-notsimaircraft'),
+              'aircraft_id': 'ac-1',
+              'aircraft_registration': null,
+            },
+            {
+              ...at('fl-unmatched'),
+              'aircraft_id': null,
+              'aircraft_registration': 'VH-NOPE',
+            },
+            {
+              ...at('fl-match'),
+              'aircraft_id': null,
+              'aircraft_registration': 'VH-XZO',
+            },
+          ],
+        },
+      ]);
+    });
+
+    test('matching keeps the linkers rules: bare forms, active rows first',
+        () async {
+      // Two tails whose registrations normalise alike, one of them retired,
+      // and a pair with no active row between them. The report counts them the
+      // way link_flights_to_aircraft would resolve them.
+      insert("INSERT INTO aircraft (id, type, country_code, registration, "
+          "archived, created_at) VALUES "
+          "('ac-live', 'B738', 'AU', 'VHOLD', 0, 1700000000), "
+          "('ac-old', 'B738', 'VH', 'OLD', 1, 1700000000), "
+          "('ac-retired1', 'B738', 'VH', 'RET', 1, 1700000000), "
+          "('ac-retired2', 'B738', 'NZ', 'VHRET', 1, 1700000000)");
+      insert("INSERT INTO flights (id, date, total_time, day_time, night_time, "
+          "aircraft_registration, crew_members_name, created_at) VALUES "
+          "('fl-bare', 1761580800, 60, 60, 0, 'XZO', NULL, 1700000000), "
+          "('fl-live', 1761667200, 60, 60, 0, 'VH-OLD', NULL, 1700000000), "
+          "('fl-retired', 1761753600, 60, 60, 0, 'VH-RET', NULL, 1700000000), "
+          "('fl-crew-form', 1761840000, 60, 60, 0, NULL, 'DOE Jane', "
+          "1700000000)");
+
+      final report =
+          payloadOf(await (await start()).call('data_quality_report', {}));
+
+      Map<String, dynamic> at(String id, int epoch,
+              [Map<String, dynamic> extra = const {}]) =>
+          {
+            'id': id,
+            'date': epochToCalendarDate(epoch),
+            ...extra,
+          };
+
+      // Date descending, exactly as the flights query returns them.
+      expect(classOf(report, 'aircraft_matchable')['count'], 3);
+      expect(
+          classOf(report, 'aircraft_matchable')['sample'],
+          [
+            at('fl-retired', 1761753600,
+                {'aircraft_registration': 'VH-RET', 'candidates': 2}),
+            at('fl-live', 1761667200,
+                {'aircraft_registration': 'VH-OLD', 'candidates': 1}),
+            at('fl-bare', 1761580800,
+                {'aircraft_registration': 'XZO', 'candidates': 1}),
+          ],
+          reason: 'an active row hides the retired namesake; a bare form still '
+              'matches, because link_flights_to_aircraft matches it');
+      expect(classOf(report, 'crew_matchable')['count'], 1,
+          reason: 'DOE Jane is Jane Does last-first form');
+    });
+
+    test('stays fast when a big logbook meets a big fleet and crew list',
+        () async {
+      const rows = 5000;
+      const fleet = 400;
+      const crew = 300;
+      withFixtureDb(dbPath, (db) {
+        db.execute('BEGIN');
+        for (var start = 0; start < fleet; start += 200) {
+          final values = [
+            for (var i = start; i < start + 200 && i < fleet; i++)
+              "('ac-scale$i', 'B738', 'VH', 'S$i', 1700000000)",
+          ];
+          db.execute('INSERT INTO aircraft (id, type, country_code, '
+              'registration, created_at) VALUES ${values.join(', ')}');
+        }
+        for (var start = 0; start < crew; start += 200) {
+          final values = [
+            for (var i = start; i < start + 200 && i < crew; i++)
+              "('cr-scale$i', 'Crew $i', 'Crew', '$i', 1700000000)",
+          ];
+          db.execute('INSERT INTO crew_members '
+              '(id, name, first_name, last_name, created_at) '
+              'VALUES ${values.join(', ')}');
+        }
+        for (var start = 0; start < rows; start += 500) {
+          final values = [
+            for (var i = start; i < start + 500 && i < rows; i++)
+              "('fl-scale$i', ${1761408000 + i * 60}, 'YSSY - YBBN', 60, 60, "
+                  "0, 'VH-S1', 'Crew 1', 1700000000)",
+          ];
+          db.execute(
+              'INSERT INTO flights (id, date, route, total_time, day_time, '
+              'night_time, aircraft_registration, crew_members_name, '
+              'created_at) VALUES ${values.join(', ')}');
+        }
+        db.execute('COMMIT');
+      });
+      final server = await start();
+      // Warm the JIT first: the first tool call pays the compile of the
+      // handler, which is not what this test is measuring.
+      await server.call('data_quality_report', {});
+
+      final watch = Stopwatch()..start();
+      final report = payloadOf(await server.call('data_quality_report', {}));
+      watch.stop();
+
+      int countOf(String id) => (report['classes'] as List)
+          .cast<Map<String, dynamic>>()
+          .firstWhere((c) => c['id'] == id)['count'] as int;
+      expect(report['total_flights'], rows + 2);
+      expect(countOf('aircraft_matchable'), rows);
+      expect(countOf('crew_matchable'), rows);
+      // Measured on this fixture: 160 ms with the lookups loaded once, about
+      // 7 s before #54, when every flight rescanned the aircraft and crew
+      // tables. The bound is a fence, not a benchmark: roughly 19x the
+      // measured cost, so a slow CI box is not a failure, while a per-row
+      // query coming back lands well above it.
+      expect(watch.elapsed, lessThan(const Duration(seconds: 3)),
+          reason: 'data_quality_report took ${watch.elapsedMilliseconds} ms '
+              'for $rows rows against a $fleet-aircraft fleet and $crew crew');
     });
   });
 
@@ -461,6 +784,61 @@ void main() {
                   'SELECT aircraft_registration FROM flights WHERE id = ?',
                   ['fl-rev'])).single['aircraft_registration'],
           'VH-XZO');
+    });
+
+    test(
+        'an explicit flight_id with no link and no text is reported, not '
+        'thrown', () async {
+      // Issue #60: fl-draft has aircraft_id IS NULL and empty registration
+      // text, so there is nothing to resolve. The preview must report it.
+      final server = await start(write: true);
+
+      final preview = payloadOf(await server.call('link_flights_to_aircraft', {
+        'flight_ids': ['fl-draft']
+      }));
+
+      expect(preview['dry_run'], isTrue);
+      expect(preview['linked'], 0);
+      final unmatched = preview['unmatched'] as List;
+      expect(unmatched.single['flight_id'], 'fl-draft');
+      expect(unmatched.single['detail'],
+          'flight has no aircraft and no registration text');
+
+      final applied = payloadOf(await server.call('link_flights_to_aircraft', {
+        'flight_ids': ['fl-draft'],
+        'dry_run': false
+      }));
+      expect(applied['linked'], 0);
+      expect((applied['unmatched'] as List).single['flight_id'], 'fl-draft');
+
+      final row = withFixtureDb(
+          dbPath,
+          (db) => db
+              .select('SELECT aircraft_id, aircraft_registration FROM flights '
+                  "WHERE id = 'fl-draft'")).single;
+      expect(row['aircraft_id'], isNull);
+      expect(row['aircraft_registration'], isNull);
+    });
+
+    test('a batch with one unlinkable flight still links the others', () async {
+      insert("INSERT INTO flights (id, date, route, aircraft_registration, "
+          "created_at) VALUES ('fl-link', 1761408000, 'YSSY - NZQN', "
+          "'VH-XZO', 1700000000)");
+      final server = await start(write: true);
+
+      final applied = payloadOf(await server.call('link_flights_to_aircraft', {
+        'flight_ids': ['fl-draft', 'fl-link'],
+        'dry_run': false
+      }));
+
+      expect(applied['linked'], 1);
+      expect((applied['unmatched'] as List).single['flight_id'], 'fl-draft');
+      final row = withFixtureDb(
+              dbPath,
+              (db) => db.select(
+                  'SELECT aircraft_id FROM flights WHERE id = ?', ['fl-link']))
+          .single;
+      expect(row['aircraft_id'], 'ac-1');
     });
 
     test('never creates aircraft and never deletes anything', () async {

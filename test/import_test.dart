@@ -231,6 +231,19 @@ void main() {
       expect('${issue['message']}', contains('74.04'),
           reason: 'the message names the minute result');
 
+      // 1.005 hours is 60.3 minutes: the import path and the _hours aliases
+      // must refuse the same value rather than one rounding it to 60.
+      final justOver = payloadOf(await server.call('validate_flight_drafts', {
+        'mode': 'import',
+        'units': 'decimal_hours',
+        'flights': [
+          {'date': '2026-11-02', 'total_time': 1.005},
+        ],
+      }));
+      final over = issuesAt(justOver, 0).single;
+      expect(over['code'], 'unit_implausible');
+      expect('${over['message']}', contains('60.3'));
+
       final huge = payloadOf(await server.call('validate_flight_drafts', {
         'mode': 'import',
         'flights': [
