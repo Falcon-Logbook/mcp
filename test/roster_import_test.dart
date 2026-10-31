@@ -2,7 +2,7 @@ import 'dart:convert';
 import 'dart:io';
 
 import 'package:falcon_mcp/falcon_mcp.dart'
-    show auditPathFor, dateToEpoch, formatCalendarDate;
+    show auditPathFor, dateToEpoch, epochToIso, formatCalendarDate;
 import 'package:test/test.dart';
 
 import 'support/harness.dart';
@@ -584,6 +584,20 @@ void main() {
       expect(stored['total_time'], isNull,
           reason: 'the block is the plan, never the time flown');
       expect(stored['day_order'], 0);
+
+      // Issue #73: the planned times are `_utc` columns holding unix seconds,
+      // which the naming conventions do not catch, so `_instantColumns` has to
+      // list them. Read them back through a tool, not the raw table, or
+      // dropping either entry leaves the suite green.
+      final read = payloadOf(await server
+          .call('get_flight', {'id': (result['created'] as List).single}));
+      expect(read['scheduled_departure_utc'], epochToIso(departure));
+      expect(read['scheduled_arrival_utc'], epochToIso(arrival));
+      expect(read['scheduled_arrival_utc'], isA<String>(),
+          reason: 'an instant renders as ISO text, never a raw epoch integer');
+      expect(read['scheduled_block_minutes'], 90,
+          reason: 'a duration stays in minutes, unmoved by the instant rule');
+      expect(read['total_time'], isNull);
     });
 
     test('one audit entry per batch carries batch_id and the created ids',
