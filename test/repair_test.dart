@@ -245,6 +245,97 @@ void main() {
     });
   });
 
+  group('update_crew rename', () {
+    Map<String, dynamic> crewRow(String id) => withFixtureDb(
+        dbPath,
+        (db) => db.select(
+            'SELECT name, first_name, last_name, updated_at FROM crew_members '
+            'WHERE id = ?',
+            [id])).single;
+
+    Map<String, dynamic> flightRow(String id) => withFixtureDb(
+        dbPath,
+        (db) => db.select(
+            'SELECT crew_member_id, crew_members_name, updated_at FROM flights '
+            'WHERE id = ?',
+            [id])).single;
+
+    test('renaming first_name re-derives the name and relabels linked flights',
+        () async {
+      final server = await start(write: true);
+
+      payloadOf(await server.call('update_crew', {
+        'id': 'cr-1',
+        'first_name': 'Janet',
+      }));
+
+      final crew = crewRow('cr-1');
+      expect(crew['name'], 'Janet Doe',
+          reason: 'add_crew derives name as "first last"');
+      expect(crew['first_name'], 'Janet');
+      expect(crew['last_name'], 'Doe');
+      expect(crew['updated_at'], isNotNull, reason: 'the rename is stamped');
+      final flight = flightRow('fl-1');
+      expect(flight['crew_members_name'], 'Janet Doe',
+          reason: 'the flight label follows the crew link');
+      expect(flight['updated_at'], isNotNull);
+    });
+
+    test('renaming last_name re-derives the name too', () async {
+      final server = await start(write: true);
+
+      payloadOf(await server.call('update_crew', {
+        'id': 'cr-1',
+        'last_name': 'Dough',
+      }));
+
+      expect(crewRow('cr-1')['name'], 'Jane Dough');
+      expect(flightRow('fl-1')['crew_members_name'], 'Jane Dough');
+    });
+
+    test('an explicit name wins over the parts, as add_crew does', () async {
+      final server = await start(write: true);
+
+      payloadOf(await server.call('update_crew', {
+        'id': 'cr-1',
+        'first_name': 'Janet',
+        'last_name': 'Doe',
+        'name': 'Captain Doe',
+      }));
+
+      final crew = crewRow('cr-1');
+      expect(crew['name'], 'Captain Doe');
+      expect(crew['first_name'], 'Janet');
+      expect(crew['last_name'], 'Doe');
+    });
+
+    test('touches no other crew row or flight', () async {
+      insert("INSERT INTO crew_members (id, name, first_name, last_name, "
+          "created_at, updated_at) VALUES ('cr-2', 'Sam Pilot', 'Sam', "
+          "'Pilot', 1700000000, 1700005000)");
+      insert("INSERT INTO flights (id, date, route, crew_member_id, "
+          "crew_members_name, created_at) VALUES ('fl-2', 1761494400, "
+          "'YSBK - YSSY', 'cr-2', 'Sam Pilot', 1700000000)");
+      final server = await start(write: true);
+
+      payloadOf(await server.call('update_crew', {
+        'id': 'cr-1',
+        'first_name': 'Janet',
+      }));
+
+      final other = crewRow('cr-2');
+      expect(other['name'], 'Sam Pilot');
+      expect(other['updated_at'], 1700005000);
+      final otherFlight = flightRow('fl-2');
+      expect(otherFlight['crew_members_name'], 'Sam Pilot');
+      expect(otherFlight['updated_at'], isNull);
+      final unlinked = flightRow('fl-draft');
+      expect(unlinked['crew_members_name'], isNull);
+      expect(unlinked['updated_at'], isNull,
+          reason: 'a flight with no crew link keeps its label');
+    });
+  });
+
   group('link_flights_to_aircraft', () {
     test('resolves display-form text against a bare-registration fleet',
         () async {

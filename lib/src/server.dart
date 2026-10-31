@@ -150,8 +150,9 @@ const _aircraftColumns = <_Column>[
 
 const _crewColumns = <_Column>[
   _Column('name', _Kind.text,
-      note:
-          'Display name. Derived from first_name and last_name when omitted.'),
+      note: 'Display name. Derived from first_name and last_name when omitted '
+          'on create, and re-derived when either changes on update unless name '
+          'is given too.'),
   _Column('first_name', _Kind.text),
   _Column('last_name', _Kind.text),
   _Column('note', _Kind.text),
@@ -5433,7 +5434,10 @@ Future<void> runServer(String dbPath, {bool readonly = true}) async {
     server.registerTool(
       'update_crew',
       description:
-          'Update a crew member by id. Only the fields provided are changed.',
+          'Update a crew member by id. Only the fields provided are changed. '
+          'Changing first_name or last_name without name re-derives name as '
+          '"first last" and relabels that crew member\'s flights; an explicit '
+          'name wins.',
       inputSchema: JsonSchema.object(
         properties: {
           'dry_run': _dryRunSchema,
@@ -5452,8 +5456,10 @@ Future<void> runServer(String dbPath, {bool readonly = true}) async {
             tool: 'update_crew');
         final id = asText(args['id']);
         if (id == null) throw _ToolError('Missing or invalid id', field: 'id');
-        if (db
-            .query('SELECT id FROM crew_members WHERE id = ?', [id]).isEmpty) {
+        final existing = db.query(
+            'SELECT name, first_name, last_name FROM crew_members WHERE id = ?',
+            [id]);
+        if (existing.isEmpty) {
           throw _ToolError('Crew member not found: $id',
               code: 'not_found', field: 'id');
         }
@@ -5461,12 +5467,30 @@ Future<void> runServer(String dbPath, {bool readonly = true}) async {
         final values = <Object?>[];
         _collect(db, 'crew_members', _crewColumns, args, columns, values);
         if (columns.isEmpty) throw _ToolError('No fields to update');
+        // add_crew derives name as '$first $last'. The update path has to do
+        // the same, or a rename leaves the display name (and every label and
+        // match that reads it) on the old text. An explicit name wins, as it
+        // does on create.
+        String? derivedName;
+        if (!columns.contains('name') &&
+            (columns.contains('first_name') || columns.contains('last_name'))) {
+          final firstName = columns.contains('first_name')
+              ? asText(values[columns.indexOf('first_name')])
+              : asText(existing.first['first_name']);
+          final lastName = columns.contains('last_name')
+              ? asText(values[columns.indexOf('last_name')])
+              : asText(existing.first['last_name']);
+          derivedName = '${firstName ?? ''} ${lastName ?? ''}';
+          columns.add('name');
+          values.add(derivedName);
+        }
         final assignments = [for (final column in columns) '$column = ?'];
         final guard = _optimisticGuard(args);
+        final now = nowEpochSeconds();
         final changed = db.execute(
           'UPDATE crew_members SET ${assignments.join(', ')}, updated_at = ? '
           'WHERE id = ?${guard.$1}',
-          [...values, nowEpochSeconds(), id, ...guard.$2],
+          [...values, now, id, ...guard.$2],
         );
         _requireUpdated(db,
             table: 'crew_members',
@@ -5475,6 +5499,17 @@ Future<void> runServer(String dbPath, {bool readonly = true}) async {
             label: 'Crew member',
             tool: 'update_crew',
             expected: _expectedUpdatedAtOf(args));
+        if (derivedName != null &&
+            derivedName != (asText(existing.first['name']) ?? '')) {
+          // The app's rule (merge_crew, crewDao.mergeCrewMembers): a crew
+          // label change follows the link, so the logbook never shows a name
+          // that disagrees with the crew row.
+          db.execute(
+            'UPDATE flights SET crew_members_name = ?, updated_at = ? '
+            'WHERE crew_member_id = ?',
+            [derivedName, now, id],
+          );
+        }
         return {'status': 'updated', 'id': id};
       }),
     );
