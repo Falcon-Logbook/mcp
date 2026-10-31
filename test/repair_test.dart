@@ -438,6 +438,65 @@ void main() {
     });
   });
 
+  // Issue #57: deleting a saved route unlinks its flights, and that unlink is
+  // a flight write. Without the updated_at stamp a delta push never re-selects
+  // the flight, so the cloud keeps a route_id pointing at the deleted route.
+  group('delete_saved_route', () {
+    test('previews then unlinks every flight and stamps updated_at', () async {
+      insert("UPDATE flights SET route_id = 1, updated_at = 1700000000 "
+          "WHERE id = 'fl-1'");
+      insert("INSERT INTO flights (id, date, route, route_id, updated_at, "
+          "created_at) VALUES ('fl-route-b', 1761494400, 'YSSY - EGLL', 1, "
+          "1700000000, 1700000000)");
+      insert(
+          "UPDATE flights SET updated_at = 1700000000 WHERE id = 'fl-draft'");
+      final server = await start(write: true);
+
+      Map<String, Map<String, Object?>> rows() => withFixtureDb(
+          dbPath,
+          (db) => {
+                for (final row in db.select(
+                    'SELECT id, route_id, updated_at FROM flights ORDER BY id'))
+                  row['id'] as String: {
+                    'id': row['id'],
+                    'route_id': row['route_id'],
+                    'updated_at': row['updated_at'],
+                  },
+              });
+      final before = rows();
+
+      final preview = payloadOf(
+          await server.call('delete_saved_route', {'id': 1, 'dry_run': true}));
+      expect(preview['dry_run'], isTrue);
+      expect(preview['status'], 'deleted');
+      expect(preview['affected_ids'], unorderedEquals(['fl-1', 'fl-route-b']));
+      expect(rows(), before, reason: 'the preview changes nothing');
+
+      final applied = payloadOf(
+          await server.call('delete_saved_route', {'id': 1, 'dry_run': false}));
+      expect(applied.containsKey('dry_run'), isFalse,
+          reason: 'an applied delete is not marked');
+      expect(applied['status'], 'deleted');
+      expect(applied['table'], 'saved_routes');
+      expect(applied['affected_ids'], unorderedEquals(['fl-1', 'fl-route-b']),
+          reason: 'the response names the flights it unlinked');
+
+      final after = rows();
+      for (final id in ['fl-1', 'fl-route-b']) {
+        expect(after[id]!['route_id'], isNull);
+        expect(after[id]!['updated_at'],
+            greaterThan(before[id]!['updated_at'] as int),
+            reason: '$id must carry a stamp so a delta push sees the unlink');
+      }
+      expect(after['fl-draft'], before['fl-draft'],
+          reason: 'a flight that never linked to the route is untouched');
+      expect(
+          withFixtureDb(
+              dbPath, (db) => db.select('SELECT id FROM saved_routes')),
+          isEmpty);
+    });
+  });
+
   group('acceptance: scale and the audit trail', () {
     test('a 500-flight tidy-up completes in one transaction', () async {
       final rows = [
