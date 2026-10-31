@@ -109,12 +109,11 @@ class AskStateStore {
     return token;
   }
 
-  /// Consumes [token] for [questions].
+  /// Why [token] cannot be used for [questions], or null when it can.
   ///
-  /// Returns why it cannot be used, or null when it was used. A token is spent
-  /// on use, so a second attempt with the same one is refused: the answers
-  /// belong to the first call that sent them.
-  String? consume(String token, List<Question> questions) {
+  /// Nothing that is still usable is spent here: a caller that goes on to
+  /// refuse the answers leaves the form answerable with the same token.
+  String? check(String token, List<Question> questions) {
     final pending = _pending[token];
     if (pending == null) {
       return 'These answers no longer match a waiting question. Ask again.';
@@ -128,6 +127,17 @@ class AskStateStore {
       return 'The questions changed while they were waiting for an answer. '
           'Ask again.';
     }
+    return null;
+  }
+
+  /// Consumes [token] for [questions].
+  ///
+  /// Returns why it cannot be used, or null when it was used. A token is spent
+  /// on use, so a second attempt with the same one is refused: the answers
+  /// belong to the first call that sent them.
+  String? consume(String token, List<Question> questions) {
+    final refused = check(token, questions);
+    if (refused != null) return refused;
     _pending.remove(token);
     return null;
   }
@@ -205,7 +215,7 @@ Future<BaseResultData> askUser(
       _refuse('requestState',
           'inputResponses requires the requestState from the first call');
     }
-    final refused = state.consume(requestState, questions);
+    final refused = state.check(requestState, questions);
     if (refused != null) return needsInput(questions, reason: refused);
     final response = inputResponses[askUserInputKey];
     if (response == null) {
@@ -214,7 +224,12 @@ Future<BaseResultData> askUser(
           'inputResponses["$askUserInputKey"] is missing. '
               'Answer the question that was asked.');
     }
-    return readElicitResponse(response.value, questions);
+    // The answers are read before the token is spent, so a refusal here leaves
+    // the form answerable: a retry with a corrected answer still finds it.
+    final answered = readElicitResponse(response.value, questions);
+    final spent = state.consume(requestState, questions);
+    if (spent != null) return needsInput(questions, reason: spent);
+    return answered;
   }
   if (requestState != null) {
     _refuse('inputResponses',

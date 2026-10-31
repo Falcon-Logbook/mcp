@@ -609,6 +609,15 @@ void main() {
           contains('no longer match'));
     });
 
+    test('checking a token does not spend it', () {
+      final state = AskStateStore();
+      final token = state.remember([AskQuestions.confirmPlan]);
+      expect(state.check(token, [AskQuestions.confirmPlan]), isNull);
+      expect(state.pending, 1, reason: 'a check leaves the token waiting');
+      expect(state.consume(token, [AskQuestions.confirmPlan]), isNull);
+      expect(state.pending, 0);
+    });
+
     test('an unknown token is refused', () {
       expect(AskStateStore().consume('made-up', [AskQuestions.confirmPlan]),
           contains('no longer match'));
@@ -801,6 +810,99 @@ void main() {
       expect(payload['status'], 'needs_input');
       expect(payload, isNot(contains('answers')));
       expect(payload['reason'], contains('no longer match'));
+    });
+
+    test('a rejected answer leaves the form answerable', () async {
+      final state = AskStateStore();
+      final questions = [AskQuestions.confirmPlan.toJson()];
+      final first = await ask(
+        {'questions': questions},
+        stateless: true,
+        canElicit: true,
+        state: state,
+      );
+      final token = first.toJson()['requestState'] as String;
+      InputResponses answered(Object? value) => {
+            askUserInputKey: InputResponse.fromJson({
+              'action': 'accept',
+              'content': {AskQuestions.confirmPlanId: value},
+            }),
+          };
+
+      // A string where the form offered true or false: refused, but the form
+      // is still waiting, so the user corrects it instead of starting over.
+      await expectLater(
+        ask({'questions': questions},
+            stateless: true,
+            canElicit: true,
+            state: state,
+            requestState: token,
+            inputResponses: answered('yes')),
+        throwsA(isA<AskUserError>()
+            .having((error) => error.field, 'field',
+                'answers.${AskQuestions.confirmPlanId}')
+            .having((error) => error.message, 'message',
+                contains('must be true or false'))),
+      );
+      expect(state.pending, 1, reason: 'a refusal must not spend the token');
+
+      final retry = await ask(
+        {'questions': questions},
+        stateless: true,
+        canElicit: true,
+        state: state,
+        requestState: token,
+        inputResponses: answered(true),
+      );
+      expect(payloadOf(retry), {
+        'status': 'answered',
+        'answers': {AskQuestions.confirmPlanId: true},
+        'defaulted': <String>[],
+      });
+      expect(state.pending, 0, reason: 'the accepted answer spent it');
+    });
+
+    test('an unreadable form answer leaves the form answerable', () async {
+      final state = AskStateStore();
+      final questions = [AskQuestions.confirmPlan.toJson()];
+      final first = await ask(
+        {'questions': questions},
+        stateless: true,
+        canElicit: true,
+        state: state,
+      );
+      final token = first.toJson()['requestState'] as String;
+
+      await expectLater(
+        ask({'questions': questions},
+            stateless: true,
+            canElicit: true,
+            state: state,
+            requestState: token,
+            inputResponses: {
+              askUserInputKey:
+                  const InputResponse.raw({'action': 'shrug'}),
+            }),
+        throwsA(isA<AskUserError>().having(
+            (e) => e.message, 'message', contains('is not a form answer'))),
+      );
+      expect(state.pending, 1, reason: 'a refusal must not spend the token');
+
+      final retry = await ask(
+        {'questions': questions},
+        stateless: true,
+        canElicit: true,
+        state: state,
+        requestState: token,
+        inputResponses: {
+          askUserInputKey: InputResponse.fromJson({
+            'action': 'accept',
+            'content': {AskQuestions.confirmPlanId: true},
+          }),
+        },
+      );
+      expect(payloadOf(retry)['status'], 'answered');
+      expect(state.pending, 0);
     });
 
     test('a legacy client that can elicit is asked inside the call', () async {
@@ -1002,6 +1104,24 @@ void main() {
         throwsA(isA<AskUserError>()
             .having((e) => e.message, 'message', contains('is missing'))),
       );
+      expect(state.pending, 1, reason: 'the wrong key must not spend the token');
+
+      // The same token still answers once the key is the one that was asked.
+      final retry = await ask(
+        {'questions': questions},
+        stateless: true,
+        canElicit: true,
+        state: state,
+        requestState: token,
+        inputResponses: {
+          askUserInputKey: InputResponse.fromJson({
+            'action': 'accept',
+            'content': {AskQuestions.confirmPlanId: true},
+          }),
+        },
+      );
+      expect(payloadOf(retry)['status'], 'answered');
+      expect(state.pending, 0);
     });
 
     test('answers that are not an object are refused', () async {
