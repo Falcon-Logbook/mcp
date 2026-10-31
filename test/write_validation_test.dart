@@ -422,6 +422,223 @@ void main() {
         reason: 'the refused update must not land');
   });
 
+  // Issue #61: an explicit aircraft_id or crew_member_id is authoritative. A
+  // name or registration sent beside it must name the same row; a different
+  // row is refused, never silently replaced, because that is the only way a
+  // caller can resolve a tie the warnings ask it to resolve.
+  group('an explicit id wins over a name', () {
+    /// A second tail with the same registration under another country code, the
+    /// shape that makes a registration ambiguous, and a second crew member so a
+    /// name can disagree with an id.
+    void seedTwinTail() => withFixtureDb(dbPath, (db) {
+          db.execute(
+            "INSERT INTO aircraft (id, type, country_code, registration, "
+            "multi_engine, ifr, created_at) "
+            "VALUES ('ac-2', 'B738', 'ZK', 'XZO', 1, 1, 1700000000)",
+          );
+          db.execute(
+            "INSERT INTO crew_members (id, name, first_name, last_name, "
+            "created_at) VALUES ('cr-2', 'Alex Roe', 'Alex', 'Roe', 1700000000)",
+          );
+        });
+
+    test('a matching registration beside the id succeeds', () async {
+      seedTwinTail();
+      final server = await start();
+      final before = flightCount();
+
+      final created = await server.call('create_flight', {
+        'date': '2026-10-28',
+        'total_time': 60,
+        'aircraft_id': 'ac-1',
+        'aircraft_registration': 'VH-XZO',
+        'crew_member_id': 'cr-1',
+        'crew_members_name': 'Jane Doe',
+      });
+      expect(created.isError, isFalse, reason: '${created.payload}');
+      expect(flightCount(), before + 1);
+
+      final id = payloadOf(created)['id'] as String;
+      final row = flightRow(id);
+      expect(row['aircraft_id'], 'ac-1');
+      expect(row['aircraft_registration'], 'VH-XZO');
+      expect(row['crew_member_id'], 'cr-1');
+      expect(row['crew_members_name'], 'Jane Doe');
+      expect(payloadOf(created)['warnings'], isNull);
+    });
+
+    test('an id resolves the tie the warnings ask the caller to resolve',
+        () async {
+      seedTwinTail();
+      final server = await start();
+
+      final bare = await server.call('create_flight', {
+        'date': '2026-10-28',
+        'total_time': 60,
+        'aircraft_registration': 'XZO',
+      });
+      expect(bare.isError, isFalse, reason: '${bare.payload}');
+      expect('${payloadOf(bare)['warnings']}', contains('Pass aircraft_id'));
+      expect(flightRow(payloadOf(bare)['id'] as String)['aircraft_id'], isNull);
+
+      // The id the warning asks for is the one that now wins, and the tail it
+      // names is the one the row displays.
+      final chosen = await server.call('create_flight', {
+        'date': '2026-10-28',
+        'total_time': 60,
+        'aircraft_id': 'ac-2',
+        'aircraft_registration': 'XZO',
+      });
+      expect(chosen.isError, isFalse, reason: '${chosen.payload}');
+      final row = flightRow(payloadOf(chosen)['id'] as String);
+      expect(row['aircraft_id'], 'ac-2');
+      expect(row['aircraft_registration'], 'ZK-XZO');
+      expect(payloadOf(chosen)['warnings'], isNull);
+    });
+
+    test('a conflicting name is refused and nothing is written', () async {
+      seedTwinTail();
+      final server = await start();
+      final before = flightCount();
+
+      // "VH-XZO" resolves to ac-1; the id names ac-2.
+      for (final dryRun in [false, true]) {
+        final result = await server.call('create_flight', {
+          'date': '2026-10-28',
+          'total_time': 60,
+          'aircraft_id': 'ac-2',
+          'aircraft_registration': 'VH-XZO',
+          if (dryRun) 'dry_run': true,
+        });
+        expect(result.isError, isTrue,
+            reason: 'a disagreement must be refused, dry run included');
+        final envelope = jsonDecode('${result.payload}') as Map;
+        expect(envelope['error'], 'conflict');
+        expect(envelope['field'], 'aircraft_id');
+        expect('${envelope['detail']}', contains('aircraft_registration'));
+        expect('${envelope['detail']}', contains('VH-XZO'));
+        expect('${envelope['detail']}', contains('ac-1'));
+        expect('${envelope['detail']}', contains('ac-2'));
+        expect(envelope['candidates'], isNotEmpty);
+        expect(flightCount(), before,
+            reason: 'a refused write must not insert');
+      }
+
+      // The same rule on an update: the row is untouched.
+      final updated = await server.call('update_flight', {
+        'id': 'fl-1',
+        'aircraft_id': 'ac-2',
+        'aircraft_registration': 'VH-XZO',
+      });
+      expect(updated.isError, isTrue);
+      expect(flightRow('fl-1')['aircraft_id'], 'ac-1');
+      expect(flightRow('fl-1')['aircraft_registration'], 'VH-XZO');
+    });
+
+    test('a crew name that disagrees with the id is refused', () async {
+      seedTwinTail();
+      final server = await start();
+      final before = flightCount();
+
+      final conflict = await server.call('create_flight', {
+        'date': '2026-10-28',
+        'total_time': 60,
+        'crew_member_id': 'cr-1',
+        'crew_members_name': 'Alex Roe',
+      });
+      expect(conflict.isError, isTrue);
+      final envelope = jsonDecode('${conflict.payload}') as Map;
+      expect(envelope['error'], 'conflict');
+      expect(envelope['field'], 'crew_member_id');
+      expect('${envelope['detail']}', contains('crew_members_name'));
+      expect('${envelope['detail']}', contains('Alex Roe'));
+      expect('${envelope['detail']}', contains('cr-1'));
+      expect('${envelope['detail']}', contains('cr-2'));
+      expect(flightCount(), before);
+    });
+
+    test('a name alone still resolves and an id alone still links', () async {
+      seedTwinTail();
+      final server = await start();
+
+      final byName = await server.call('create_flight', {
+        'date': '2026-10-29',
+        'total_time': 60,
+        'aircraft_registration': 'ZK-XZO',
+        'crew_members_name': 'Alex Roe',
+      });
+      expect(byName.isError, isFalse, reason: '${byName.payload}');
+      final named = flightRow(payloadOf(byName)['id'] as String);
+      expect(named['aircraft_id'], 'ac-2');
+      expect(named['crew_member_id'], 'cr-2');
+
+      final byId = await server.call('create_flight', {
+        'date': '2026-10-29',
+        'total_time': 60,
+        'aircraft_id': 'ac-2',
+        'crew_member_id': 'cr-2',
+      });
+      expect(byId.isError, isFalse, reason: '${byId.payload}');
+      final linked = flightRow(payloadOf(byId)['id'] as String);
+      expect(linked['aircraft_id'], 'ac-2');
+      expect(linked['aircraft_registration'], isNull);
+      expect(linked['crew_member_id'], 'cr-2');
+      expect(linked['crew_members_name'], isNull);
+    });
+
+    test('a roster row with a conflicting id is an error and writes nothing',
+        () async {
+      seedTwinTail();
+      final server = await start();
+      final before = flightCount();
+
+      final rows = [
+        {
+          'date': '2026-10-30',
+          'route': 'YSSY - NZQN',
+          'aircraft_id': 'ac-2',
+          'aircraft_registration': 'VH-XZO',
+          'draft': true,
+        },
+        {
+          'date': '2026-10-30',
+          'route': 'YSSY - NZQN',
+          'aircraft_id': 'ac-2',
+          'aircraft_registration': 'XZO',
+          'draft': true,
+        },
+      ];
+
+      final validated = payloadOf(
+          await server.call('validate_flight_drafts', {'flights': rows}));
+      final issues = ((validated['rows'] as List).first
+          as Map<String, dynamic>)['issues'] as List;
+      expect([
+        for (final issue in issues.cast<Map<String, dynamic>>())
+          if (issue['severity'] == 'error') issue['code']
+      ], [
+        'aircraft_id_conflict'
+      ], reason: '${validated['rows']}');
+
+      final applied =
+          await server.call('apply_flight_batch', {'flights': rows});
+      expect(applied.isError, isFalse, reason: '${applied.payload}');
+      expect(payloadOf(applied)['applied'], 0);
+      expect(flightCount(), before);
+
+      final partial = await server.call('apply_flight_batch', {
+        'flights': rows,
+        'dry_run': false,
+        'allow_partial': true,
+      });
+      expect(partial.isError, isFalse, reason: '${partial.payload}');
+      expect(payloadOf(partial)['applied'], 1,
+          reason: 'the row whose id and registration agree is written');
+      expect(payloadOf(partial)['failed'], hasLength(1));
+      expect(flightCount(), before + 1);
+    });
+  });
+
   test('update_flight_settings no longer takes an id', () async {
     final server = await start();
 

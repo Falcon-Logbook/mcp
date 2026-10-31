@@ -58,18 +58,26 @@ const _flightColumns = <_Column>[
       min: 0, note: 'Order within the day; 0 is first.'),
   _Column('aircraft_id', _Kind.text,
       note:
-          'Aircraft row id. Derived automatically from aircraft_registration when it matches.'),
+          'Aircraft row id. Authoritative: derived from aircraft_registration '
+          'when that is the only one sent, kept as sent when both are, and a '
+          'registration naming a different aircraft is refused as a conflict.'),
   _Column('aircraft_registration', _Kind.text,
       note:
-          'Registration as displayed, e.g. VH-XZO. Matched against the aircraft table to set aircraft_id.'),
+          'Registration as displayed, e.g. VH-XZO. Matched against the aircraft '
+          'table to set aircraft_id; with aircraft_id it only has to name the '
+          'same aircraft.'),
   _Column('flight_type', _Kind.text, note: "'route' or 'details'."),
   _Column('crew_role', _Kind.text,
       note: "'pilotInCommand', 'copilot' or 'student'."),
   _Column('crew_member_id', _Kind.text,
       note:
-          'Crew row id. Derived automatically from crew_members_name when it matches.'),
+          'Crew row id. Authoritative: derived from crew_members_name when that '
+          'is the only one sent, kept as sent when both are, and a name that '
+          'matches a different crew member is refused as a conflict.'),
   _Column('crew_members_name', _Kind.text,
-      note: 'Other crew member display name.'),
+      note:
+          'Other crew member display name. With crew_member_id it only has to '
+          'name the same person.'),
   _Column('route', _Kind.text, note: 'Route text, e.g. "YSSY - NZQN".'),
   _Column('flight_number', _Kind.text),
   // 0 is refused by the write path, so the schema says 1: a caller that plans
@@ -1186,6 +1194,11 @@ List<T> _activeOr<T>(List<T> rows, bool Function(T row) archived) {
   return active.isEmpty ? rows : active;
 }
 
+/// Whether [table] holds [id]. An id a caller sent is checked before use, so a
+/// bad one is refused the same way whether or not a name came with it.
+bool _rowExists(FalconDb db, String table, String id) =>
+    db.query('SELECT id FROM $table WHERE id = ?', [id]).isNotEmpty;
+
 /// The aircraft a write should link to, or the rows that tie when the
 /// registration names more than one.
 ///
@@ -1357,61 +1370,133 @@ const Set<String> _splitFields = {'total_time', 'day_time', 'night_time'};
         field: 'total_time');
   }
 
+  // An explicit id wins. The registration or name sent next to it is how the
+  // row displays, so it has to name that same row: when the two disagree, the
+  // write is refused rather than the id being replaced by whatever the name
+  // happens to match. A tie with the explicit id among its candidates is how a
+  // caller resolves the ambiguity the warnings ask about.
+  final suppliedAircraftId =
+      fields.containsKey('aircraft_id') ? asText(fields['aircraft_id']) : null;
+  if (suppliedAircraftId != null &&
+      !_rowExists(db, 'aircraft', suppliedAircraftId)) {
+    throw _ToolError('Aircraft not found: $suppliedAircraftId',
+        code: 'not_found', field: 'aircraft_id');
+  }
   if (fields.containsKey('aircraft_registration')) {
     final text = asText(fields['aircraft_registration']);
     if (text == null) {
       values['aircraft_registration'] = null;
-      values['aircraft_id'] = null;
+      values['aircraft_id'] = suppliedAircraftId;
     } else {
       final match = _matchAircraft(db, text);
-      values['aircraft_registration'] = match.display ?? text;
-      values['aircraft_id'] = match.id;
-      if (match.candidates.length > 1) {
-        warnings.add(
-            '${match.candidates.length} aircraft match "$text", so the flight '
-            'is not linked: ${_candidatesText(match.candidates)}. Pass '
-            'aircraft_id to choose one.');
-      } else if (match.id == null) {
-        warnings.add(
-            'No aircraft matched "$text"; the flight is not linked to an aircraft.');
+      if (suppliedAircraftId == null) {
+        values['aircraft_registration'] = match.display ?? text;
+        values['aircraft_id'] = match.id;
+        if (match.candidates.length > 1) {
+          warnings.add(
+              '${match.candidates.length} aircraft match "$text", so the flight '
+              'is not linked: ${_candidatesText(match.candidates)}. Pass '
+              'aircraft_id to choose one.');
+        } else if (match.id == null) {
+          warnings.add(
+              'No aircraft matched "$text"; the flight is not linked to an aircraft.');
+        }
+      } else {
+        final matched = match.candidates.isNotEmpty
+            ? match.candidates
+            : [
+                {'id': match.id, 'registration': match.display},
+              ];
+        final chosen = [
+          for (final row in matched)
+            if (row['id'] == suppliedAircraftId) row,
+        ];
+        final agrees = match.id == suppliedAircraftId || chosen.isNotEmpty;
+        if (!agrees && (match.id != null || match.candidates.isNotEmpty)) {
+          throw _ToolError(
+            'aircraft_registration "$text" and aircraft_id '
+            '"$suppliedAircraftId" name different aircraft: the registration '
+            'resolves to ${_candidatesText(matched)}, not to aircraft '
+            '"$suppliedAircraftId". Send the registration of the aircraft the '
+            'id names, or drop one of the two fields. Nothing was written.',
+            code: 'conflict',
+            field: 'aircraft_id',
+            tool: tool,
+            data: {
+              'aircraft_id': suppliedAircraftId,
+              'aircraft_registration': text,
+              'candidates': matched,
+            },
+          );
+        }
+        values['aircraft_id'] = suppliedAircraftId;
+        values['aircraft_registration'] = chosen.isEmpty
+            ? (match.display ?? text)
+            : (asText(chosen.single['registration']) ?? text);
       }
     }
   } else if (fields.containsKey('aircraft_id')) {
-    final aircraftId = asText(fields['aircraft_id']);
-    if (aircraftId != null &&
-        db.query(
-            'SELECT id FROM aircraft WHERE id = ?', [aircraftId]).isEmpty) {
-      throw _ToolError('Aircraft not found: $aircraftId',
-          code: 'not_found', field: 'aircraft_id');
-    }
-    values['aircraft_id'] = aircraftId;
+    values['aircraft_id'] = suppliedAircraftId;
   }
 
+  final suppliedCrewId = fields.containsKey('crew_member_id')
+      ? asText(fields['crew_member_id'])
+      : null;
+  if (suppliedCrewId != null &&
+      !_rowExists(db, 'crew_members', suppliedCrewId)) {
+    throw _ToolError('Crew member not found: $suppliedCrewId',
+        code: 'not_found', field: 'crew_member_id');
+  }
   if (fields.containsKey('crew_members_name')) {
     final name = asText(fields['crew_members_name']);
     if (name == null) {
       values['crew_members_name'] = null;
-      values['crew_member_id'] = null;
+      values['crew_member_id'] = suppliedCrewId;
     } else {
       final match = _matchCrewMemberId(db, name);
-      values['crew_members_name'] = name;
-      values['crew_member_id'] = match.id;
-      if (match.candidates.length > 1) {
-        warnings.add(
-            '${match.candidates.length} crew members match "$name", so the '
-            'flight is not linked: ${_candidatesText(match.candidates)}. Pass '
-            'crew_member_id to choose one.');
+      if (suppliedCrewId == null) {
+        values['crew_members_name'] = name;
+        values['crew_member_id'] = match.id;
+        if (match.candidates.length > 1) {
+          warnings.add(
+              '${match.candidates.length} crew members match "$name", so the '
+              'flight is not linked: ${_candidatesText(match.candidates)}. Pass '
+              'crew_member_id to choose one.');
+        }
+      } else {
+        final agrees = match.id == suppliedCrewId ||
+            match.candidates.any((row) => row['id'] == suppliedCrewId);
+        if (!agrees && (match.id != null || match.candidates.isNotEmpty)) {
+          final matched = match.candidates.isNotEmpty
+              ? match.candidates
+              : [
+                  for (final row in db.query(
+                      'SELECT id, name FROM crew_members WHERE id = ?',
+                      [match.id]))
+                    {'id': row['id'], 'name': row['name']},
+                ];
+          throw _ToolError(
+            'crew_members_name "$name" and crew_member_id "$suppliedCrewId" '
+            'name different crew members: the name resolves to '
+            '${_candidatesText(matched)}, not to crew member '
+            '"$suppliedCrewId". Send the name of the crew member the id names, '
+            'or drop one of the two fields. Nothing was written.',
+            code: 'conflict',
+            field: 'crew_member_id',
+            tool: tool,
+            data: {
+              'crew_member_id': suppliedCrewId,
+              'crew_members_name': name,
+              'candidates': matched,
+            },
+          );
+        }
+        values['crew_members_name'] = name;
+        values['crew_member_id'] = suppliedCrewId;
       }
     }
   } else if (fields.containsKey('crew_member_id')) {
-    final crewId = asText(fields['crew_member_id']);
-    if (crewId != null &&
-        db.query(
-            'SELECT id FROM crew_members WHERE id = ?', [crewId]).isEmpty) {
-      throw _ToolError('Crew member not found: $crewId',
-          code: 'not_found', field: 'crew_member_id');
-    }
-    values['crew_member_id'] = crewId;
+    values['crew_member_id'] = suppliedCrewId;
   }
 
   for (final entry in <String, Set<String>>{
@@ -1656,14 +1741,22 @@ List<dynamic> _rosterFlightRows(Map<String, dynamic> args) {
 /// The stable issue code for a refusal `_flightValues` raised on one row.
 /// Every class a roster can hit has a code an agent can branch on; anything
 /// else is one bad value.
-String _rosterIssueCode(_ToolError error) => switch (error.field) {
-      'crew_role' => 'invalid_crew_role',
-      'flight_type' => 'invalid_flight_type',
-      'calc_time_mode' => 'invalid_calc_time_mode',
-      'aircraft_id' => 'aircraft_not_found',
-      'crew_member_id' => 'crew_not_found',
-      _ => error.code == 'unknown_field' ? 'unknown_field' : 'invalid_row',
+String _rosterIssueCode(_ToolError error) {
+  if (error.code == 'conflict') {
+    return switch (error.field) {
+      'crew_member_id' => 'crew_id_conflict',
+      _ => 'aircraft_id_conflict',
     };
+  }
+  return switch (error.field) {
+    'crew_role' => 'invalid_crew_role',
+    'flight_type' => 'invalid_flight_type',
+    'calc_time_mode' => 'invalid_calc_time_mode',
+    'aircraft_id' => 'aircraft_not_found',
+    'crew_member_id' => 'crew_not_found',
+    _ => error.code == 'unknown_field' ? 'unknown_field' : 'invalid_row',
+  };
+}
 
 /// The active tails of [type], for the row that names a type but no
 /// registration. Empty when the fleet has no such type, which is still said.
@@ -2466,7 +2559,18 @@ List<_RosterRow> _rosterRows(
           !RegExp(r'^\d+ crew members match ').hasMatch(warning) &&
           !warning.startsWith('route "')));
     } on _ToolError catch (error) {
-      row.add(_rosterIssueCode(error), error.detail, field: error.field);
+      final candidates = error.data?['candidates'];
+      row.add(
+        _rosterIssueCode(error),
+        error.detail,
+        field: error.field,
+        candidates: candidates is List
+            ? [
+                for (final candidate in candidates)
+                  candidate as Map<String, dynamic>
+              ]
+            : const [],
+      );
       continue;
     }
 
@@ -2550,8 +2654,11 @@ List<_RosterRow> _rosterRows(
       row.add('split_mismatch', error.detail);
     }
 
+    // A row carries a registration and, possibly, the aircraft it links to. An
+    // explicit aircraft_id already answered the question these warnings ask,
+    // so the row is only questioned about a name that has no id beside it.
     final registration = asText(values['aircraft_registration']);
-    if (registration != null) {
+    if (registration != null && asText(values['aircraft_id']) == null) {
       final matches = _aircraftCandidates(db, registration);
       if (matches.isEmpty) {
         row.add(
@@ -2575,7 +2682,7 @@ List<_RosterRow> _rosterRows(
           ],
         );
       }
-    } else if (aircraftType != null) {
+    } else if (registration == null && aircraftType != null) {
       final tails = _aircraftOfType(db, aircraftType);
       row.add(
         'aircraft_missing',
@@ -2593,7 +2700,7 @@ List<_RosterRow> _rosterRows(
     }
 
     final crewName = asText(values['crew_members_name']);
-    if (crewName != null) {
+    if (crewName != null && asText(values['crew_member_id']) == null) {
       final matches = _crewCandidates(db, crewName);
       if (matches.isEmpty) {
         row.add(
@@ -4977,7 +5084,10 @@ Future<void> runServer(String dbPath, {bool readonly = true}) async {
           'Create a flight. Times are minutes; total_time_hours, day_time_hours '
           'and night_time_hours are accepted instead. Sets aircraft_id and '
           'crew_member_id automatically when the registration or crew name '
-          'matches, and names the candidates when a match is ambiguous. '
+          'matches, and names the candidates when a match is ambiguous. An id '
+          'you pass is authoritative: with a registration or name beside it, it '
+          'must name the same row, and a conflict error names both fields and '
+          'both candidates otherwise. '
           'day_order is computed for the date. Returns the row as written as '
           'flight, with draft telling you whether it counts as a draft, and '
           'warnings for anything odd but legal.',
@@ -6450,7 +6560,7 @@ Future<void> runServer(String dbPath, {bool readonly = true}) async {
                 '- Reads return local rows only (owner_id NULL or "local") unless include_shared is true. Paged reads return count (rows on this page), total (all matching rows), has_more and offset, and default to 20 rows with a maximum of 200; the list reads state in their own limit description how many they return and report total and has_more. A listed flight is a summary, unless full: true.\n'
                 '- flights.route is free text. It is a route pair only when it is exactly "AAA - BBB": two segments split on " - ", each 3 or 4 characters and equal in length, the same rule the app applies. Anything else is a description and has no direction, so departure_icao and arrival_icao are null and the route filters cannot match it. The two codes are derived, not stored: full rows and get_flight carry them, the twelve-field summary does not. Write tools warn when a route will be stored as a description.\n'
                 '- aircraft.registration is the BARE registration (e.g. country_code=VH, registration=XZO). The app displays country_code + "-" + registration.\n'
-                '- flights.aircraft_registration is the display registration (e.g. VH-XZO). Write tools accept either form and set aircraft_id from the matching aircraft row; flights.crew_members_name is matched the same way to set crew_member_id. When more than one active row matches a name or registration, the link is left unset and the warning lists the candidates, so pass aircraft_id or crew_member_id to choose.\n'
+                '- flights.aircraft_registration is the display registration (e.g. VH-XZO). Write tools accept either form and set aircraft_id from the matching aircraft row; flights.crew_members_name is matched the same way to set crew_member_id. When more than one active row matches a name or registration, the link is left unset and the warning lists the candidates, so pass aircraft_id or crew_member_id to choose. An id passed with a name or registration is authoritative: the name must resolve to that same row (or have the id among its candidates), and a name that resolves elsewhere is refused with code conflict naming both fields and both candidates, before anything is written.\n'
                 '- Read filters on flights match without case: aircraft_registration takes bare (XZO) or display (VH-XZO), flight_type takes route or details, and a crew_members_name filter also matches flights linked to that crew row. departure_icao and arrival_icao match one direction only and never a description. Airport search ranks an exact code first, then a prefix, then name or city, and ties break on ICAO.\n'
                 '- flight_type values: route, details. crew_role values: pilotInCommand, copilot, student.\n'
                 '- find_missing_times lists every row the app cannot show complete, with a reason per row: draft (no total), missing_split (both sides null), half_split (one side null), split_mismatch (the sides do not add up), or simulator_no_duration. Simulator sessions are excluded unless include_simulator is true, because the app expects them to carry a total and no split.\n'
@@ -6470,6 +6580,7 @@ Future<void> runServer(String dbPath, {bool readonly = true}) async {
                 '- data_quality_report is one read-only call over every defect class an imported logbook can have: drafts, missing or mismatched splits, absurd totals, unlinked aircraft and crew, duplicate crew and flights, unparsable routes, future dates, dangling route links, simulator oddities, orphaned registration text. Each class carries a stable id, a count and a sample of up to 4 rows; a count is the finding, not the full list.\n'
                 '- The repair tools merge_crew, link_flights_to_aircraft and link_flights_to_crew default to dry_run: true and say so on the response; pass dry_run: false to apply the same diff. They run in one transaction, stamp updated_at, tombstone deletions so sync propagates them, never create rows beyond the operation named, and never delete flights: duplicate flights are reported for a human to decide.\n'
                 '- Planned times (scheduled_departure_utc, scheduled_arrival_utc, scheduled_block_minutes) come with Falcon-Logbook/app#231 and schema 20. The two instants are unix epoch seconds UTC and render as ISO-8601 with an explicit offset; the block is integer minutes. They exist only on a migrated database, so a write naming them on an older file is refused by name rather than silently dropped. A leg with planned times stays a draft: total_time empty, the block kept as the plan.\n'
+                '- An explicit id is authoritative. When create_flight, update_flight or a roster row sends aircraft_id or crew_member_id beside aircraft_registration or crew_members_name, the name must name the same row or have the id among its candidates: a name that resolves elsewhere is refused with code conflict (aircraft_id_conflict or crew_id_conflict on a roster) naming both fields and the candidates, never silently resolved to one of them.\n'
                 '- validate_flight_drafts and apply_flight_batch take a roster as flights, an array of objects using create_flight field names, up to 500 rows. Each row also accepts client_ref (an identity for retries) and aircraft_type (a hint, never stored). validate writes nothing and answers per row with ok, issues of {field, code, message, severity} and warnings; severity error is a row apply refuses. apply is atomic by default (one bad row writes nothing, applied: 0), allows partial with allow_partial: true, skips a duplicate or an already imported client_ref instead of overwriting, records one audit entry per batch with batch_id and the created ids, and previews with dry_run: true (its default). A roster leg is written as a draft through the same row builder as create_flight, so updated_at and sync behave the same.\n'
                 '- A failed call returns {error, field, detail}: error is a stable code (unknown_field, invalid_value, not_found, conflict, constraint, busy, internal), field is the argument at fault, and unknown_field also names the tool. detail is one sentence, and the accepted list is capped at eight names plus a count. A conflict adds current, the row as it stands now.',
           ),
@@ -6513,7 +6624,7 @@ Future<void> runServer(String dbPath, {bool readonly = true}) async {
                 'REPORT EVERY ROW THAT DID NOT MAKE IT\n'
                 'Silent partial success is the failure this flow exists to prevent. At the end, list every row that was skipped or failed, with its index, its client_ref if it had one, and the reason. Say how many landed, and name the batch_id.\n\n'
                 'TOOLS AND CODES\n'
-                'validate_flight_drafts writes nothing: flights (up to 500, create_flight field names), date_from, date_to, plus mode (roster by default; import checks a logbook file instead, see falcon://import) and units (the file\'s duration convention, used only in import mode). Every row answers ok, issues of {field, code, message, severity} and warnings; severity error means apply_flight_batch would refuse the row, warning means ask about it, info is stored as text. Codes: unknown_field, invalid_row, invalid_crew_role, invalid_flight_type, invalid_calc_time_mode, aircraft_not_found, crew_not_found, date_missing, date_out_of_range, date_order, aircraft_unmatched, aircraft_ambiguous, aircraft_missing, crew_unmatched, crew_ambiguous, route_unparsable, airport_unresolved, split_mismatch, duplicate_existing, duplicate_batch, scheduled_total_time, planned_times_unsupported.\n'
+                'validate_flight_drafts writes nothing: flights (up to 500, create_flight field names), date_from, date_to, plus mode (roster by default; import checks a logbook file instead, see falcon://import) and units (the file\'s duration convention, used only in import mode). Every row answers ok, issues of {field, code, message, severity} and warnings; severity error means apply_flight_batch would refuse the row, warning means ask about it, info is stored as text. Codes: unknown_field, invalid_row, invalid_crew_role, invalid_flight_type, invalid_calc_time_mode, aircraft_not_found, crew_not_found, aircraft_id_conflict, crew_id_conflict, date_missing, date_out_of_range, date_order, aircraft_unmatched, aircraft_ambiguous, aircraft_missing, crew_unmatched, crew_ambiguous, route_unparsable, airport_unresolved, split_mismatch, duplicate_existing, duplicate_batch, scheduled_total_time, planned_times_unsupported.\n'
                 'apply_flight_batch (write mode only) takes the same flights plus dry_run (default true: a preview with the same plan), allow_partial (default false: atomic) and batch_id. Per row it accepts client_ref, which makes a retry idempotent, and aircraft_type, a hint that is never stored. It returns batch_id, dry_run, applied, created ids, skipped and failed, each entry {index, reason}. A duplicate in the logbook or the batch is skipped, never overwritten.\n',
           ),
         ],
