@@ -117,7 +117,10 @@ mapped rows and writes them.
   nothing anywhere: no cloud, no account, no telemetry, and it never talks to a sync server.
 - **Works with the app open or closed.**
 - **Every write is logged** to an audit file next to your database, named after it
-  (`<database-name>.mcp_audit.jsonl`), so you can see what changed and when.
+  (`<database-name>.mcp_audit.jsonl`), so you can see what changed and when. A batch records
+  its row count, a fingerprint and a short sample rather than all 500 rows, and the `client_ref`s
+  it created also go to a small `.refs` index beside the log, so a retry check never has to parse
+  the log.
 - **Writes are checked before they land.** Flight times are capped at 525600 minutes (8760 hours)
   and counts at 10000, the same limits the app enforces; block times must be a real 24-hour clock
   time; day and night must add up to the total; and a zero total is refused, because the app would
