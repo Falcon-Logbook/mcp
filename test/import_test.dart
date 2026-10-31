@@ -1,7 +1,13 @@
+import 'dart:convert';
 import 'dart:io';
 
 import 'package:falcon_mcp/falcon_mcp.dart'
-    show auditPathFor, dateToEpoch, formatCalendarDate, readAudit;
+    show
+        auditPathFor,
+        clientRefIndexPathFor,
+        dateToEpoch,
+        formatCalendarDate,
+        readAudit;
 import 'package:test/test.dart';
 
 import 'support/harness.dart';
@@ -607,7 +613,8 @@ void main() {
 
       // The batch audit entry: read back through readAudit from the file
       // auditPathFor names, one entry per call rather than per row, carrying
-      // the batch id and the ids it created.
+      // the batch id and the ids it created. The rows are summarised rather
+      // than stored, so 500 rows do not become a 500-row JSON line.
       expect(File(auditPathFor(dbPath)).existsSync(), isTrue);
       final entries = [
         for (final entry in readAudit(dbPath))
@@ -617,9 +624,135 @@ void main() {
           reason: 'one entry per batch, not one per row');
       final entry = entries.single;
       expect(entry['result'], 'ok');
-      expect((entry['args'] as Map)['batch_id'], 'batch-500');
-      expect(entry['ids'], result['created']);
-      expect((entry['created_refs'] as List), hasLength(500));
+      final args = entry['args'] as Map;
+      expect(args['batch_id'], 'batch-500');
+      final flights = args['flights'] as Map;
+      expect(flights['count'], 500);
+      expect((flights['sample'] as List), hasLength(3),
+          reason: 'a short sample shows what the batch was made of');
+      expect(flights['fingerprint'], matches(RegExp(r'^[0-9a-f]{16}$')));
+      expect(entry['ids'], (result['created'] as List).take(20).toList());
+      expect(entry['ids_count'], 500);
+      expect((entry['created_refs'] as List), hasLength(500),
+          reason: 'the refs are the retry identity, so they stay whole');
+      final line = File(auditPathFor(dbPath))
+          .readAsLinesSync()
+          .firstWhere((line) => line.contains('apply_flight_batch'));
+      expect(line.length, lessThan(16 * 1024),
+          reason: 'a 500-row batch must not write a hundreds-of-kilobytes '
+              'line: ${line.length} bytes');
+    });
+
+    test('a retry after a restart still sees the refs it created', () async {
+      final rows = [
+        for (var i = 0; i < 40; i++)
+          {
+            'client_ref': 'restart-${i + 1}',
+            'date': formatCalendarDate(DateTime(2025, 3, 1 + i)),
+            'route': 'YSSY - NZQN',
+            'aircraft_registration': 'VH-XZO',
+            'total_time': 90,
+          },
+      ];
+
+      final first = await start(write: true);
+      final applied = payloadOf(await first.call('apply_flight_batch', {
+        'dry_run': false,
+        'mode': 'import',
+        'flights': rows,
+      }));
+      expect(applied['applied'], 40);
+      await first.stop();
+      expect(File(clientRefIndexPathFor(dbPath)).existsSync(), isTrue,
+          reason: 'the refs are indexed beside the log');
+      final count = flightCount();
+
+      // A new process, the same roster: every row is a ref an earlier batch
+      // already created, so nothing is written twice.
+      final second = await start(write: true);
+      final retried = payloadOf(await second.call('apply_flight_batch', {
+        'dry_run': false,
+        'mode': 'import',
+        'flights': rows,
+      }));
+      expect(retried['applied'], 0);
+      expect((retried['created_refs'] as List), isEmpty);
+      expect((retried['skipped'] as List), hasLength(40));
+      expect({
+        for (final skip
+            in (retried['skipped'] as List).cast<Map<String, dynamic>>())
+          skip['code']
+      }, {
+        'client_ref_seen'
+      });
+      expect(flightCount(), count, reason: 'a retry writes no second row');
+    });
+
+    test('a small call is recorded in full', () async {
+      final server = await start(write: true);
+      await server.call('apply_flight_batch', {
+        'dry_run': false,
+        'mode': 'import',
+        'flights': [
+          {
+            'client_ref': 'small-1',
+            'date': '2025-05-01',
+            'route': 'YSSY - NZQN',
+            'aircraft_registration': 'VH-XZO',
+            'total_time': 90,
+          },
+        ],
+      });
+
+      final entry = readAudit(dbPath)
+          .firstWhere((entry) => entry['tool'] == 'apply_flight_batch');
+      final flights = (entry['args'] as Map)['flights'] as List;
+      expect(flights, hasLength(1));
+      expect((flights.single as Map)['client_ref'], 'small-1',
+          reason: 'short of the cap, the argument is the argument');
+    });
+
+    test('an audit log written before the index still answers a retry',
+        () async {
+      // The shape an older build wrote: the whole roster in args, and the refs
+      // it created beside it.
+      final legacy = jsonEncode({
+        'ts': '2026-01-01T00:00:00.000Z',
+        'tool': 'apply_flight_batch',
+        'args': {
+          'batch_id': 'legacy-1',
+          'dry_run': false,
+          'flights': [
+            {'client_ref': 'legacy-1', 'date': '2025-01-01', 'total_time': 90},
+          ],
+        },
+        'result': 'ok',
+        'ids': ['fl-created'],
+        'created_refs': ['legacy-1'],
+      });
+      File(auditPathFor(dbPath)).writeAsStringSync('$legacy\n');
+      expect(File(clientRefIndexPathFor(dbPath)).existsSync(), isFalse);
+
+      final server = await start(write: true);
+      final result = payloadOf(await server.call('apply_flight_batch', {
+        'dry_run': false,
+        'mode': 'import',
+        'flights': [
+          {
+            'client_ref': 'legacy-1',
+            'date': '2025-01-01',
+            'route': 'YSSY - NZQN',
+            'aircraft_registration': 'VH-XZO',
+            'total_time': 90,
+          },
+        ],
+      }));
+
+      expect(result['applied'], 0);
+      expect((result['skipped'] as List).single,
+          containsPair('code', 'client_ref_seen'));
+      expect(File(clientRefIndexPathFor(dbPath)).existsSync(), isTrue,
+          reason: 'the old log is read once and folded into the index');
     });
 
     test('would_create_draft warns, and writes as a draft when confirmed',

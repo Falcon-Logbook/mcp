@@ -942,6 +942,22 @@ String _routeFilterSql(String direction) {
 // Audit log
 // ============================================================
 
+/// The longest argument list an audit entry records in full. A roster batch
+/// carries one object per row, up to `_rosterRowCap` of them, so recording
+/// `flights` verbatim made an entry hundreds of kilobytes and every later write
+/// pay to read the log back. Anything longer is recorded as [_boundedArgs]'
+/// summary: the row count, a fingerprint of the list and a short sample.
+const int _auditArgListCap = 8;
+
+/// How many entries of a summarized argument list stay in the entry, so the log
+/// still shows what the batch was made of.
+const int _auditArgSample = 3;
+
+/// How many created ids an audit entry keeps. The batch's own `created_refs`
+/// stay whole, because those are the retry identity; the ids are a record, and
+/// the count plus a sample keeps 500 rows from filling the log.
+const int _auditIdCap = 20;
+
 class _Auditor {
   _Auditor(this.dbPath);
 
@@ -959,17 +975,67 @@ class _Auditor {
     List<String>? ids,
     List<String>? refs,
   }) {
+    final outcome = result ?? (error == null ? 'ok' : 'error');
+    // The retry index is written before the log entry: the log is a record that
+    // is allowed to lose a line, but a lost ref would let a retry write a
+    // duplicate row. Only an applied batch creates refs; a dry run creates none.
+    if (outcome == 'ok' && refs != null) appendClientRefs(dbPath, refs: refs);
     return appendAudit(dbPath, {
       'ts': DateTime.now().toUtc().toIso8601String(),
       'tool': tool,
-      'args': args,
-      'result': result ?? (error == null ? 'ok' : 'error'),
+      'args': _boundedArgs(args),
+      'result': outcome,
       if (id != null) 'id': id,
-      if (ids != null) 'ids': ids,
+      if (ids != null) 'ids': ids.take(_auditIdCap).toList(),
+      if (ids != null && ids.length > _auditIdCap) 'ids_count': ids.length,
       if (refs != null) 'created_refs': refs,
       if (error != null) 'error': error,
     });
   }
+}
+
+/// [args] as the audit entry records them: unchanged when every list is small,
+/// otherwise with each long list replaced by its count, its fingerprint and a
+/// sample. A roster batch is the case this exists for; a single-row call is
+/// still recorded in full.
+Map<String, dynamic> _boundedArgs(Map<String, dynamic> args) {
+  var bounded = false;
+  final recorded = <String, dynamic>{};
+  for (final entry in args.entries) {
+    final value = entry.value;
+    if (value is List && value.length > _auditArgListCap) {
+      bounded = true;
+      recorded[entry.key] = {
+        'count': value.length,
+        'fingerprint': _fingerprint(value),
+        'sample': value.take(_auditArgSample).toList(),
+      };
+    } else {
+      recorded[entry.key] = value;
+    }
+  }
+  return bounded ? recorded : args;
+}
+
+/// A stable 16-hex-digit fingerprint of [value]: enough for the log to tell two
+/// rosters apart and to check a retry sent the same rows, without storing them.
+/// Two FNV-1a lanes, one over the JSON text and one over it reversed, so it is
+/// the same after a restart. Not a security hash and never compared to anything
+/// outside the log.
+String _fingerprint(Object? value) {
+  const offset = 0x811c9dc5;
+  const prime = 0x01000193;
+  var forward = offset;
+  var reverse = offset;
+  final bytes = utf8.encode(jsonEncode(value));
+  for (final byte in bytes) {
+    forward = ((forward ^ byte) * prime) & 0xFFFFFFFF;
+  }
+  for (final byte in bytes.reversed) {
+    reverse = ((reverse ^ byte) * prime) & 0xFFFFFFFF;
+  }
+  return forward.toRadixString(16).padLeft(8, '0') +
+      reverse.toRadixString(16).padLeft(8, '0');
 }
 
 /// A committed write whose audit entry could not be written. The change is
@@ -2930,10 +2996,18 @@ Map<String, dynamic> _rosterReport(
     };
 
 /// The `client_ref` values an earlier applied batch already created, from the
-/// audit log: the log is the record of what a batch contained, so a retry needs
-/// no extra column. Only rows that actually landed are here, so a row that
-/// failed in a partial batch can be fixed and retried under the same ref.
+/// retry index beside the log: a small file of refs, so a retry reads that
+/// rather than decoding the whole audit log on every call.
+///
+/// The index keeps every ref ever created, so retry identity has no window and
+/// a batch from a year ago still cannot be imported twice. Only rows that
+/// actually landed are in it, so a row that failed in a partial batch can be
+/// fixed and retried under the same ref. A logbook whose audit log predates the
+/// index is read once and folded into it, which also keeps the full-payload
+/// entries an older build wrote readable.
 Set<String> _importedClientRefs(String dbPath) {
+  final indexed = readClientRefs(dbPath);
+  if (indexed != null) return indexed;
   final refs = <String>{};
   for (final entry in readAudit(dbPath)) {
     if (entry['tool'] != 'apply_flight_batch') continue;
@@ -2942,6 +3016,7 @@ Set<String> _importedClientRefs(String dbPath) {
     if (created is! List) continue;
     refs.addAll(created.whereType<String>());
   }
+  if (refs.isNotEmpty) appendClientRefs(dbPath, refs: refs.toList());
   return refs;
 }
 
@@ -6768,7 +6843,7 @@ Future<void> runServer(String dbPath, {bool readonly = true}) async {
                 '- The repair tools merge_crew, link_flights_to_aircraft and link_flights_to_crew default to dry_run: true and say so on the response; pass dry_run: false to apply the same diff. They run in one transaction, stamp updated_at, tombstone deletions so sync propagates them, never create rows beyond the operation named, and never delete flights: duplicate flights are reported for a human to decide.\n'
                 '- Planned times (scheduled_departure_utc, scheduled_arrival_utc, scheduled_block_minutes) come with Falcon-Logbook/app#231 and schema 20. The two instants are unix epoch seconds UTC and render as ISO-8601 with an explicit offset; the block is integer minutes. They exist only on a migrated database, so a write naming them on an older file is refused by name rather than silently dropped. A leg with planned times stays a draft: total_time empty, the block kept as the plan.\n'
                 '- An explicit id is authoritative. When create_flight, update_flight or a roster row sends aircraft_id or crew_member_id beside aircraft_registration or crew_members_name, the name must name the same row or have the id among its candidates: a name that resolves elsewhere is refused with code conflict (aircraft_id_conflict or crew_id_conflict on a roster) naming both fields and the candidates, never silently resolved to one of them.\n'
-                '- validate_flight_drafts and apply_flight_batch take a roster as flights, an array of objects using create_flight field names, up to 500 rows. Each row also accepts client_ref (an identity for retries) and aircraft_type (a hint, never stored). validate writes nothing and answers per row with ok, issues of {field, code, message, severity} and warnings; severity error is a row apply refuses. apply is atomic by default (one bad row writes nothing, applied: 0), allows partial with allow_partial: true, skips a duplicate or an already imported client_ref instead of overwriting, records one audit entry per batch with batch_id and the created ids (and warns in the response when that entry cannot be written), and previews with dry_run: true (its default). A roster leg is written as a draft through the same row builder as create_flight, so updated_at and sync behave the same.\n'
+                '- validate_flight_drafts and apply_flight_batch take a roster as flights, an array of objects using create_flight field names, up to 500 rows. Each row also accepts client_ref (an identity for retries) and aircraft_type (a hint, never stored). validate writes nothing and answers per row with ok, issues of {field, code, message, severity} and warnings; severity error is a row apply refuses. apply is atomic by default (one bad row writes nothing, applied: 0), allows partial with allow_partial: true, skips a duplicate or an already imported client_ref instead of overwriting, records one audit entry per batch with batch_id, the row count and a sample of the rows rather than all of them (the created refs are listed in full, and a ref index beside the log answers retries without reading it; the response warns when that entry cannot be written), and previews with dry_run: true (its default). A roster leg is written as a draft through the same row builder as create_flight, so updated_at and sync behave the same.\n'
                 '- A failed call returns {error, field, detail}: error is a stable code (unknown_field, invalid_value, not_found, conflict, constraint, busy, internal), field is the argument at fault, and unknown_field also names the tool. detail is one sentence, and the accepted list is capped at eight names plus a count. A conflict adds current, the row as it stands now.',
           ),
         ],

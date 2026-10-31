@@ -393,6 +393,52 @@ String? appendAudit(String dbPath, Map<String, dynamic> entry) {
   }
 }
 
+/// The `client_ref` retry index that sits beside the audit log:
+/// `<db-name>.mcp_audit.jsonl.refs`.
+///
+/// One line per applied batch, `{ts, refs}`, so a retry check reads this small
+/// file instead of decoding the whole log. It is the retry authority: it keeps
+/// every ref ever created, in the order the batches landed.
+String clientRefIndexPathFor(String dbPath) => '${auditPathFor(dbPath)}.refs';
+
+/// Appends the `client_ref`s one applied batch created to the retry index.
+/// Never throws, like [appendAudit]: the index is a convenience over the log,
+/// not a prerequisite for a write.
+void appendClientRefs(String dbPath, {required List<String> refs}) {
+  if (refs.isEmpty) return;
+  try {
+    final file = File(clientRefIndexPathFor(dbPath));
+    final line = jsonEncode({
+      'ts': DateTime.now().toUtc().toIso8601String(),
+      'refs': refs,
+    });
+    file.writeAsStringSync('$line\n', mode: FileMode.append, flush: true);
+  } catch (_) {
+    // Best effort only.
+  }
+}
+
+/// Every `client_ref` the retry index holds, or null when there is no index
+/// yet (a logbook whose audit log predates it). An unreadable or partly written
+/// index reads as the refs that could be parsed.
+Set<String>? readClientRefs(String dbPath) {
+  final file = File(clientRefIndexPathFor(dbPath));
+  if (!file.existsSync()) return null;
+  final refs = <String>{};
+  try {
+    for (final line in file.readAsLinesSync()) {
+      if (line.trim().isEmpty) continue;
+      final entry = jsonDecode(line);
+      if (entry is! Map) continue;
+      final batch = entry['refs'];
+      if (batch is List) refs.addAll(batch.whereType<String>());
+    }
+  } catch (_) {
+    // Return what was parseable.
+  }
+  return refs;
+}
+
 /// The entries of the audit log next to [dbPath], oldest first. A missing,
 /// unreadable or partly written log reads as the entries that could be parsed:
 /// the log is a record, not a prerequisite for a write.

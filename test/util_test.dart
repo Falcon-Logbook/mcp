@@ -309,6 +309,26 @@ void main() {
     });
   });
 
+  group('clientRefIndexPathFor', () {
+    test('sits beside the audit log it indexes', () {
+      expect(
+        clientRefIndexPathFor('/data/falcon_db.sqlite'),
+        '/data/falcon_db.mcp_audit.jsonl.refs',
+      );
+    });
+
+    test('reads back every ref, and null when there is no index', () {
+      final dir = Directory.systemTemp.createTempSync('falcon_mcp_refs_test');
+      addTearDown(() => dir.deleteSync(recursive: true));
+      final dbPath = '${dir.path}/falcon_db.sqlite';
+
+      expect(readClientRefs(dbPath), isNull);
+      appendClientRefs(dbPath, refs: ['a', 'b']);
+      appendClientRefs(dbPath, refs: ['c']);
+      expect(readClientRefs(dbPath), {'a', 'b', 'c'});
+    });
+  });
+
   test('serverVersion matches pubspec', () {
     final pubspec = File('pubspec.yaml').readAsStringSync();
     expect(pubspec, contains('version: $serverVersion'));
