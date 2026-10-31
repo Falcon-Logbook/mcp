@@ -2,10 +2,22 @@ import 'dart:io';
 
 import 'package:falcon_mcp/falcon_mcp.dart';
 import 'package:sqlite3/sqlite3.dart' show SqliteException;
+import 'package:sqlite3/sqlite3.dart' as sqlite show OpenMode, sqlite3;
 import 'package:test/test.dart';
 
 import 'support/harness.dart';
 import 'support/schema.dart';
+
+/// Whether permission bits are enforced, which a root process does not do.
+/// The read-only-directory tests set those bits, so a root run would pass
+/// without exercising the fallback and has to be skipped instead.
+final bool _permissionsIgnored = () {
+  try {
+    return Process.runSync('id', ['-u']).stdout.toString().trim() == '0';
+  } on ProcessException {
+    return false;
+  }
+}();
 
 void main() {
   late Directory tempDir;
@@ -57,6 +69,103 @@ void main() {
       throwsA(anything),
     );
   });
+
+  test('a WAL logbook is read over a normal read-only connection', () {
+    _setWal(dbPath);
+    // A commit still in the -wal is visible only to a connection that honours
+    // the WAL, which the ordinary read-only open does and the immutable
+    // fallback does not. Keeping the writer open stops the checkpoint.
+    final writer = sqlite.sqlite3.open(dbPath);
+    addTearDown(writer.dispose);
+    writer.execute(
+      "INSERT INTO flights (id, date, route, created_at) "
+      "VALUES ('fl-wal', 1761408000, 'WAL - not checkpointed', 0)",
+    );
+
+    final db = openDb(dbPath, readonly: true);
+    addTearDown(db.close);
+    expect(
+      db.query("SELECT route FROM flights WHERE id = 'fl-wal'").single['route'],
+      'WAL - not checkpointed',
+    );
+  });
+
+  test(
+      'a WAL logbook in a read-only directory is read via the immutable '
+      'fallback', () {
+    final dir = Directory('${tempDir.path}/readonly mount')..createSync();
+    // A space in the name proves the fallback URI is encoded rather than just
+    // prefixed with `file:`, which SQLite would reject or misread.
+    _setWal(dbPath);
+    final copy = File(dbPath).copySync('${dir.path}/falcon db.sqlite').path;
+    Process.runSync('chmod', ['555', dir.path]);
+    addTearDown(() => Process.runSync('chmod', ['755', dir.path]));
+
+    // The ordinary read-only connection is what fails here. Without this the
+    // test would pass on a writable directory and prove nothing.
+    ensureSqliteLibrary();
+    expect(
+      () {
+        final raw = sqlite.sqlite3.open(copy, mode: sqlite.OpenMode.readOnly);
+        try {
+          raw.select('PRAGMA user_version');
+        } finally {
+          raw.dispose();
+        }
+      },
+      throwsA(isA<SqliteException>()),
+    );
+
+    final db = openDb(copy, readonly: true);
+    addTearDown(db.close);
+    expect(db.schemaVersion, fixtureSchemaVersion);
+    expect(
+      db.query("SELECT route FROM flights WHERE id = 'fl-1'").single['route'],
+      'YSSY - NZQN',
+    );
+    // immutable=1 promises the file cannot change, so it writes nothing: the
+    // directory still holds only the logbook, with no -wal or -shm beside it.
+    expect(dir.listSync().map((entry) => entry.path.split('/').last), [
+      'falcon db.sqlite',
+    ]);
+  },
+      skip: _permissionsIgnored
+          ? 'running as root ignores the directory mode, so the fallback would not '
+              'be exercised'
+          : null);
+
+  test(
+      'failing both reads explains the writable directory and the immutable '
+      'caveat', () {
+    _setWal(dbPath);
+    final copy =
+        File(dbPath).copySync('${tempDir.path}/unreadable.sqlite').path;
+    // The file exists but SQLite cannot read it, so the immutable retry fails
+    // too and the error has to carry the explanation.
+    Process.runSync('chmod', ['000', copy]);
+    addTearDown(() => Process.runSync('chmod', ['644', copy]));
+
+    expect(
+      () => openDb(copy, readonly: true),
+      throwsA(
+        isA<FalconDbException>().having(
+          (error) => error.message,
+          'message',
+          allOf(
+            contains('writable directory'),
+            contains('-shm'),
+            contains('immutable=1'),
+            contains('live writer'),
+            contains('--db'),
+          ),
+        ),
+      ),
+    );
+  },
+      skip: _permissionsIgnored
+          ? 'running as root ignores the file mode, so the read would succeed '
+              'instead of failing'
+          : null);
 
   test('transactions roll back on failure', () {
     final db = openDb(dbPath);
@@ -161,4 +270,10 @@ void main() {
     expect(id['pk'], 1);
     expect(db.tableInfo('no_such_table'), isEmpty);
   });
+}
+
+/// Switches the fixture at [path] to WAL, the mode the Falcon app runs in, so
+/// the read path is exercised against the shape a real logbook has.
+void _setWal(String path) {
+  withFixtureDb(path, (raw) => raw.execute('PRAGMA journal_mode = wal'));
 }
