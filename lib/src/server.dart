@@ -5237,6 +5237,7 @@ Future<void> runServer(String dbPath, {bool readonly = true}) async {
           readOnlyHint: false, destructiveHint: true, openWorldHint: false),
       callback: (args, extra) async =>
           _runWrite(db, auditor, 'delete_flight', args, () {
+        _rejectUnknown(args, const {'id', 'dry_run'}, tool: 'delete_flight');
         final id = asText(args['id']);
         if (id == null) throw _ToolError('Missing or invalid id', field: 'id');
         if (db.query('SELECT id FROM flights WHERE id = ?', [id]).isEmpty) {
@@ -5401,6 +5402,7 @@ Future<void> runServer(String dbPath, {bool readonly = true}) async {
           readOnlyHint: false, destructiveHint: true, openWorldHint: false),
       callback: (args, extra) async =>
           _runWrite(db, auditor, 'delete_aircraft', args, () {
+        _rejectUnknown(args, const {'id', 'dry_run'}, tool: 'delete_aircraft');
         final id = asText(args['id']);
         if (id == null) throw _ToolError('Missing or invalid id', field: 'id');
         if (db.query('SELECT id FROM aircraft WHERE id = ?', [id]).isEmpty) {
@@ -5514,6 +5516,7 @@ Future<void> runServer(String dbPath, {bool readonly = true}) async {
           readOnlyHint: false, destructiveHint: true, openWorldHint: false),
       callback: (args, extra) async =>
           _runWrite(db, auditor, 'delete_crew', args, () {
+        _rejectUnknown(args, const {'id', 'dry_run'}, tool: 'delete_crew');
         final id = asText(args['id']);
         if (id == null) throw _ToolError('Missing or invalid id', field: 'id');
         if (db
@@ -5629,6 +5632,8 @@ Future<void> runServer(String dbPath, {bool readonly = true}) async {
           readOnlyHint: false, destructiveHint: true, openWorldHint: false),
       callback: (args, extra) async =>
           _runWrite(db, auditor, 'delete_custom_airport', args, () {
+        _rejectUnknown(args, const {'id', 'dry_run'},
+            tool: 'delete_custom_airport');
         final id = asText(args['id']);
         if (id == null) throw _ToolError('Missing or invalid id', field: 'id');
         if (db.query(
@@ -5742,6 +5747,8 @@ Future<void> runServer(String dbPath, {bool readonly = true}) async {
           readOnlyHint: false, destructiveHint: true, openWorldHint: false),
       callback: (args, extra) async =>
           _runWrite(db, auditor, 'delete_saved_route', args, () {
+        _rejectUnknown(args, const {'id', 'dry_run'},
+            tool: 'delete_saved_route');
         final id = asInt(args['id']);
         if (id == null) throw _ToolError('Missing or invalid id', field: 'id');
         if (db
@@ -5891,6 +5898,8 @@ Future<void> runServer(String dbPath, {bool readonly = true}) async {
           'dry_run': asBool(args['dry_run']) != false,
         };
         return _runWrite(db, auditor, 'merge_crew', effectiveArgs, () {
+          _rejectUnknown(args, const {'into_id', 'from_ids', 'dry_run'},
+              tool: 'merge_crew');
           final intoId = asText(args['into_id']);
           if (intoId == null) {
             throw _ToolError('into_id is required', field: 'into_id');
@@ -6021,6 +6030,8 @@ Future<void> runServer(String dbPath, {bool readonly = true}) async {
         };
         return _runWrite(db, auditor, 'link_flights_to_aircraft', effectiveArgs,
             () {
+          _rejectUnknown(args, const {'aircraft_id', 'flight_ids', 'dry_run'},
+              tool: 'link_flights_to_aircraft');
           final aircraftId = asText(args['aircraft_id']);
           final flightIds = _idListArg(args, 'flight_ids');
           final preferred = _preferredCountryCodes(db);
@@ -6197,6 +6208,8 @@ Future<void> runServer(String dbPath, {bool readonly = true}) async {
         };
         return _runWrite(db, auditor, 'link_flights_to_crew', effectiveArgs,
             () {
+          _rejectUnknown(args, const {'flight_ids', 'dry_run'},
+              tool: 'link_flights_to_crew');
           final flightIds = _idListArg(args, 'flight_ids');
           final candidates = <Map<String, dynamic>>[];
           if (flightIds.isNotEmpty) {
