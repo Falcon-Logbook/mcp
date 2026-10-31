@@ -544,6 +544,14 @@ void main() {
       expect(state.pending, 0);
     });
 
+    test('a token fits the same questions echoed in another order', () {
+      final state = AskStateStore();
+      final questions = roster();
+      final token = state.remember(questions);
+      expect(state.consume(token, questions.reversed.toList()), isNull,
+          reason: 'a client may store and re-echo the questions as a set');
+    });
+
     test('a token does not fit a different question set', () {
       final state = AskStateStore();
       final token = state.remember([AskQuestions.confirmPlan]);
@@ -636,6 +644,49 @@ void main() {
         'answers': {AskQuestions.confirmPlanId: true},
         'defaulted': <String>[],
       });
+    });
+
+    test('the retry is accepted when the questions come back reordered',
+        () async {
+      final state = AskStateStore();
+      final questions = [
+        AskQuestions.confirmPlan.toJson(),
+        AskQuestions.createMissingCrew.toJson(),
+      ];
+      final first = await ask(
+        {'questions': questions},
+        stateless: true,
+        canElicit: true,
+        state: state,
+      );
+      final token = first.toJson()['requestState'] as String;
+      // A client that keeps the asked questions in a set may echo them in any
+      // order: the same questions are still the same questions.
+      final retry = await ask(
+        {'questions': questions.reversed.toList()},
+        stateless: true,
+        canElicit: true,
+        state: state,
+        requestState: token,
+        inputResponses: {
+          askUserInputKey: InputResponse.fromJson({
+            'action': 'accept',
+            'content': {
+              AskQuestions.confirmPlanId: true,
+              AskQuestions.createMissingCrewId: false,
+            },
+          }),
+        },
+      );
+      expect(payloadOf(retry), {
+        'status': 'answered',
+        'answers': {
+          AskQuestions.confirmPlanId: true,
+          AskQuestions.createMissingCrewId: false,
+        },
+        'defaulted': <String>[],
+      });
+      expect(state.pending, 0, reason: 'the token was spent, not lost');
     });
 
     test('a replayed token is refused rather than answered twice', () async {
